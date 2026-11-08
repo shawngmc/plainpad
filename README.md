@@ -1,49 +1,165 @@
 # Plainpad
 
 A small, fast plain-text editor for Windows, macOS and Linux, written in Rust.
-It has no AI features and no formatting.
+It has no AI features and no formatting: you open text, edit it, and save it.
 
-The UI is drawn in software, without a GPU: [winit](https://github.com/rust-windowing/winit)
-creates the window, [softbuffer](https://github.com/rust-windowing/softbuffer) puts pixels on it,
-and [cosmic-text](https://github.com/pop-os/cosmic-text) shapes text, including bidirectional and complex scripts.
-File dialogs come from [rfd](https://github.com/PolyMeilex/rfd), which uses the XDG portal on Linux, so GTK isn't needed.
+The aim is low memory use and fast response. It won't match a hand-written 17 KB assembly
+editor, but it should use far less memory than modern Windows Notepad (80+ MB).
 
 ## Features
 
-- Choose the font family and size. There is no rich formatting.
-- Detects line endings (CRLF / LF / CR), warns when a file mixes them, and lets you convert between them.
-- Detects the encoding: UTF-8, UTF-8 with BOM, UTF-16 LE/BE with BOM, and Windows-1252 as a fallback.
-  Every byte round-trips unchanged.
-- Find, Find Next/Previous, Replace and Replace All, with an optional Match case.
-- Unicode support: shaping, right-to-left and mixed-direction text, font fallback, and IME input with preedit display.
-- Open, Save, Save As, Rename and Print.
-  - Saving writes a temporary file and renames it over the original, so a failed save never leaves a truncated file.
-  - Printing lays out pages with the same text engine as the editor. On Windows it uses the system print dialog
-    (GDI). On macOS and Linux it sends a PDF to the default CUPS printer with `lp`. If there is no printer,
-    it opens the PDF in your viewer.
-- Word wrap (Alt+Z), zoom (Ctrl +/−/0 or Ctrl+wheel), and a status bar you can hide.
-- Detects URLs (`http(s)://`, `ftp://`, `file://`, `mailto:`, `www.`). They are coloured, underlined when you
-  hover over them, and Ctrl+click (Cmd+click on macOS) opens them in your browser.
-- Word-level undo/redo. The window title marks unsaved changes, and the mark clears if you undo back to the saved state.
-- Settings are saved in the platform config directory.
+**Files**
+- New, Open, Save, Save As, Rename, Print
+- You can also drag a file onto the window or pass a path on the command line
+- Saving writes a temporary file and renames it over the original, so a failed save never truncates your file.
+  Symlinks and file permissions are kept.
+- A save prompt appears before New, Open or Exit if there are unsaved changes. The window title shows `*`
+  while the file is modified, and it clears if you undo back to the saved state.
 
-## Build
+**Text and Unicode**
+- Shaping, bidirectional text (Arabic, Hebrew and mixed-direction lines), complex scripts and font fallback
+  for CJK and other scripts
+- IME input with inline display of in-progress composition
+- Encoding detection: UTF-8, UTF-8 with BOM, UTF-16 LE/BE (with BOM), and Windows-1252 as a fallback.
+  Every byte round-trips unchanged. You can change the encoding from the Format menu.
+- Line-ending detection: CRLF, LF or CR. Files with mixed endings are flagged and normalised on save.
+  You can convert between them from the Format menu.
+
+**Editing**
+- Find, Find Next and Find Previous, with an optional Match case
+- Replace and Replace All. Replace All undoes as a single step.
+- Undo and redo, grouped by word
+- Word selection by double-click, line selection by triple-click, Shift+click to extend a selection
+
+**View**
+- Font family and size picker with search and a live preview. There is no rich formatting.
+- Word wrap toggle. With wrap off, scroll horizontally with Shift+wheel.
+- Zoom
+- A status bar you can hide, showing line and column, selection size, zoom, line ending and encoding
+- Light or dark theme, following the system
+- URL detection for `http(s)://`, `ftp://`, `file://`, `mailto:` and `www.`. URLs are coloured,
+  underlined on hover, and Ctrl+click opens them in the system browser.
+
+**Printing**
+- Pages are laid out with the same text engine as the editor, in your chosen font, with page numbers.
+- Windows: the native print dialog, printing through GDI
+- macOS and Linux: a PDF is sent to the default CUPS printer with `lp`. If there is no printer, the PDF opens in your viewer.
+
+**Settings**
+- Font, size, word wrap, status bar and window size are remembered in the platform config directory
+  (`%APPDATA%`, `~/Library/Application Support`, or `$XDG_CONFIG_HOME`).
+
+## Keyboard shortcuts
+
+On macOS, use **Cmd** wherever this table says **Ctrl**. macOS also follows its own conventions for moving the cursor; see the notes below the table.
+
+| Action | Shortcut |
+|---|---|
+| New | Ctrl+N |
+| Open | Ctrl+O |
+| Save | Ctrl+S |
+| Save As | Ctrl+Shift+S |
+| Print | Ctrl+P |
+| Exit | Ctrl+Q |
+| Undo | Ctrl+Z |
+| Redo | Ctrl+Y or Ctrl+Shift+Z |
+| Cut / Copy / Paste | Ctrl+X / Ctrl+C / Ctrl+V |
+| Select all | Ctrl+A |
+| Find | Ctrl+F |
+| Replace | Ctrl+H |
+| Find next | F3 or Ctrl+G |
+| Find previous | Shift+F3 or Ctrl+Shift+G |
+| Word wrap | Alt+Z |
+| Zoom in / out / reset | Ctrl+= / Ctrl+- / Ctrl+0, or Ctrl+mouse wheel |
+| Open the File / Edit / Format / View menu | Alt+F / Alt+E / Alt+O / Alt+V |
+| Move between menu items | Arrow keys, Enter to choose, Esc to close |
+| Move by word | Ctrl+Left / Ctrl+Right |
+| Start / end of line | Home / End |
+| Start / end of document | Ctrl+Home / Ctrl+End |
+| Page up / down | PageUp / PageDown |
+| Extend selection | Shift + any movement key, or Shift+click |
+| Delete previous / next word | Ctrl+Backspace / Ctrl+Delete |
+| Insert a tab | Tab |
+| Clear selection, or close the find bar | Esc |
+| Open a URL | Ctrl+click |
+
+**Find bar:** Enter finds the next match and Shift+Enter the previous one. In the Replace field, Enter replaces
+the current match. Tab switches between the Find and Replace fields, and Esc closes the bar.
+
+**Font dialog:** Type to filter the list. Up, Down, PageUp and PageDown change the selection, Tab moves to the
+size field, Enter applies and Esc cancels.
+
+**macOS:** Option+Left/Right moves by word, Cmd+Left/Right moves to the start or end of the line, and
+Cmd+Up/Down moves to the start or end of the document. The Alt+letter shortcuts for menus and word wrap are not
+available on macOS, because Option types characters there.
+
+## Intentional optimizations
+
+These choices keep memory use, CPU use and dependencies small. Some trade away polish, and those trade-offs are deliberate.
+
+- **The cursor doesn't blink.** The event loop uses `ControlFlow::Wait` and only repaints after input,
+  so an idle window uses no CPU and never wakes up on a timer.
+- **No GTK.** On Linux, file dialogs use the XDG desktop portal (via `rfd`) and the clipboard talks to
+  X11/Wayland directly (`arboard`). This avoids loading GTK, which adds about 30 MB of memory.
+- **The GUI is drawn by the app itself.** The menus, find bar, dialogs and status bar are drawn by the app
+  rather than taken from a widget toolkit, so the same code runs on every platform with no toolkit underneath.
+- **No GPU.** Pixels go to the window through `softbuffer`. No wgpu, OpenGL or Vulkan drivers are loaded,
+  and GPU stacks typically use 60–150 MB of memory on their own.
+- **Repaints only when something changes.** Moving the mouse repaints only if the hovered URL, the menu
+  highlight or a drag actually changes.
+- **Only visible text is laid out.** Lines are shaped when they scroll into view, and the shaping data for
+  lines scrolled past is discarded.
+- **Fonts are memory-mapped.** The system font database maps font files into memory rather than reading
+  them into the heap, and loads only font metadata at startup.
+- **UI text is cached.** Labels such as menus and buttons are shaped once and reused. The cache is capped at 512 entries.
+- **Printing uses its own short-lived memory.** Pages are rendered one at a time into a separate glyph
+  cache, so high-resolution print glyphs never stay in the editor's memory. On macOS and Linux the PDF is
+  written to disk page by page as it's produced.
+- **Undo stores changes, not copies.** Each undo step records only what changed, never a snapshot of the
+  document, and consecutive keystrokes are merged into one step per word.
+- **Case-insensitive search doesn't copy the document.** Text is compared character by character in place,
+  instead of lowercasing a copy of each line.
+- **Small dependencies where possible.** Windows-1252 conversion uses a 32-entry table instead of
+  `encoding_rs`, and settings are a plain `key=value` file instead of using serde.
+- **Release build settings.** The release build uses `opt-level = 3`, full LTO, `codegen-units = 1`,
+  `panic = "abort"` and stripped symbols.
+
+## Resource use
+
+Measured on Linux/X11 with a release build:
+
+| | |
+|---|---|
+| Binary size | ~5 MB |
+| Memory with a small file open | ~18 MB, of which ~14 MB is shared libraries and memory-mapped fonts and under 2 MB is the app's own heap |
+| 27 MB, 400k-line file | opens in ~0.2 s and uses ~175 MB (see TODO) |
+
+## TODO
+
+- [ ] **Reduce memory for large files.** cosmic-text spends about 330 bytes per line. Keep only the visible
+      part of the document in the layout engine and store the rest compactly, for example in a rope.
+- [ ] Use the native macOS menu bar at the top of the screen instead of the in-window menu bar
+- [ ] Add a print dialog on macOS and Linux (page setup, choice of printer, copies)
+- [ ] Add a horizontal scrollbar when word wrap is off
+- [ ] Highlight all matches while the find bar is open
+- [ ] Support find/replace across line breaks, and regular expressions
+- [ ] Go to line (Ctrl+G, as in Notepad; this conflicts with the current Find Next binding)
+- [ ] Add a right-click context menu
+- [ ] Auto-scroll on a timer while drag-selecting outside the view (today it only scrolls while the mouse moves)
+- [ ] Let the Tab key move keyboard focus between controls in the find bar and dialogs
+- [ ] Repaint only the changed parts of the window, using softbuffer damage regions, instead of the whole window
+- [ ] Accessibility support for screen readers (AccessKit)
+- [ ] Detect BOM-less UTF-16 files
+- [ ] Notice when the open file changes on disk and offer to reload it
+- [ ] Optional blinking cursor, switched off by default
+- [ ] Test on real Windows and macOS hardware. So far only Linux/X11 has been run; the other two have only
+      been compile-checked and built in CI.
+
+## Building
 
 ```
 cargo build --release
 ```
 
 On Linux you need the `libxkbcommon-x11` and `fontconfig` development packages.
-
-## Resource use
-
-Measured on Linux/X11, release build:
-
-| | |
-|---|---|
-| Binary size | ~5 MB (stripped, LTO) |
-| RSS for a small file | ~18 MB, of which ~14 MB is shared libraries and memory-mapped fonts |
-| 27 MB / 400k-line file | opens in ~0.2 s, ~175 MB RSS |
-
-Very large files cost about 330 bytes per line. That overhead comes from cosmic-text's per-line layout state.
-The planned fix is to keep only the visible part of the document in the layout engine.
+CI builds and tests on Windows, macOS and Linux, and uploads the binaries as artifacts.
