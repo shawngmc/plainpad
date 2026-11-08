@@ -1,0 +1,672 @@
+//! Custom-drawn chrome: menu bar, find/replace bar, font dialog, prompts.
+
+use crate::doc::{Encoding, Eol};
+use crate::gfx::{Canvas, Gfx, Rect, Theme};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Cmd {
+    New,
+    Open,
+    Save,
+    SaveAs,
+    Rename,
+    Print,
+    Exit,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    Delete,
+    SelectAll,
+    Find,
+    FindNext,
+    FindPrev,
+    Replace,
+    WordWrap,
+    Font,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    StatusBar,
+    SetEol(Eol),
+    SetEncoding(Encoding),
+}
+
+pub struct Item {
+    pub label: &'static str,
+    pub key: &'static str,
+    pub cmd: Option<Cmd>,
+}
+
+const fn it(label: &'static str, key: &'static str, cmd: Cmd) -> Item {
+    Item { label, key, cmd: Some(cmd) }
+}
+const SEP: Item = Item { label: "", key: "", cmd: None };
+
+pub const MENUS: &[(&str, &[Item])] = &[
+    (
+        "File",
+        &[
+            it("New", "Ctrl+N", Cmd::New),
+            it("Open…", "Ctrl+O", Cmd::Open),
+            it("Save", "Ctrl+S", Cmd::Save),
+            it("Save As…", "Ctrl+Shift+S", Cmd::SaveAs),
+            it("Rename…", "", Cmd::Rename),
+            SEP,
+            it("Print…", "Ctrl+P", Cmd::Print),
+            SEP,
+            it("Exit", "Ctrl+Q", Cmd::Exit),
+        ],
+    ),
+    (
+        "Edit",
+        &[
+            it("Undo", "Ctrl+Z", Cmd::Undo),
+            it("Redo", "Ctrl+Y", Cmd::Redo),
+            SEP,
+            it("Cut", "Ctrl+X", Cmd::Cut),
+            it("Copy", "Ctrl+C", Cmd::Copy),
+            it("Paste", "Ctrl+V", Cmd::Paste),
+            it("Delete", "Del", Cmd::Delete),
+            SEP,
+            it("Find…", "Ctrl+F", Cmd::Find),
+            it("Find Next", "F3", Cmd::FindNext),
+            it("Find Previous", "Shift+F3", Cmd::FindPrev),
+            it("Replace…", "Ctrl+H", Cmd::Replace),
+            SEP,
+            it("Select All", "Ctrl+A", Cmd::SelectAll),
+        ],
+    ),
+    (
+        "Format",
+        &[
+            it("Word Wrap", "Alt+Z", Cmd::WordWrap),
+            it("Font…", "", Cmd::Font),
+            SEP,
+            it("Line Endings: Windows (CRLF)", "", Cmd::SetEol(Eol::CrLf)),
+            it("Line Endings: Unix (LF)", "", Cmd::SetEol(Eol::Lf)),
+            it("Line Endings: Classic Mac (CR)", "", Cmd::SetEol(Eol::Cr)),
+            SEP,
+            it("Encoding: UTF-8", "", Cmd::SetEncoding(Encoding::Utf8)),
+            it("Encoding: UTF-8 with BOM", "", Cmd::SetEncoding(Encoding::Utf8Bom)),
+            it("Encoding: UTF-16 LE", "", Cmd::SetEncoding(Encoding::Utf16Le)),
+            it("Encoding: UTF-16 BE", "", Cmd::SetEncoding(Encoding::Utf16Be)),
+            it("Encoding: Windows-1252", "", Cmd::SetEncoding(Encoding::Windows1252)),
+        ],
+    ),
+    (
+        "View",
+        &[
+            it("Zoom In", "Ctrl++", Cmd::ZoomIn),
+            it("Zoom Out", "Ctrl+-", Cmd::ZoomOut),
+            it("Restore Default Zoom", "Ctrl+0", Cmd::ZoomReset),
+            SEP,
+            it("Status Bar", "", Cmd::StatusBar),
+        ],
+    ),
+];
+
+/// Shortcut text as shown on this platform.
+pub fn key_label(k: &str) -> String {
+    if cfg!(target_os = "macos") {
+        k.replace("Ctrl+Shift+", "⇧⌘").replace("Ctrl+", "⌘").replace("Shift+", "⇧").replace("Alt+", "⌥")
+    } else {
+        k.to_owned()
+    }
+}
+
+#[derive(Default)]
+pub struct MenuState {
+    pub open: Option<usize>,
+    pub hover: Option<usize>,
+    titles: Vec<Rect>,
+    drop: Rect,
+    items: Vec<(Rect, usize)>,
+}
+
+pub enum MenuHit {
+    Title(usize),
+    Item(Cmd),
+    Inside,
+    Outside,
+}
+
+impl MenuState {
+    pub fn draw_bar(&mut self, g: &mut Gfx, cv: &mut Canvas, th: &Theme, bar: Rect, s: f32) {
+        cv.fill(bar, th.chrome);
+        cv.fill(Rect::new(bar.x, bar.bottom() - s, bar.w, s), th.border);
+        self.titles.clear();
+        let mut x = bar.x + 4.0 * s;
+        for (i, (title, _)) in MENUS.iter().enumerate() {
+            let w = g.text_w(title) + 20.0 * s;
+            let r = Rect::new(x, bar.y, w, bar.h - s);
+            if self.open == Some(i) {
+                cv.fill(r, th.hover);
+            }
+            g.text_in(cv, title, Rect::new(x + 10.0 * s, r.y, w, r.h), th.chrome_fg);
+            self.titles.push(r);
+            x += w;
+        }
+    }
+
+    pub fn draw_dropdown(&mut self, g: &mut Gfx, cv: &mut Canvas, th: &Theme, s: f32, checked: impl Fn(Cmd) -> bool) {
+        self.items.clear();
+        let Some(m) = self.open else { return };
+        let items = MENUS[m].1;
+        let row = (g.ui_line_h() + 8.0 * s).round();
+        let sep = 9.0 * s;
+        let pad = 28.0 * s;
+        let mut lw: f32 = 0.0;
+        let mut kw: f32 = 0.0;
+        for i in items {
+            lw = lw.max(g.text_w(i.label));
+            kw = kw.max(g.text_w(&key_label(i.key)));
+        }
+        let w = pad + lw + 32.0 * s + kw + 16.0 * s;
+        let h: f32 = items.iter().map(|i| if i.cmd.is_some() { row } else { sep }).sum::<f32>() + 8.0 * s;
+        let t = self.titles[m];
+        let x = t.x.min(cv.w as f32 - w).max(0.0);
+        self.drop = Rect::new(x, t.bottom() + s, w, h);
+        // Shadow, body, border.
+        cv.fill(Rect::new(self.drop.x + 2.0 * s, self.drop.y + 2.0 * s, w, h), th.shade);
+        cv.fill(self.drop, th.chrome);
+        cv.outline(self.drop, s, th.border);
+        let mut y = self.drop.y + 4.0 * s;
+        for (idx, i) in items.iter().enumerate() {
+            let Some(cmd) = i.cmd else {
+                cv.fill(Rect::new(x + 8.0 * s, y + (sep / 2.0).floor(), w - 16.0 * s, s), th.border);
+                y += sep;
+                continue;
+            };
+            let r = Rect::new(x + 4.0 * s, y, w - 8.0 * s, row);
+            if self.hover == Some(idx) {
+                cv.fill(r, th.hover);
+            }
+            if checked(cmd) {
+                g.text_in(cv, "✓", Rect::new(x + 10.0 * s, y, pad, row), th.chrome_fg);
+            }
+            g.text_in(cv, i.label, Rect::new(x + pad, y, lw, row), th.chrome_fg);
+            let kl = key_label(i.key);
+            let kx = x + w - 16.0 * s - g.text_w(&kl);
+            g.text_in(cv, &kl, Rect::new(kx, y, kw, row), th.dim);
+            self.items.push((r, idx));
+            y += row;
+        }
+    }
+
+    pub fn hit(&self, p: (f32, f32)) -> MenuHit {
+        if let Some(i) = self.titles.iter().position(|r| r.contains(p)) {
+            return MenuHit::Title(i);
+        }
+        if let Some(m) = self.open {
+            if let Some((_, idx)) = self.items.iter().find(|(r, _)| r.contains(p)) {
+                return MenuHit::Item(MENUS[m].1[*idx].cmd.unwrap());
+            }
+            if self.drop.contains(p) {
+                return MenuHit::Inside;
+            }
+        }
+        MenuHit::Outside
+    }
+
+    pub fn hover_at(&mut self, p: (f32, f32)) -> bool {
+        let old = (self.open, self.hover);
+        if let Some(i) = self.titles.iter().position(|r| r.contains(p))
+            && self.open.is_some() {
+                self.open = Some(i);
+            }
+        self.hover = self.items.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i);
+        old != (self.open, self.hover)
+    }
+
+    /// Keyboard navigation inside an open menu. Returns a command on Enter.
+    pub fn key(&mut self, k: NavKey) -> Option<Cmd> {
+        let m = self.open?;
+        let items = MENUS[m].1;
+        let step = |from: Option<usize>, d: isize| -> Option<usize> {
+            let n = items.len() as isize;
+            let mut i = from.map_or(if d > 0 { -1 } else { n }, |v| v as isize);
+            for _ in 0..n {
+                i = (i + d).rem_euclid(n);
+                if items[i as usize].cmd.is_some() {
+                    return Some(i as usize);
+                }
+            }
+            None
+        };
+        match k {
+            NavKey::Up => self.hover = step(self.hover, -1),
+            NavKey::Down => self.hover = step(self.hover, 1),
+            NavKey::Left => {
+                self.open = Some((m + MENUS.len() - 1) % MENUS.len());
+                self.hover = None;
+            }
+            NavKey::Right => {
+                self.open = Some((m + 1) % MENUS.len());
+                self.hover = None;
+            }
+            NavKey::Enter => return self.hover.and_then(|i| items[i].cmd),
+        }
+        None
+    }
+
+    pub fn close(&mut self) {
+        self.open = None;
+        self.hover = None;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum NavKey {
+    Up,
+    Down,
+    Left,
+    Right,
+    Enter,
+}
+
+/// Minimal single-line text field.
+#[derive(Default, Clone)]
+pub struct TextField {
+    pub text: String,
+    pub cursor: usize,
+    /// Whole text is selected (typing replaces it).
+    pub all: bool,
+}
+
+pub enum FieldKey<'a> {
+    Insert(&'a str),
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    SelectAll,
+}
+
+impl TextField {
+    pub fn set(&mut self, t: &str) {
+        self.text = t.to_owned();
+        self.cursor = self.text.len();
+        self.all = true;
+    }
+
+    pub fn key(&mut self, k: FieldKey) {
+        let prev = |s: &str, i: usize| s[..i].char_indices().next_back().map_or(0, |(j, _)| j);
+        let next = |s: &str, i: usize| s[i..].chars().next().map_or(i, |c| i + c.len_utf8());
+        if self.all && matches!(k, FieldKey::Insert(_) | FieldKey::Backspace | FieldKey::Delete) {
+            self.text.clear();
+            self.cursor = 0;
+            self.all = false;
+            if !matches!(k, FieldKey::Insert(_)) {
+                return;
+            }
+        }
+        match k {
+            FieldKey::Insert(s) => {
+                let s: String = s.chars().filter(|c| !c.is_control()).collect();
+                self.text.insert_str(self.cursor, &s);
+                self.cursor += s.len();
+            }
+            FieldKey::Backspace if self.cursor > 0 => {
+                let p = prev(&self.text, self.cursor);
+                self.text.replace_range(p..self.cursor, "");
+                self.cursor = p;
+            }
+            FieldKey::Delete if self.cursor < self.text.len() => {
+                let n = next(&self.text, self.cursor);
+                self.text.replace_range(self.cursor..n, "");
+            }
+            FieldKey::Left => self.cursor = if self.all { 0 } else { prev(&self.text, self.cursor) },
+            FieldKey::Right => self.cursor = if self.all { self.text.len() } else { next(&self.text, self.cursor) },
+            FieldKey::Home => self.cursor = 0,
+            FieldKey::End => self.cursor = self.text.len(),
+            FieldKey::SelectAll => {
+                self.all = true;
+                return;
+            }
+            _ => {}
+        }
+        self.all = false;
+    }
+
+    pub fn draw(&self, g: &mut Gfx, cv: &mut Canvas, th: &Theme, r: Rect, focused: bool, s: f32) {
+        cv.fill(r, th.field);
+        cv.outline(r, s, if focused { th.accent } else { th.border });
+        let inner = Rect::new(r.x + 6.0 * s, r.y, r.w - 12.0 * s, r.h);
+        cv.set_clip(inner);
+        // Keep the caret visible for long text by scrolling left.
+        let caret_x = g.text_w(&self.text[..self.cursor]);
+        let shift = (caret_x - inner.w + 2.0 * s).max(0.0);
+        if self.all && focused && !self.text.is_empty() {
+            let w = g.text_w(&self.text);
+            cv.fill(Rect::new(inner.x - shift, r.y + 3.0 * s, w, r.h - 6.0 * s), th.sel);
+        }
+        g.text_in(cv, &self.text, Rect::new(inner.x - shift, r.y, inner.w + shift, r.h), th.fg);
+        if focused {
+            cv.fill(Rect::new(inner.x - shift + caret_x, r.y + 4.0 * s, s.max(1.0), r.h - 8.0 * s), th.fg);
+        }
+        cv.reset_clip();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum FindAction {
+    Next,
+    Prev,
+    Replace,
+    ReplaceAll,
+    ToggleCase,
+    ToggleReplace,
+    Close,
+    FocusFind,
+    FocusReplace,
+}
+
+#[derive(Default)]
+pub struct FindBar {
+    pub visible: bool,
+    pub replace: bool,
+    pub case: bool,
+    pub focus: bool,
+    /// 0 = find field, 1 = replace field.
+    pub field: usize,
+    pub find: TextField,
+    pub repl: TextField,
+    buttons: Vec<(Rect, FindAction)>,
+}
+
+impl FindBar {
+    pub fn height(&self, g: &Gfx, s: f32) -> f32 {
+        if !self.visible {
+            return 0.0;
+        }
+        let row = (g.ui_line_h() + 14.0 * s).round();
+        row * if self.replace { 2.0 } else { 1.0 } + 6.0 * s
+    }
+
+    pub fn draw(&mut self, g: &mut Gfx, cv: &mut Canvas, th: &Theme, r: Rect, s: f32) {
+        self.buttons.clear();
+        cv.fill(r, th.chrome);
+        cv.fill(Rect::new(r.x, r.y, r.w, s), th.border);
+        let row = (g.ui_line_h() + 14.0 * s).round();
+        let label_w = g.text_w("Replace").max(g.text_w("Find")) + 16.0 * s;
+        let field_w = (r.w * 0.4).clamp(120.0 * s, 420.0 * s);
+        let fh = row - 8.0 * s;
+        let rows: &[(usize, &str)] = if self.replace { &[(0, "Find"), (1, "Replace")] } else { &[(0, "Find")] };
+        for &(i, label) in rows {
+            let y = r.y + 3.0 * s + i as f32 * row;
+            g.text_in(cv, label, Rect::new(r.x + 10.0 * s, y, label_w, row), th.chrome_fg);
+            let fr = Rect::new(r.x + 10.0 * s + label_w, y + 4.0 * s, field_w, fh);
+            let field = if i == 0 { &self.find } else { &self.repl };
+            field.draw(g, cv, th, fr, self.focus && self.field == i, s);
+            self.buttons.push((fr, if i == 0 { FindAction::FocusFind } else { FindAction::FocusReplace }));
+            let mut x = fr.right() + 8.0 * s;
+            let btns: &[(&str, FindAction, bool)] = if i == 0 {
+                &[
+                    ("Next", FindAction::Next, false),
+                    ("Previous", FindAction::Prev, false),
+                    ("Match case", FindAction::ToggleCase, self.case),
+                    (if self.replace { "Hide replace" } else { "Replace…" }, FindAction::ToggleReplace, false),
+                ]
+            } else {
+                &[("Replace", FindAction::Replace, false), ("Replace all", FindAction::ReplaceAll, false)]
+            };
+            for &(t, a, on) in btns {
+                let w = g.text_w(t) + 16.0 * s;
+                let br = Rect::new(x, y + 4.0 * s, w, fh);
+                if br.right() > r.right() - 30.0 * s {
+                    break;
+                }
+                cv.fill(br, if on { th.accent } else { th.bg });
+                cv.outline(br, s, th.border);
+                g.text_in(cv, t, Rect::new(br.x + 8.0 * s, br.y, w, fh), if on { th.accent_fg } else { th.chrome_fg });
+                self.buttons.push((br, a));
+                x += w + 6.0 * s;
+            }
+        }
+        let cr = Rect::new(r.right() - 28.0 * s, r.y + 3.0 * s + 4.0 * s, 22.0 * s, fh);
+        g.text_in(cv, "✕", Rect::new(cr.x + 5.0 * s, cr.y, cr.w, cr.h), th.dim);
+        self.buttons.push((cr, FindAction::Close));
+    }
+
+    pub fn hit(&self, p: (f32, f32)) -> Option<FindAction> {
+        self.buttons.iter().find(|(r, _)| r.contains(p)).map(|(_, a)| *a)
+    }
+
+    pub fn field_mut(&mut self) -> &mut TextField {
+        if self.field == 0 { &mut self.find } else { &mut self.repl }
+    }
+}
+
+pub struct FontDialog {
+    pub families: Vec<String>,
+    pub filter: TextField,
+    pub size: TextField,
+    pub selected: Option<String>,
+    pub scroll: usize,
+    /// 0 = filter field, 1 = size field.
+    pub field: usize,
+    list: Rect,
+    row_h: f32,
+    rows: Vec<(Rect, String)>,
+    buttons: Vec<(Rect, DialogAction)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DialogAction {
+    Ok,
+    Cancel,
+    FocusFilter,
+    FocusSize,
+}
+
+impl FontDialog {
+    pub fn new(families: Vec<String>, current: &str, pt: f32) -> Self {
+        let mut size = TextField::default();
+        size.set(&format!("{pt}"));
+        let selected = Some(current.to_owned());
+        let mut d = Self {
+            families,
+            filter: TextField::default(),
+            size,
+            selected,
+            scroll: 0,
+            field: 0,
+            list: Rect::default(),
+            row_h: 1.0,
+            rows: Vec::new(),
+            buttons: Vec::new(),
+        };
+        if let Some(i) = d.filtered().iter().position(|f| *f == current) {
+            d.scroll = i.saturating_sub(3);
+        }
+        d
+    }
+
+    pub fn filtered(&self) -> Vec<&str> {
+        let q = self.filter.text.to_lowercase();
+        std::iter::once("")
+            .chain(self.families.iter().map(String::as_str))
+            .filter(|f| q.is_empty() || display_name(f).to_lowercase().contains(&q))
+            .collect()
+    }
+
+    pub fn visible_rows(&self) -> usize {
+        ((self.list.h / self.row_h).floor() as usize).max(1)
+    }
+
+    pub fn move_sel(&mut self, d: isize) {
+        let list = self.filtered();
+        if list.is_empty() {
+            return;
+        }
+        let cur = self.selected.as_deref().and_then(|s| list.iter().position(|f| *f == s));
+        let i = match cur {
+            Some(i) => (i as isize + d).clamp(0, list.len() as isize - 1) as usize,
+            None => 0,
+        };
+        self.selected = Some(list[i].to_owned());
+        let vis = self.visible_rows();
+        if i < self.scroll {
+            self.scroll = i;
+        } else if i >= self.scroll + vis {
+            self.scroll = i + 1 - vis;
+        }
+    }
+
+    pub fn scroll_by(&mut self, d: isize) {
+        let n = self.filtered().len();
+        let max = n.saturating_sub(self.visible_rows());
+        self.scroll = (self.scroll as isize + d).clamp(0, max as isize) as usize;
+    }
+
+    pub fn draw(&mut self, g: &mut Gfx, cv: &mut Canvas, th: &Theme, s: f32, preview: &mut dyn FnMut(&mut Gfx, &mut Canvas, Rect, &str, f32)) {
+        cv.fill(Rect::new(0.0, 0.0, cv.w as f32, cv.h as f32), th.shade);
+        let w = (440.0 * s).min(cv.w as f32 - 20.0 * s);
+        let h = (460.0 * s).min(cv.h as f32 - 20.0 * s);
+        let r = Rect::new(((cv.w as f32 - w) / 2.0).round(), ((cv.h as f32 - h) / 2.0).round(), w, h);
+        cv.fill(r, th.chrome);
+        cv.outline(r, s, th.border);
+        self.buttons.clear();
+        self.rows.clear();
+        let lh = g.ui_line_h();
+        let pad = 14.0 * s;
+        let fh = lh + 10.0 * s;
+        let mut y = r.y + pad;
+        g.text(cv, "Font", r.x + pad, y, th.chrome_fg);
+        y += lh + 8.0 * s;
+        let fr = Rect::new(r.x + pad, y, r.w - 2.0 * pad, fh);
+        if self.filter.text.is_empty() && self.field != 0 {
+            g.text_in(cv, "Search fonts", Rect::new(fr.x + 6.0 * s, fr.y, fr.w, fr.h), th.dim);
+            cv.outline(fr, s, th.border);
+        } else {
+            self.filter.draw(g, cv, th, fr, self.field == 0, s);
+        }
+        self.buttons.push((fr, DialogAction::FocusFilter));
+        y += fh + 6.0 * s;
+        let bottom_h = fh + 8.0 * s + 48.0 * s + 8.0 * s + fh + pad;
+        self.list = Rect::new(r.x + pad, y, r.w - 2.0 * pad, (r.bottom() - bottom_h - y).max(lh));
+        self.row_h = lh + 6.0 * s;
+        cv.fill(self.list, th.field);
+        cv.outline(self.list, s, th.border);
+        cv.set_clip(self.list);
+        let list: Vec<String> = self.filtered().into_iter().map(String::from).collect();
+        let vis = self.visible_rows();
+        for (k, f) in list.iter().enumerate().skip(self.scroll).take(vis + 1) {
+            let rr = Rect::new(self.list.x, self.list.y + (k - self.scroll) as f32 * self.row_h, self.list.w, self.row_h);
+            let sel = self.selected.as_deref() == Some(f.as_str());
+            if sel {
+                cv.fill(rr, th.accent);
+            }
+            g.text_in(cv, &display_name(f), Rect::new(rr.x + 8.0 * s, rr.y, rr.w, rr.h), if sel { th.accent_fg } else { th.fg });
+            self.rows.push((rr, f.to_string()));
+        }
+        cv.reset_clip();
+        y = self.list.bottom() + 8.0 * s;
+        let sw = g.text_w("Size (pt)") + 12.0 * s;
+        g.text_in(cv, "Size (pt)", Rect::new(r.x + pad, y, sw, fh), th.chrome_fg);
+        let sr = Rect::new(r.x + pad + sw, y, 70.0 * s, fh);
+        self.size.draw(g, cv, th, sr, self.field == 1, s);
+        self.buttons.push((sr, DialogAction::FocusSize));
+        y += fh + 8.0 * s;
+        let pr = Rect::new(r.x + pad, y, r.w - 2.0 * pad, 48.0 * s);
+        cv.fill(pr, th.bg);
+        cv.outline(pr, s, th.border);
+        let pt: f32 = self.size.text.trim().parse().unwrap_or(11.0);
+        cv.set_clip(pr);
+        preview(g, cv, Rect::new(pr.x + 8.0 * s, pr.y, pr.w - 16.0 * s, pr.h), self.selected.as_deref().unwrap_or(""), pt);
+        cv.reset_clip();
+        y += 48.0 * s + 8.0 * s;
+        let mut x = r.right() - pad;
+        for (t, a) in [("Cancel", DialogAction::Cancel), ("OK", DialogAction::Ok)] {
+            let bw = g.text_w(t).max(50.0 * s) + 20.0 * s;
+            x -= bw;
+            let br = Rect::new(x, y, bw, fh);
+            let primary = a == DialogAction::Ok;
+            cv.fill(br, if primary { th.accent } else { th.bg });
+            cv.outline(br, s, th.border);
+            let tw = g.text_w(t);
+            g.text_in(cv, t, Rect::new(br.x + (bw - tw) / 2.0, br.y, tw, fh), if primary { th.accent_fg } else { th.chrome_fg });
+            self.buttons.push((br, a));
+            x -= 8.0 * s;
+        }
+    }
+
+    pub fn hit(&mut self, p: (f32, f32)) -> Option<DialogAction> {
+        if let Some((_, f)) = self.rows.iter().find(|(r, _)| r.contains(p)) {
+            self.selected = Some(f.clone());
+            return None;
+        }
+        self.buttons.iter().find(|(r, _)| r.contains(p)).map(|(_, a)| *a)
+    }
+
+    pub fn in_list(&self, p: (f32, f32)) -> bool {
+        self.list.contains(p)
+    }
+
+    pub fn field_mut(&mut self) -> &mut TextField {
+        if self.field == 0 { &mut self.filter } else { &mut self.size }
+    }
+}
+
+pub fn display_name(f: &str) -> String {
+    if f.is_empty() { "(Default monospace)".to_owned() } else { f.to_owned() }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Choice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+pub struct Prompt {
+    pub msg: String,
+    pub focus: usize,
+    buttons: Vec<(Rect, Choice)>,
+}
+
+pub const PROMPT_CHOICES: [(&str, Choice); 3] = [("Save", Choice::Save), ("Don't Save", Choice::Discard), ("Cancel", Choice::Cancel)];
+
+impl Prompt {
+    pub fn new(msg: String) -> Self {
+        Self { msg, focus: 0, buttons: Vec::new() }
+    }
+
+    pub fn draw(&mut self, g: &mut Gfx, cv: &mut Canvas, th: &Theme, s: f32) {
+        cv.fill(Rect::new(0.0, 0.0, cv.w as f32, cv.h as f32), th.shade);
+        let lh = g.ui_line_h();
+        let pad = 18.0 * s;
+        let fh = lh + 12.0 * s;
+        let bws: Vec<f32> = PROMPT_CHOICES.iter().map(|(t, _)| g.text_w(t).max(60.0 * s) + 24.0 * s).collect();
+        let btn_total: f32 = bws.iter().sum::<f32>() + 8.0 * s * 2.0;
+        let w = (g.text_w(&self.msg) + 2.0 * pad).max(btn_total + 2.0 * pad).min(cv.w as f32 - 20.0 * s);
+        let h = pad + lh + pad + fh + pad;
+        let r = Rect::new(((cv.w as f32 - w) / 2.0).round(), ((cv.h as f32 - h) / 2.5).round(), w, h);
+        cv.fill(r, th.chrome);
+        cv.outline(r, s, th.border);
+        cv.set_clip(r);
+        g.text(cv, &self.msg, r.x + pad, r.y + pad, th.chrome_fg);
+        cv.reset_clip();
+        self.buttons.clear();
+        let mut x = r.right() - pad - btn_total;
+        let y = r.bottom() - pad - fh;
+        for (i, ((t, c), bw)) in PROMPT_CHOICES.iter().zip(&bws).enumerate() {
+            let br = Rect::new(x, y, *bw, fh);
+            let f = i == self.focus;
+            cv.fill(br, if f { th.accent } else { th.bg });
+            cv.outline(br, s, th.border);
+            let tw = g.text_w(t);
+            g.text_in(cv, t, Rect::new(br.x + (bw - tw) / 2.0, y, tw, fh), if f { th.accent_fg } else { th.chrome_fg });
+            self.buttons.push((br, *c));
+            x += bw + 8.0 * s;
+        }
+    }
+
+    pub fn hit(&self, p: (f32, f32)) -> Option<Choice> {
+        self.buttons.iter().find(|(r, _)| r.contains(p)).map(|(_, c)| *c)
+    }
+}
