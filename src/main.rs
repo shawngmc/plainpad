@@ -1,15 +1,14 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod doc;
+mod document;
 mod gfx;
 mod print;
 mod search;
 mod ui;
+mod view;
 
-use cosmic_text::{
-    Action, Attrs, AttrsList, Buffer, Change, Cursor, Edit, Editor, Family, Metrics, Motion, Scroll, Selection,
-    Shaping, Wrap,
-};
+use cosmic_text::{Buffer, Cursor, Metrics, Motion, Shaping, Wrap};
 use doc::{Encoding, Eol, Settings};
 use gfx::{Canvas, Gfx, Rect, Theme};
 use std::num::NonZeroU32;
@@ -18,6 +17,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use ui::{Choice, Cmd, DialogAction, FieldKey, FindAction, FindBar, FontDialog, MenuHit, MenuState, NavKey, Prompt};
+use view::{font_attrs, View};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -45,17 +45,9 @@ enum Drag {
     Thumb(f32),
 }
 
-fn font_attrs(family: &str) -> Attrs<'_> {
-    if family.is_empty() {
-        Attrs::new().family(Family::Monospace)
-    } else {
-        Attrs::new().family(Family::Name(family))
-    }
-}
-
 struct App {
     gfx: Gfx,
-    editor: Editor<'static>,
+    view: View,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     settings: Settings,
@@ -72,10 +64,6 @@ struct App {
     eol: Eol,
     mixed_eol: bool,
     meta_dirty: bool,
-    undo: Vec<Change>,
-    redo: Vec<Change>,
-    saved_len: Option<usize>,
-    can_merge: bool,
     menu: MenuState,
     find: FindBar,
     font_dlg: Option<FontDialog>,
@@ -97,12 +85,10 @@ struct App {
 impl App {
     fn new(settings: Settings, file: Option<PathBuf>) -> Self {
         let mut gfx = Gfx::new();
-        let mut buffer = Buffer::new(&mut gfx.fs, Metrics::new(14.0, 18.0));
-        buffer.set_wrap(if settings.wrap { Wrap::WordOrGlyph } else { Wrap::None });
-        buffer.set_text("", &font_attrs(&settings.font_family), Shaping::Advanced, None);
+        let view = View::new(&mut gfx.fs, &settings.font_family, settings.wrap);
         let mut app = App {
             gfx,
-            editor: Editor::new(buffer),
+            view,
             window: None,
             surface: None,
             settings,
@@ -119,10 +105,6 @@ impl App {
             eol: Eol::platform(),
             mixed_eol: false,
             meta_dirty: false,
-            undo: Vec::new(),
-            redo: Vec::new(),
-            saved_len: Some(0),
-            can_merge: false,
             menu: MenuState::default(),
             find: FindBar::default(),
             font_dlg: None,
@@ -150,6 +132,10 @@ impl App {
         app
     }
 
+    fn primary(&self) -> bool {
+        if MAC { self.mods.super_key() } else { self.mods.control_key() }
+    }
+
     // ---------------------------------------------------------------- document
 
     fn doc_name(&self) -> String {
@@ -161,34 +147,11 @@ impl App {
     }
 
     fn is_dirty(&self) -> bool {
-        self.meta_dirty || Some(self.undo.len()) != self.saved_len
-    }
-
-    fn doc_text(&self, eol: &str) -> String {
-        self.editor.with_buffer(|b| {
-            let mut s = String::with_capacity(b.lines.iter().map(|l| l.text().len() + 2).sum());
-            for (i, l) in b.lines.iter().enumerate() {
-                if i > 0 {
-                    s.push_str(eol);
-                }
-                s.push_str(l.text());
-            }
-            s
-        })
+        self.meta_dirty || self.view.doc.is_dirty()
     }
 
     fn set_doc(&mut self, text: &str) {
-        let attrs = font_attrs(&self.settings.font_family);
-        self.editor.with_buffer_mut(|b| {
-            b.set_text(text, &attrs, Shaping::Advanced, None);
-            b.set_scroll(Scroll::default());
-        });
-        self.editor.set_selection(Selection::None);
-        self.editor.set_cursor(Cursor::new(0, 0));
-        self.undo.clear();
-        self.redo.clear();
-        self.saved_len = Some(0);
-        self.can_merge = false;
+        self.view.set_text(text);
         self.meta_dirty = false;
         self.hover_url = None;
     }
@@ -251,7 +214,7 @@ impl App {
     }
 
     fn save_to(&mut self, path: PathBuf) -> bool {
-        let text = self.doc_text(self.eol.as_str());
+        let text = self.view.doc.to_string_eol(self.eol.as_str());
         let bytes = match doc::encode(&text, self.encoding) {
             Ok(b) => b,
             Err(c) => {
@@ -264,8 +227,7 @@ impl App {
         match doc::save(&path, &bytes) {
             Ok(()) => {
                 self.path = Some(path);
-                self.saved_len = Some(self.undo.len());
-                self.can_merge = false;
+                self.view.doc.mark_saved();
                 self.meta_dirty = false;
                 self.mixed_eol = false;
                 true
@@ -298,11 +260,17 @@ impl App {
     }
 
     fn print(&mut self) {
-        let text = self.doc_text("\n");
-        let job = print::Job { text: &text, family: &self.settings.font_family, font_pt: self.settings.font_pt };
+        let title = self.doc_name();
+        let doc = &self.view.doc;
+        let line = |i: usize| doc.line(i).into_owned();
+        let job = print::Job {
+            lines: doc.len_lines(),
+            line: &line,
+            family: &self.settings.font_family,
+            font_pt: self.settings.font_pt,
+        };
         // A throwaway glyph cache: print-resolution glyphs would otherwise bloat the screen cache.
         let mut cache = cosmic_text::SwashCache::new();
-        let title = self.doc_name();
         let r = print::print(&mut self.gfx.fs, &mut cache, &job, &title);
         self.status_msg = Some(r.unwrap_or_else(|e| e));
     }
@@ -335,9 +303,10 @@ impl App {
         match c {
             Choice::Save => {
                 if self.save()
-                    && let Some(p) = pending {
-                        self.run_unguarded(p);
-                    }
+                    && let Some(p) = pending
+                {
+                    self.run_unguarded(p);
+                }
             }
             Choice::Discard => {
                 if let Some(p) = pending {
@@ -350,79 +319,9 @@ impl App {
 
     // ---------------------------------------------------------------- editing
 
-    fn commit(&mut self, merge: bool) {
-        let Some(c) = self.editor.finish_change() else { return };
-        if c.items.is_empty() {
-            return;
-        }
-        if self.saved_len.is_some_and(|s| s > self.undo.len()) {
-            self.saved_len = None;
-        }
-        self.redo.clear();
-        let at_save_point = self.saved_len == Some(self.undo.len());
-        match self.undo.last_mut() {
-            Some(last) if merge && self.can_merge && !at_save_point => last.items.extend(c.items),
-            _ => self.undo.push(c),
-        }
-        self.can_merge = merge;
+    fn edited(&mut self) {
         self.status_msg = None;
         self.hover_url = None;
-    }
-
-    fn edit_action(&mut self, action: Action, merge: bool) {
-        self.editor.start_change();
-        self.editor.action(&mut self.gfx.fs, action);
-        self.commit(merge);
-    }
-
-    fn edit_with(&mut self, f: impl FnOnce(&mut Editor<'static>)) {
-        self.editor.start_change();
-        f(&mut self.editor);
-        self.commit(false);
-    }
-
-    fn type_text(&mut self, s: &str) {
-        let mut chars = s.chars();
-        match (chars.next(), chars.next()) {
-            (Some(c), None) => {
-                self.edit_action(Action::Insert(c), true);
-                if c.is_whitespace() {
-                    self.can_merge = false;
-                }
-            }
-            (Some(_), Some(_)) => self.edit_with(|e| e.insert_string(s, None)),
-            _ => {}
-        }
-    }
-
-    /// Marks the cursor as moved so the view scrolls to it (apply_change doesn't).
-    fn reveal_cursor(&mut self) {
-        let c = self.editor.cursor();
-        self.editor.set_cursor(Cursor::new(usize::MAX, 0));
-        self.editor.set_cursor(c);
-    }
-
-    fn undo(&mut self) {
-        let _ = self.editor.finish_change();
-        if let Some(mut c) = self.undo.pop() {
-            c.reverse();
-            self.editor.set_selection(Selection::None);
-            self.editor.apply_change(&c);
-            c.reverse();
-            self.redo.push(c);
-            self.can_merge = false;
-            self.reveal_cursor();
-        }
-    }
-
-    fn redo(&mut self) {
-        if let Some(c) = self.redo.pop() {
-            self.editor.set_selection(Selection::None);
-            self.editor.apply_change(&c);
-            self.undo.push(c);
-            self.can_merge = false;
-            self.reveal_cursor();
-        }
     }
 
     fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
@@ -444,37 +343,9 @@ impl App {
     }
 
     fn copy(&mut self) {
-        if let Some(t) = self.editor.copy_selection() {
+        if let Some(t) = self.view.selected_text() {
             self.set_clipboard(t);
         }
-    }
-
-    fn motion(&mut self, m: Motion, shift: bool) {
-        self.can_merge = false;
-        if shift {
-            if self.editor.selection() == Selection::None {
-                self.editor.set_selection(Selection::Normal(self.editor.cursor()));
-            }
-        } else if let Some((a, z)) = self.editor.selection_bounds() {
-            self.editor.set_selection(Selection::None);
-            match m {
-                Motion::Left => return self.editor.set_cursor(a),
-                Motion::Right => return self.editor.set_cursor(z),
-                _ => {}
-            }
-        }
-        self.editor.action(&mut self.gfx.fs, Action::Motion(m));
-    }
-
-    fn delete_word(&mut self, forward: bool) {
-        if self.editor.selection() == Selection::None {
-            self.editor.set_selection(Selection::Normal(self.editor.cursor()));
-            let m = if forward { Motion::NextWord } else { Motion::PreviousWord };
-            self.editor.action(&mut self.gfx.fs, Action::Motion(m));
-        }
-        self.edit_with(|e| {
-            e.delete_selection();
-        });
     }
 
     // ---------------------------------------------------------------- find
@@ -484,7 +355,8 @@ impl App {
         self.find.replace |= replace;
         self.find.focus = true;
         self.find.field = 0;
-        if let Some(sel) = self.editor.copy_selection().filter(|s| !s.contains('\n') && !s.is_empty()) {
+        let sel = self.view.selection().filter(|(a, z)| a.line == z.line);
+        if let Some(sel) = sel.and_then(|_| self.view.selected_text()) {
             self.find.find.set(&sel);
         } else {
             self.find.find.all = true;
@@ -498,32 +370,32 @@ impl App {
             return false;
         }
         let case = self.find.case;
-        let cur = self.editor.cursor();
-        let (start, end) = self.editor.selection_bounds().unwrap_or((cur, cur));
-        let found = self.editor.with_buffer(|b| {
-            let n = b.lines.len();
-            for k in 0..=n {
-                if forward {
-                    let li = (end.line + k) % n;
-                    let from = if k == 0 { end.index } else { 0 };
-                    if let Some(r) = search::find(b.lines[li].text(), &needle, case, from) {
-                        return Some((li, r));
-                    }
-                } else {
-                    let li = (start.line + n * 2 - k) % n;
-                    let hay = b.lines[li].text();
-                    let before = if k == 0 { start.index } else { hay.len() };
-                    if let Some(r) = search::rfind(hay, &needle, case, before) {
-                        return Some((li, r));
-                    }
+        let cur = self.view.cursor;
+        let (start, end) = self.view.selection().unwrap_or((cur, cur));
+        let doc = &self.view.doc;
+        let n = doc.len_lines();
+        let mut found = None;
+        for k in 0..=n {
+            if forward {
+                let li = (end.line + k) % n;
+                let from = if k == 0 { end.index } else { 0 };
+                if let Some(r) = search::find(&doc.line(li), &needle, case, from) {
+                    found = Some((li, r));
+                    break;
+                }
+            } else {
+                let li = (start.line + n * 2 - k) % n;
+                let hay = doc.line(li);
+                let before = if k == 0 { start.index } else { hay.len() };
+                if let Some(r) = search::rfind(&hay, &needle, case, before) {
+                    found = Some((li, r));
+                    break;
                 }
             }
-            None
-        });
+        }
         match found {
             Some((li, r)) => {
-                self.editor.set_selection(Selection::Normal(Cursor::new(li, r.start)));
-                self.editor.set_cursor(Cursor::new(li, r.end));
+                self.view.set_selection(Cursor::new(li, r.start), Cursor::new(li, r.end));
                 self.status_msg = None;
                 true
             }
@@ -537,9 +409,10 @@ impl App {
     fn replace_one(&mut self) {
         let needle = self.find.find.text.clone();
         let repl = self.find.repl.text.clone();
-        let sel = self.editor.copy_selection().unwrap_or_default();
+        let sel = self.view.selected_text().unwrap_or_default();
         if !sel.is_empty() && search::find(&sel, &needle, self.find.case, 0) == Some(0..sel.len()) {
-            self.edit_with(|e| e.insert_string(&repl, None));
+            self.view.replace_selection(&repl, false);
+            self.edited();
         }
         self.find_next(true);
     }
@@ -551,30 +424,23 @@ impl App {
             return;
         }
         let case = self.find.case;
-        let matches: Vec<(usize, Range<usize>)> = self.editor.with_buffer(|b| {
-            let mut v = Vec::new();
-            for (li, l) in b.lines.iter().enumerate() {
-                let mut from = 0;
-                while let Some(r) = search::find(l.text(), &needle, case, from) {
-                    from = r.end;
-                    v.push((li, r));
-                }
+        let doc = &self.view.doc;
+        let mut ranges = Vec::new();
+        for li in 0..doc.len_lines() {
+            let line = doc.line(li);
+            let mut from = 0;
+            while let Some(r) = search::find(&line, &needle, case, from) {
+                from = r.end;
+                ranges.push((Cursor::new(li, r.start), Cursor::new(li, r.end)));
             }
-            v
-        });
-        let Some(first) = matches.first().cloned() else {
+        }
+        if ranges.is_empty() {
             self.status_msg = Some(format!("Cannot find \"{needle}\""));
             return;
-        };
-        self.edit_with(|e| {
-            e.set_selection(Selection::None);
-            for (li, r) in matches.iter().rev() {
-                e.delete_range(Cursor::new(*li, r.start), Cursor::new(*li, r.end));
-                e.insert_at(Cursor::new(*li, r.start), &repl, None);
-            }
-            e.set_cursor(Cursor::new(first.0, first.1.start));
-        });
-        self.status_msg = Some(format!("Replaced {} occurrence(s)", matches.len()));
+        }
+        self.view.replace_many(&ranges, &repl);
+        self.edited();
+        self.status_msg = Some(format!("Replaced {} occurrence(s)", ranges.len()));
     }
 
     fn find_action(&mut self, a: FindAction) {
@@ -621,29 +487,31 @@ impl App {
             }
             Cmd::Rename => self.rename(),
             Cmd::Print => self.print(),
-            Cmd::Undo => self.undo(),
-            Cmd::Redo => self.redo(),
+            Cmd::Undo => {
+                self.view.undo();
+                self.edited();
+            }
+            Cmd::Redo => {
+                self.view.redo();
+                self.edited();
+            }
             Cmd::Cut => {
                 self.copy();
-                self.edit_with(|e| {
-                    e.delete_selection();
-                });
+                self.view.delete_selection();
+                self.edited();
             }
             Cmd::Copy => self.copy(),
             Cmd::Paste => {
                 if let Some(t) = self.get_clipboard() {
-                    self.edit_with(|e| e.insert_string(&t, None));
+                    self.view.replace_selection(&t, false);
+                    self.edited();
                 }
             }
-            Cmd::Delete => self.edit_action(Action::Delete, false),
-            Cmd::SelectAll => {
-                let end = self.editor.with_buffer(|b| {
-                    let l = b.lines.len() - 1;
-                    Cursor::new(l, b.lines[l].text().len())
-                });
-                self.editor.set_selection(Selection::Normal(Cursor::new(0, 0)));
-                self.editor.set_cursor(end);
+            Cmd::Delete => {
+                self.view.delete();
+                self.edited();
             }
+            Cmd::SelectAll => self.view.select_all(),
             Cmd::Find => self.open_find(false),
             Cmd::Replace => self.open_find(true),
             Cmd::FindNext => {
@@ -654,14 +522,6 @@ impl App {
             }
             Cmd::WordWrap => {
                 self.settings.wrap = !self.settings.wrap;
-                let wrap = if self.settings.wrap { Wrap::WordOrGlyph } else { Wrap::None };
-                self.editor.with_buffer_mut(|b| {
-                    b.set_wrap(wrap);
-                    let mut s = b.scroll();
-                    s.horizontal = 0.0;
-                    b.set_scroll(s);
-                });
-                self.reveal_cursor();
                 self.settings.save();
             }
             Cmd::Font => {
@@ -713,14 +573,7 @@ impl App {
             self.settings.font_pt = pt.clamp(4.0, 200.0);
         }
         self.settings.save();
-        let attrs = font_attrs(&self.settings.font_family);
-        let list = AttrsList::new(&attrs);
-        self.editor.with_buffer_mut(|b| {
-            for line in b.lines.iter_mut() {
-                line.set_attrs_list(list.clone());
-            }
-            b.set_redraw(true);
-        });
+        self.view.set_font(&self.settings.font_family);
         self.applied.2 = 0.0; // force metrics refresh
     }
 
@@ -766,7 +619,7 @@ impl App {
             return;
         }
         self.needs_redraw = true;
-        let primary = if MAC { self.mods.super_key() } else { self.mods.control_key() };
+        let primary = self.primary();
         let (shift, alt) = (self.mods.shift_key(), self.mods.alt_key());
         let c = shortcut_char(&ev);
         let named = match &ev.logical_key {
@@ -814,13 +667,14 @@ impl App {
                 None => {}
             }
             if let Some(d) = &mut self.font_dlg
-                && d.field == 0 {
-                    let list = d.filtered();
-                    if !list.iter().any(|f| Some(*f) == d.selected.as_deref()) {
-                        d.selected = list.first().map(|s| s.to_string());
-                        d.scroll = 0;
-                    }
+                && d.field == 0
+            {
+                let list = d.filtered();
+                if !list.iter().any(|f| Some(*f) == d.selected.as_deref()) {
+                    d.selected = list.first().map(|s| s.to_string());
+                    d.scroll = 0;
                 }
+            }
             return;
         }
 
@@ -843,14 +697,17 @@ impl App {
             return;
         }
 
-        // Alt+letter opens a menu (not on macOS, where the menu bar works differently).
-        if alt && !primary && !MAC
-            && let Some(i) = c.and_then(|c| "feov".find(c)) {
-                self.menu.open = Some(i);
-                self.menu.hover = None;
-                self.menu.key(NavKey::Down);
-                return;
-            }
+        // Alt+letter opens a menu (not on macOS, where Option types characters).
+        if alt
+            && !primary
+            && !MAC
+            && let Some(i) = c.and_then(|c| "feov".find(c))
+        {
+            self.menu.open = Some(i);
+            self.menu.hover = None;
+            self.menu.key(NavKey::Down);
+            return;
+        }
 
         let in_find = self.find.visible && self.find.focus;
         if let Some(cmd) = self.shortcut(&ev, c, primary, shift, alt) {
@@ -906,62 +763,49 @@ impl App {
         // macOS: Option moves by word, Cmd by line/document. Elsewhere Ctrl moves by word.
         let word = if MAC { alt } else { primary };
         let line = MAC && primary;
-        let handled = match named {
+        let motion = match named {
             Some(NamedKey::ArrowLeft) => {
-                self.motion(if line { Motion::Home } else if word { Motion::LeftWord } else { Motion::Left }, shift);
-                true
+                Some(if line { Motion::Home } else if word { Motion::LeftWord } else { Motion::Left })
             }
             Some(NamedKey::ArrowRight) => {
-                self.motion(if line { Motion::End } else if word { Motion::RightWord } else { Motion::Right }, shift);
-                true
+                Some(if line { Motion::End } else if word { Motion::RightWord } else { Motion::Right })
             }
-            Some(NamedKey::ArrowUp) => {
-                self.motion(if line { Motion::BufferStart } else { Motion::Up }, shift);
-                true
-            }
-            Some(NamedKey::ArrowDown) => {
-                self.motion(if line { Motion::BufferEnd } else { Motion::Down }, shift);
-                true
-            }
-            Some(NamedKey::Home) => {
-                self.motion(if primary { Motion::BufferStart } else { Motion::Home }, shift);
-                true
-            }
-            Some(NamedKey::End) => {
-                self.motion(if primary { Motion::BufferEnd } else { Motion::End }, shift);
-                true
-            }
-            Some(NamedKey::PageUp) => {
-                self.motion(Motion::PageUp, shift);
-                true
-            }
-            Some(NamedKey::PageDown) => {
-                self.motion(Motion::PageDown, shift);
+            Some(NamedKey::ArrowUp) => Some(if line { Motion::BufferStart } else { Motion::Up }),
+            Some(NamedKey::ArrowDown) => Some(if line { Motion::BufferEnd } else { Motion::Down }),
+            Some(NamedKey::Home) => Some(if primary { Motion::BufferStart } else { Motion::Home }),
+            Some(NamedKey::End) => Some(if primary { Motion::BufferEnd } else { Motion::End }),
+            Some(NamedKey::PageUp) => Some(Motion::PageUp),
+            Some(NamedKey::PageDown) => Some(Motion::PageDown),
+            _ => None,
+        };
+        if let Some(m) = motion {
+            self.view.motion(&mut self.gfx.fs, m, shift);
+            return;
+        }
+        let edited = match named {
+            Some(NamedKey::Backspace) if word => {
+                self.view.delete_word(&mut self.gfx.fs, false);
                 true
             }
             Some(NamedKey::Backspace) => {
-                if word {
-                    self.delete_word(false)
-                } else {
-                    self.edit_action(Action::Backspace, false)
-                }
+                self.view.backspace();
+                true
+            }
+            Some(NamedKey::Delete) if word => {
+                self.view.delete_word(&mut self.gfx.fs, true);
                 true
             }
             Some(NamedKey::Delete) => {
-                if word {
-                    self.delete_word(true)
-                } else {
-                    self.edit_action(Action::Delete, false)
-                }
+                self.view.delete();
                 true
             }
             Some(NamedKey::Enter) => {
-                self.edit_action(Action::Enter, false);
+                self.view.replace_selection("\n", false);
                 true
             }
             Some(NamedKey::Tab) => {
                 if !primary {
-                    self.type_text("\t");
+                    self.view.type_text("\t");
                 }
                 true
             }
@@ -969,42 +813,43 @@ impl App {
                 if self.find.visible {
                     self.find_action(FindAction::Close);
                 } else {
-                    self.editor.action(&mut self.gfx.fs, Action::Escape);
+                    self.view.clear_selection();
                 }
-                true
+                false
             }
-            _ => false,
+            _ => match text {
+                Some(t) if typing => {
+                    self.view.type_text(t);
+                    true
+                }
+                _ => false,
+            },
         };
-        if !handled && typing
-            && let Some(t) = text {
-                self.type_text(t);
-            }
+        if edited {
+            self.edited();
+        }
     }
 
     // ---------------------------------------------------------------- mouse
 
-    fn editor_point(&self, p: (f32, f32)) -> (i32, i32) {
+    /// Converts a window point to coordinates relative to the text origin.
+    fn text_point(&self, p: (f32, f32)) -> (f32, f32) {
         let pad = (6.0 * self.scale).round();
-        let hs = self.editor.with_buffer(|b| b.scroll().horizontal);
-        ((p.0 - self.layout.text.x - pad + hs) as i32, (p.1 - self.layout.text.y) as i32)
+        (p.0 - self.layout.text.x - pad + self.view.h_scroll(), p.1 - self.layout.text.y)
     }
 
     fn url_at(&self, p: (f32, f32)) -> Option<(usize, Range<usize>, String)> {
         if !self.layout.text.contains(p) {
             return None;
         }
-        let (x, y) = self.editor_point(p);
-        let (x, y) = (x as f32, y as f32);
-        self.editor.with_buffer(|b| {
-            let run = b.layout_runs().find(|r| y >= r.line_top && y < r.line_top + r.line_height)?;
-            let g = run.glyphs.iter().find(|g| x >= g.x && x < g.x + g.w)?;
-            let r = search::find_urls(run.text).into_iter().find(|r| g.start >= r.start && g.start < r.end)?;
-            Some((run.line_i, r.clone(), run.text[r].to_owned()))
-        })
+        let (x, y) = self.text_point(p);
+        self.view.url_at(x, y)
     }
 
+    /// (thumb rect, track travel, total lines)
     fn scrollbar(&self) -> Option<(Rect, f32, usize)> {
-        let (total, line, lh) = self.editor.with_buffer(|b| (b.lines.len(), b.scroll().line, b.metrics().line_height));
+        let (total, line) = self.view.scroll_info();
+        let lh = self.view.line_h();
         let track = self.layout.vbar;
         let vis = (track.h / lh).max(1.0);
         if total as f32 <= vis && line == 0 {
@@ -1017,12 +862,13 @@ impl App {
 
     fn update_cursor_icon(&mut self) {
         let p = self.mouse;
-        let primary = if MAC { self.mods.super_key() } else { self.mods.control_key() };
         let icon = if self.prompt.is_some() || self.font_dlg.is_some() || self.menu.open.is_some() {
             CursorIcon::Default
         } else if self.layout.text.contains(p) {
-            if primary && self.hover_url.is_some() { CursorIcon::Pointer } else { CursorIcon::Text }
-        } else if self.find.visible && self.find.hit(p).is_some_and(|a| matches!(a, FindAction::FocusFind | FindAction::FocusReplace)) {
+            if self.primary() && self.hover_url.is_some() { CursorIcon::Pointer } else { CursorIcon::Text }
+        } else if self.find.visible
+            && self.find.hit(p).is_some_and(|a| matches!(a, FindAction::FocusFind | FindAction::FocusReplace))
+        {
             CursorIcon::Text
         } else {
             CursorIcon::Default
@@ -1042,25 +888,21 @@ impl App {
         }
         match self.drag {
             Drag::Text => {
-                let (x, y) = self.editor_point(p);
                 let t = self.layout.text;
                 if p.1 < t.y {
-                    self.editor.action(&mut self.gfx.fs, Action::Scroll { pixels: -(t.y - p.1) });
+                    self.view.scroll_px(-(t.y - p.1));
                 } else if p.1 > t.bottom() {
-                    self.editor.action(&mut self.gfx.fs, Action::Scroll { pixels: p.1 - t.bottom() });
+                    self.view.scroll_px(p.1 - t.bottom());
                 }
-                self.editor.action(&mut self.gfx.fs, Action::Drag { x, y: y.clamp(0, t.h as i32 - 1) });
+                self.view.prepare(&mut self.gfx.fs);
+                let (x, y) = self.text_point(p);
+                self.view.drag(x, y.clamp(0.0, t.h - 1.0));
                 self.needs_redraw = true;
             }
             Drag::Thumb(grab) => {
-                if let Some((thumb, range, total)) = self.scrollbar() {
+                if let Some((_, range, total)) = self.scrollbar() {
                     let frac = ((p.1 - grab - self.layout.vbar.y) / range.max(1.0)).clamp(0.0, 1.0);
-                    let line = (frac * (total - 1) as f32).round() as usize;
-                    let _ = thumb;
-                    self.editor.with_buffer_mut(|b| {
-                        let h = b.scroll().horizontal;
-                        b.set_scroll(Scroll::new(line, 0.0, h));
-                    });
+                    self.view.scroll_to_line((frac * (total - 1) as f32).round() as usize);
                     self.needs_redraw = true;
                 }
             }
@@ -1138,38 +980,30 @@ impl App {
                     self.drag = Drag::Thumb(p.1 - thumb.y);
                 } else {
                     let page = self.layout.text.h * 0.9;
-                    let px = if p.1 < thumb.y { -page } else { page };
-                    self.editor.action(&mut self.gfx.fs, Action::Scroll { pixels: px });
+                    self.view.scroll_px(if p.1 < thumb.y { -page } else { page });
                 }
             }
             return;
         }
         if self.layout.text.contains(p) {
             self.find.focus = false;
-            self.can_merge = false;
-            let primary = if MAC { self.mods.super_key() } else { self.mods.control_key() };
-            if primary
-                && let Some((_, _, url)) = self.url_at(p) {
-                    let target = search::url_target(&url);
-                    if let Err(e) = open::that_detached(&target) {
-                        self.status_msg = Some(format!("Could not open {target}: {e}"));
-                    }
-                    return;
+            if self.primary()
+                && let Some((_, _, url)) = self.url_at(p)
+            {
+                let target = search::url_target(&url);
+                if let Err(e) = open::that_detached(&target) {
+                    self.status_msg = Some(format!("Could not open {target}: {e}"));
                 }
-            let (x, y) = self.editor_point(p);
-            let action = match n {
-                2 => Action::DoubleClick { x, y },
-                3 => Action::TripleClick { x, y },
-                _ if self.mods.shift_key() => Action::Drag { x, y },
-                _ => Action::Click { x, y },
-            };
-            self.editor.action(&mut self.gfx.fs, action);
+                return;
+            }
+            let (x, y) = self.text_point(p);
+            self.view.click(x, y, n, self.mods.shift_key());
             self.drag = Drag::Text;
         }
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
-        let lh = self.editor.with_buffer(|b| b.metrics().line_height);
+        let lh = self.view.line_h();
         let (mut dx, mut dy) = match delta {
             MouseScrollDelta::LineDelta(x, y) => (x * 3.0 * lh, y * 3.0 * lh),
             MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
@@ -1182,8 +1016,7 @@ impl App {
         if self.prompt.is_some() {
             return;
         }
-        let primary = if MAC { self.mods.super_key() } else { self.mods.control_key() };
-        if primary {
+        if self.primary() {
             if dy != 0.0 {
                 self.run(if dy > 0.0 { Cmd::ZoomIn } else { Cmd::ZoomOut });
                 self.needs_redraw = true;
@@ -1194,14 +1027,10 @@ impl App {
             (dx, dy) = (dy, 0.0);
         }
         if dy != 0.0 {
-            self.editor.action(&mut self.gfx.fs, Action::Scroll { pixels: -dy });
+            self.view.scroll_px(-dy);
         }
         if dx != 0.0 && !self.settings.wrap {
-            self.editor.with_buffer_mut(|b| {
-                let mut s = b.scroll();
-                s.horizontal = (s.horizontal - dx).max(0.0);
-                b.set_scroll(s);
-            });
+            self.view.scroll_h(-dx);
         }
         self.hover_url = None;
         self.needs_redraw = true;
@@ -1230,10 +1059,7 @@ impl App {
         let want = ((self.layout.text.w - 2.0 * pad).max(1.0), text_h, font_px, line_h, self.settings.wrap);
         if want != self.applied {
             self.applied = want;
-            self.editor.with_buffer_mut(|b| {
-                b.set_metrics_and_size(Metrics::new(font_px, line_h), Some(want.0), Some(want.1));
-            });
-            self.reveal_cursor();
+            self.view.set_geometry(font_px, line_h, want.0, want.1, want.4);
         }
     }
 
@@ -1242,61 +1068,13 @@ impl App {
         let s = self.scale;
         let area = self.layout.text;
         let pad = (6.0 * s).round();
-        let show_caret = self.focused && !(self.find.visible && self.find.focus) && self.prompt.is_none() && self.font_dlg.is_none();
-        self.editor.shape_as_needed(&mut self.gfx.fs, true);
-        let sel = self.editor.selection_bounds();
-        let cursor = self.editor.cursor();
-        let hover = self.hover_url.clone();
-        let Gfx { fs, cache, .. } = &mut self.gfx;
-        cv.set_clip(area);
-        let mut caret = None;
-        self.editor.with_buffer(|b| {
-            let ox = area.x + pad - b.scroll().horizontal;
-            let oy = area.y;
-            let mut url_line = usize::MAX;
-            let mut urls = Vec::new();
-            let px1 = s.max(1.0).round();
-            for run in b.layout_runs() {
-                let li = run.line_i;
-                let top = oy + run.line_top;
-                if let Some((a, z)) = sel.filter(|(a, z)| li >= a.line && li <= z.line) {
-                    let hl: Vec<(f32, f32)> = run.highlight(a, z).collect();
-                    if hl.is_empty() && run.glyphs.is_empty() && z.line > li {
-                        cv.fill(Rect::new(area.x, top, area.w, run.line_height), th.sel);
-                    }
-                    let n = hl.len();
-                    for (k, (x, w)) in hl.into_iter().enumerate() {
-                        let (mut x0, mut x1) = (ox + x, ox + x + w);
-                        if k + 1 == n && z.line > li {
-                            if run.rtl { x0 = area.x } else { x1 = area.right() }
-                        }
-                        cv.fill(Rect::new(x0, top, x1 - x0, run.line_height), th.sel);
-                    }
-                }
-                if li != url_line {
-                    url_line = li;
-                    urls = search::find_urls(run.text);
-                }
-                for g in run.glyphs {
-                    let in_url = urls.iter().any(|r| g.start >= r.start && g.start < r.end);
-                    let selected = sel.is_some_and(|(a, z)| {
-                        li >= a.line && li <= z.line && (a.line != li || g.end > a.index) && (z.line != li || g.start < z.index)
-                    });
-                    let color = if selected { th.sel_fg } else if in_url { th.link } else { th.fg };
-                    let pg = g.physical((ox, oy + run.line_y), 1.0);
-                    cache.with_pixels(fs, pg.cache_key, color, |x, y, c| cv.blend(pg.x + x, pg.y + y, c));
-                    if let Some((hl, hr)) = &hover
-                        && *hl == li && g.start >= hr.start && g.start < hr.end {
-                            cv.fill(Rect::new(ox + g.x, oy + run.line_y + 2.0 * s, g.w, px1), th.link);
-                        }
-                }
-                if li == cursor.line
-                    && let Some(x) = run.cursor_position(&cursor) {
-                        caret = Some(((ox + x).round(), top, run.line_height));
-                    }
-            }
-        });
+        let show_caret =
+            self.focused && !(self.find.visible && self.find.focus) && self.prompt.is_none() && self.font_dlg.is_none();
+        self.view.prepare(&mut self.gfx.fs);
+        let caret =
+            self.view.draw(&mut self.gfx.fs, &mut self.gfx.cache, cv, area, pad, &th, s, self.hover_url.as_ref());
         if let Some((x, y, h)) = caret {
+            cv.set_clip(area);
             if !self.preedit.is_empty() {
                 let w = self.gfx.text_w(&self.preedit);
                 let r = Rect::new(x, y, w + 4.0 * s, h);
@@ -1306,17 +1084,16 @@ impl App {
             } else if show_caret {
                 cv.fill(Rect::new(x, y, s.max(1.0).round(), h), th.fg);
             }
+            cv.reset_clip();
             if let Some(w) = &self.window {
                 w.set_ime_cursor_area(PhysicalPosition::new(x as f64, y as f64), PhysicalSize::new(1.0, h as f64));
             }
         }
-        cv.reset_clip();
 
         // Scrollbar.
         cv.fill(self.layout.vbar, th.bg);
         if let Some((thumb, _, _)) = self.scrollbar() {
-            let c = if self.drag != Drag::None && matches!(self.drag, Drag::Thumb(_)) { th.dim } else { th.border };
-            cv.fill(thumb, c);
+            cv.fill(thumb, if matches!(self.drag, Drag::Thumb(_)) { th.dim } else { th.border });
         }
     }
 
@@ -1328,29 +1105,14 @@ impl App {
         let (th, s) = (self.theme, self.scale);
         cv.fill(r, th.chrome);
         cv.fill(Rect::new(r.x, r.y, r.w, s.max(1.0)), th.border);
-        let cur = self.editor.cursor();
-        let sel = self.editor.selection_bounds();
-        let (col, selected) = self.editor.with_buffer(|b| {
-            let col = b.lines[cur.line].text()[..cur.index].chars().count() + 1;
-            let selected = sel.map(|(a, z)| {
-                if z.line - a.line > 10_000 {
-                    return format!("{} lines selected", z.line - a.line + 1);
-                }
-                let mut n = 0;
-                for li in a.line..=z.line {
-                    let t = b.lines[li].text();
-                    let s0 = if li == a.line { a.index } else { 0 };
-                    let s1 = if li == z.line { z.index } else { t.len() };
-                    n += t[s0..s1].chars().count() + (li != z.line) as usize;
-                }
-                format!("{n} selected")
-            });
-            (col, selected)
-        });
+        let cur = self.view.cursor;
+        let doc = &self.view.doc;
+        let col = doc.line(cur.line)[..cur.index].chars().count() + 1;
+        let selected = self.view.selection().map(|(a, z)| doc.chars_between(a, z));
         let left = match &self.status_msg {
             Some(m) => m.clone(),
-            None => match selected.filter(|s| !s.starts_with("0 ")) {
-                Some(sel) => format!("Ln {}, Col {}   ({sel})", cur.line + 1, col),
+            None => match selected {
+                Some(n) => format!("Ln {}, Col {}   ({n} selected)", cur.line + 1, col),
                 None => format!("Ln {}, Col {}", cur.line + 1, col),
             },
         };
@@ -1377,14 +1139,15 @@ impl App {
         let Some(mut surface) = self.surface.take() else { return };
         let size = win.inner_size();
         if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-            && surface.resize(w, h).is_ok() {
-                self.compute_layout(size.width as f32, size.height as f32);
-                if let Ok(mut buf) = surface.buffer_mut() {
-                    let mut cv = Canvas::new(&mut buf, size.width, size.height);
-                    self.paint(&mut cv);
-                    let _ = buf.present();
-                }
+            && surface.resize(w, h).is_ok()
+        {
+            self.compute_layout(size.width as f32, size.height as f32);
+            if let Ok(mut buf) = surface.buffer_mut() {
+                let mut cv = Canvas::new(&mut buf, size.width, size.height);
+                self.paint(&mut cv);
+                let _ = buf.present();
             }
+        }
         self.surface = Some(surface);
         let title = format!("{}{} - {APP}", if self.is_dirty() { "*" } else { "" }, self.doc_name());
         if title != self.title {
@@ -1403,12 +1166,10 @@ impl App {
         self.draw_status(cv);
         self.menu.draw_bar(&mut self.gfx, cv, &th, self.layout.menu, s);
         if self.menu.open.is_some() {
-            let checked = |c: Cmd| self.checked(c);
-            // `checked` borrows self immutably; draw with a snapshot of check states instead.
             let states: Vec<(Cmd, bool)> = ui::MENUS
                 .iter()
                 .flat_map(|(_, items)| items.iter().filter_map(|i| i.cmd))
-                .map(|c| (c, checked(c)))
+                .map(|c| (c, self.checked(c)))
                 .collect();
             self.menu.draw_dropdown(&mut self.gfx, cv, &th, s, |c| states.iter().any(|(k, v)| *k == c && *v));
         }
@@ -1456,9 +1217,10 @@ fn shortcut_char(ev: &KeyEvent) -> Option<char> {
     if let Key::Character(s) = ev.key_without_modifiers() {
         let mut it = s.chars();
         if let (Some(c), None) = (it.next(), it.next())
-            && c.is_ascii() {
-                return Some(c.to_ascii_lowercase());
-            }
+            && c.is_ascii()
+        {
+            return Some(c.to_ascii_lowercase());
+        }
     }
     let PhysicalKey::Code(code) = ev.physical_key else { return None };
     Some(match code {
@@ -1545,7 +1307,8 @@ impl ApplicationHandler for App {
                             if self.find.visible && self.find.focus {
                                 self.find.field_mut().key(FieldKey::Insert(&text));
                             } else {
-                                self.type_text(&text);
+                                self.view.type_text(&text);
+                                self.edited();
                             }
                         }
                     }
@@ -1574,9 +1337,10 @@ impl ApplicationHandler for App {
             return;
         }
         if std::mem::take(&mut self.needs_redraw)
-            && let Some(w) = &self.window {
-                w.request_redraw();
-            }
+            && let Some(w) = &self.window
+        {
+            w.request_redraw();
+        }
     }
 }
 

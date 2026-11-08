@@ -107,16 +107,24 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
   and GPU stacks typically use 60–150 MB of memory on their own.
 - **Repaints only when something changes.** Moving the mouse repaints only if the hovered URL, the menu
   highlight or a drag actually changes.
-- **Only visible text is laid out.** Lines are shaped when they scroll into view, and the shaping data for
-  lines scrolled past is discarded.
+- **The document is stored in a rope (`ropey`), outside the layout engine.** The whole text lives in a
+  compact rope, which adds about 10% over the file size. Only a window of a few hundred lines around the
+  viewport is loaded into cosmic-text. That matters because cosmic-text spends about 330 bytes of
+  bookkeeping on every line it holds, before any layout. As you scroll, lines are swapped in and out of
+  the window, and lines already laid out are reused. The cursor, selection and undo history are stored
+  in whole-document positions, so they work across the entire file. Search, Replace All, the selection
+  count and saving all work on the rope directly.
+- **Only visible text is laid out.** Lines are shaped when they scroll into view, and the shaping data
+  for lines scrolled past is discarded.
 - **Fonts are memory-mapped.** The system font database maps font files into memory rather than reading
   them into the heap, and loads only font metadata at startup.
 - **UI text is cached.** Labels such as menus and buttons are shaped once and reused. The cache is capped at 512 entries.
-- **Printing uses its own short-lived memory.** Pages are rendered one at a time into a separate glyph
-  cache, so high-resolution print glyphs never stay in the editor's memory. On macOS and Linux the PDF is
+- **Printing uses its own short-lived memory.** The document is laid out 256 lines at a time and pages are
+  rendered one by one into a separate glyph cache, so printing a huge file never holds its whole layout,
+  and high-resolution print glyphs never stay in the editor's memory. On macOS and Linux the PDF is
   written to disk page by page as it's produced.
 - **Undo stores changes, not copies.** Each undo step records only what changed, never a snapshot of the
-  document, and consecutive keystrokes are merged into one step per word.
+  document, and consecutive keystrokes are merged into one step per word. Replace All is a single step.
 - **Case-insensitive search doesn't copy the document.** Text is compared character by character in place,
   instead of lowercasing a copy of each line.
 - **Small dependencies where possible.** Windows-1252 conversion uses a 32-entry table instead of
@@ -132,12 +140,16 @@ Measured on Linux/X11 with a release build:
 |---|---|
 | Binary size | ~5 MB |
 | Memory with a small file open | ~18 MB, of which ~14 MB is shared libraries and memory-mapped fonts and under 2 MB is the app's own heap |
-| 27 MB, 400k-line file | opens in ~0.2 s and uses ~175 MB (see TODO) |
+| 27 MB, 400k-line file | opens in ~0.2 s and uses ~48 MB, of which ~33 MB is the app's heap (it used ~175 MB before the rope and window change). Loading briefly peaks at ~67 MB. |
 
 ## TODO
 
-- [ ] **Reduce memory for large files.** cosmic-text spends about 330 bytes per line. Keep only the visible
-      part of the document in the layout engine and store the rest compactly, for example in a rope.
+- [x] Reduce memory for large files: the document is now held in a rope and only a window of lines is laid out
+- [ ] Lower the peak memory while loading. Today the file bytes, the decoded string and the rope are briefly
+      in memory together. Decoding straight into the rope would avoid that.
+- [ ] Handle very long single lines, such as minified files. cosmic-text shapes a whole line at once, so a
+      multi-megabyte line is slow to display.
+- [ ] Open several documents at once, in tabs
 - [ ] Use the native macOS menu bar at the top of the screen instead of the in-window menu bar
 - [ ] Add a print dialog on macOS and Linux (page setup, choice of printer, copies)
 - [ ] Add a horizontal scrollbar when word wrap is off

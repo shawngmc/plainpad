@@ -27,7 +27,8 @@ impl PageSetup {
 }
 
 pub struct Job<'a> {
-    pub text: &'a str,
+    pub lines: usize,
+    pub line: &'a dyn Fn(usize) -> String,
     pub family: &'a str,
     pub font_pt: f32,
 }
@@ -37,6 +38,57 @@ pub struct Raster<'a> {
     pub h: u32,
     /// Row-major 8-bit grey, 255 = white.
     pub px: &'a [u8],
+}
+
+/// Document lines laid out per batch, so even huge documents only ever have
+/// one batch of layout in memory.
+const BATCH: usize = 256;
+
+struct Pager<'a, F> {
+    w: u32,
+    h: u32,
+    margin: f32,
+    raster: Vec<u8>,
+    footer: Buffer,
+    footer_px: f32,
+    page: usize,
+    pages: usize,
+    sink: &'a mut F,
+}
+
+fn plot(raster: &mut [u8], w: u32, h: u32, x: i32, y: i32, c: Color) {
+    if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+        let p = &mut raster[(y as u32 * w + x as u32) as usize];
+        *p = (*p).min(255 - c.a());
+    }
+}
+
+impl<F: FnMut(usize, usize, Raster) -> io::Result<()>> Pager<'_, F> {
+    fn emit(&mut self, fs: &mut FontSystem, cache: &mut SwashCache) -> io::Result<()> {
+        let (w, h) = (self.w, self.h);
+        self.footer.set_text(
+            &format!("Page {} of {}", self.page + 1, self.pages),
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
+        self.footer.shape_until_scroll(fs, false);
+        let raster = &mut self.raster;
+        for run in self.footer.layout_runs() {
+            let x = (w as f32 - run.line_w) / 2.0;
+            let y = h as f32 - self.margin + self.footer_px * 0.5;
+            for g in run.glyphs {
+                let pg = g.physical((x, y + run.line_y), 1.0);
+                cache.with_pixels(fs, pg.cache_key, Color::rgb(0, 0, 0), |gx, gy, c| {
+                    plot(raster, w, h, pg.x + gx, pg.y + gy, c)
+                });
+            }
+        }
+        (self.sink)(self.page, self.pages, Raster { w, h, px: &self.raster })?;
+        self.raster.fill(255);
+        self.page += 1;
+        Ok(())
+    }
 }
 
 /// Lays out `job`, renders each page and passes it to `sink(page_index, page_count, raster)`.
@@ -54,6 +106,7 @@ pub fn render_pages(
     let lh = (font_px * 1.25).ceil();
     let content_w = (w as f32 - 2.0 * margin).max(dpi);
     let content_h = (h as f32 - 2.0 * margin - lh * 1.5).max(lh);
+    let lines_per_page = ((content_h / lh).floor() as usize).max(1);
 
     let attrs = if job.family.is_empty() {
         Attrs::new().family(Family::Monospace)
@@ -63,54 +116,60 @@ pub fn render_pages(
     let mut buf = Buffer::new(fs, Metrics::new(font_px, lh));
     buf.set_wrap(Wrap::WordOrGlyph);
     buf.set_size(Some(content_w), None);
-    buf.set_text(job.text, &attrs, Shaping::Advanced, None);
-    buf.shape_until_scroll(fs, false);
+    let layout = |buf: &mut Buffer, fs: &mut FontSystem, start: usize| {
+        let end = (start + BATCH).min(job.lines);
+        let text: Vec<String> = (start..end).map(job.line).collect();
+        buf.set_text(&text.join("\n"), &attrs, Shaping::Advanced, None);
+        buf.shape_until_scroll(fs, false);
+    };
 
-    let lines_per_page = ((content_h / lh).floor() as usize).max(1);
-    let total = buf.layout_runs().count();
+    // Pass 1: count visual lines so the footer can say "Page n of m".
+    let mut total = 0;
+    for start in (0..job.lines).step_by(BATCH) {
+        layout(&mut buf, fs, start);
+        total += buf.layout_runs().count();
+    }
     let pages = total.div_ceil(lines_per_page).max(1);
 
     let footer_px = (9.0 * dpi / 72.0).round();
     let mut footer = Buffer::new(fs, Metrics::new(footer_px, footer_px * 1.3));
     footer.set_size(None, None);
-
-    let mut raster = vec![255u8; (w * h) as usize];
-    let mut runs = buf.layout_runs();
-    let black = Color::rgb(0, 0, 0);
-    let plot = |raster: &mut [u8], x: i32, y: i32, c: Color| {
-        if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
-            let p = &mut raster[(y as u32 * w + x as u32) as usize];
-            *p = (*p).min(255 - c.a());
-        }
+    let mut pager = Pager {
+        w,
+        h,
+        margin,
+        raster: vec![255u8; (w * h) as usize],
+        footer,
+        footer_px,
+        page: 0,
+        pages,
+        sink: &mut sink,
     };
-    for p in 0..pages {
-        raster.fill(255);
-        for k in 0..lines_per_page {
-            let Some(run) = runs.next() else { break };
-            let top = margin + k as f32 * lh;
+
+    // Pass 2: render.
+    let mut row = 0;
+    for start in (0..job.lines).step_by(BATCH) {
+        layout(&mut buf, fs, start);
+        for run in buf.layout_runs() {
+            let top = margin + row as f32 * lh;
             for g in run.glyphs {
                 let pg = g.physical((margin, top + run.line_y - run.line_top), 1.0);
-                cache.with_pixels(fs, pg.cache_key, black, |x, y, c| plot(&mut raster, pg.x + x, pg.y + y, c));
+                let raster = &mut pager.raster;
+                cache.with_pixels(fs, pg.cache_key, Color::rgb(0, 0, 0), |x, y, c| {
+                    plot(raster, w, h, pg.x + x, pg.y + y, c)
+                });
+            }
+            row += 1;
+            if row == lines_per_page {
+                pager.emit(fs, cache)?;
+                row = 0;
             }
         }
-        footer.set_text(
-            &format!("Page {} of {}", p + 1, pages),
-            &Attrs::new().family(Family::SansSerif),
-            Shaping::Advanced,
-            None,
-        );
-        footer.shape_until_scroll(fs, false);
-        for run in footer.layout_runs() {
-            let x = (w as f32 - run.line_w) / 2.0;
-            let y = h as f32 - margin + footer_px * 0.5;
-            for g in run.glyphs {
-                let pg = g.physical((x, y + run.line_y), 1.0);
-                cache.with_pixels(fs, pg.cache_key, black, |gx, gy, c| plot(&mut raster, pg.x + gx, pg.y + gy, c));
-            }
-        }
-        sink(p, pages, Raster { w, h, px: &raster })?;
     }
-    Ok(pages)
+    if row > 0 || pager.page == 0 {
+        pager.emit(fs, cache)?;
+    }
+    Ok(pager.page)
 }
 
 /// Streams rasterised pages into a minimal PDF (one Flate-compressed
