@@ -45,7 +45,10 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
   files. Snapshots are deleted as soon as a document is saved, closed or undone back to its saved state, and
   the folder is removed on a normal exit. Each running instance keeps its own locked folder, so several
   instances never take each other's snapshots. The timer only runs while there are unsnapshotted edits, so an
-  idle editor still never wakes up.
+  idle editor still never wakes up. Documents of 1 MB or more are snapshotted as an edit log on top of the
+  saved file (or one full copy), so each pause in typing writes only what changed. If such a file is changed
+  by another program and the editor then crashes before its next snapshot, its edits can't be rebuilt; the
+  next start says so rather than restoring the wrong text.
 - **Files changed by other programs:** when a window regains focus, its tabs' files are checked. A tab with
   no unsaved changes reloads silently, keeping its scroll position. A tab with unsaved changes asks whether to
   reload or keep your version (keeping is the default). A deleted file is reported and the tab marked modified.
@@ -271,6 +274,13 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
   rendered one by one into a separate glyph cache, so printing a huge file never holds its whole layout,
   and high-resolution print glyphs never stay in the editor's memory. On macOS and Linux the PDF is
   written to disk page by page as it's produced.
+- **Crash-recovery snapshots of big documents log edits.** Rewriting a 300 MB document after every pause
+  in typing wrote 290 MB each time, and kept a 284 MB copy in the recovery folder. From 1 MB up, the first
+  snapshot either names the file on disk (with its modified time and size), when the file still holds the
+  saved text, or writes one full copy; after that, each snapshot appends just the edits made since. The same
+  300 MB document now writes under 1 KB per pause, and its recovery folder holds 16 KB. The text is written
+  whole again only after a Replace All, once the log reaches a quarter of the document, or after a failed
+  write. Smaller documents are still written whole each time, which is simplest and costs little.
 - **Undo stores changes, not copies.** Each undo step records only what changed, never a snapshot of the
   document, and consecutive keystrokes are merged into one step per word. Replace All is a single step.
 - **Case-insensitive search doesn't copy the document.** Text is compared character by character in place,
@@ -375,8 +385,9 @@ Recently fixed:
 - [ ] Print in the background too (layout needs the font system, which lives on the window thread)
 - [ ] Undo and redo of a huge Replace All in the background (0.5 s on the window thread for 3.3M matches in 300 MB)
 - [ ] Measure startup on systems with thousands of fonts; consider caching the font database if it's slow
-- [ ] Crash-recovery snapshots rewrite the whole document 2 s after each pause in typing. For a 500 MB file
-      that is 500 MB written per pause; back off as documents grow, or record the original plus the undo history
+- [x] Crash-recovery snapshots rewrote the whole document 2 s after each pause in typing (290 MB per pause for
+      a 300 MB file). Big documents now log their edits instead: under 1 KB per pause
+- [ ] Restore crash-recovered documents in the background too (a 300 MB one takes ~0.5 s at startup)
 - [ ] A benchmark job in CI that fails on regressions: startup time, idle memory, memory with a 30 MB file and
       after closing it, keystroke time on a long line, binary size. Memory and size are reliable on shared
       runners; timings only roughly

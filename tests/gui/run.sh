@@ -210,6 +210,26 @@ w('needle at the end\\n')" > big.txt
     wait_until 10 sh -c '[ "$(tail -n 1 big.txt)" = "found the end" ]'
 }
 
+# Crash recovery of a big file logs edits instead of copying the document.
+x11_big_crash_recovery() {
+    python3 -c "print('some text for the snapshot test\\n' * 300_000, end='')" > rb.txt
+    start_app rb.txt
+    wait_until 5 x_win "rb.txt"
+    x_focus "rb.txt"
+    x_mark_when_loaded rb.txt
+    xdotool key ctrl+End; xdotool type "unsaved tail"
+    wait_until 6 sh -c "find '$CFG' -name '*.log' | grep -q ."
+    sleep 0.5
+    # A few hundred bytes on disk, not another 9 MB copy.
+    [ "$(du -sk "$CFG/plainpad/recovery" | cut -f1)" -lt 64 ]
+    kill -9 "$APP_PID"; wait "$APP_PID" 2>/dev/null; sleep 0.3
+    XDG_CONFIG_HOME=$CFG "$APP" >"$WORK/app.log" 2>&1 &
+    wait_until 10 x_win '\*rb.txt'
+    x_focus "rb.txt"
+    xdotool key ctrl+s
+    wait_until 5 sh -c '[ "$(tail -c 12 rb.txt)" = "unsaved tail" ] && [ "$(head -c 5 rb.txt)" = "#some" ]'
+}
+
 # ---------------------------------------------------------------- Wayland
 
 PTR_FIFO=$WORK/pointer.fifo
@@ -284,7 +304,7 @@ export DISPLAY=:91
 unset WAYLAND_DISPLAY
 wait_until 5 xdpyinfo >/dev/null 2>&1 || sleep 1
 for t in x11_type_and_save x11_clipboard x11_tabs_close_prompt x11_drag_tab_out x11_crash_recovery \
-         x11_reload_changed_file x11_long_line x11_big_file; do
+         x11_reload_changed_file x11_long_line x11_big_file x11_big_crash_recovery; do
     run_test $t
 done
 kill $XVFB 2>/dev/null

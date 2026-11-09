@@ -92,6 +92,50 @@ fn normalize(text: &str) -> Cow<'_, str> {
     if text.contains('\r') { Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n")) } else { Cow::Borrowed(text) }
 }
 
+/// One change, for the crash-recovery journal: `remove` bytes at byte offset
+/// `at` were replaced by `insert`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JournalOp {
+    pub at: usize,
+    pub remove: usize,
+    pub insert: String,
+}
+
+/// Changes since the journal was last taken; see [`Document::take_journal`].
+pub struct Journal {
+    /// Identifies the state the journal started from. It changes when the
+    /// document is saved, or the journal restarted.
+    pub epoch: u64,
+    /// The journal started from the saved text (so the saved file is a valid base).
+    pub from_saved: bool,
+    /// None if changes were too big to journal; the whole text must be written.
+    pub ops: Option<Vec<JournalOp>>,
+}
+
+/// Applies journal entries to `rope`, checking each lands inside the text and
+/// on character boundaries (a damaged journal must not panic).
+pub fn replay(rope: &mut Rope, ops: &[JournalOp]) -> Result<(), String> {
+    for op in ops {
+        let end = op.at.checked_add(op.remove).filter(|&e| e <= rope.len_bytes()).ok_or("edit past the end")?;
+        let (ca, cb) = (rope.byte_to_char(op.at), rope.byte_to_char(end));
+        if rope.char_to_byte(ca) != op.at || rope.char_to_byte(cb) != end {
+            return Err("edit inside a character".into());
+        }
+        rope.remove(ca..cb);
+        rope.insert(ca, &op.insert);
+    }
+    Ok(())
+}
+
+/// Unwritten journal entries beyond this give up on journaling until the next full snapshot.
+const JOURNAL_CAP: usize = 16 * 1024 * 1024;
+
+fn next_epoch() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct Document {
     rope: Rope,
     undo: VecDeque<Group>,
@@ -106,6 +150,13 @@ pub struct Document {
     can_merge: bool,
     /// Bumped on every change to the text, so autosave knows what's new.
     version: u64,
+    /// Edits not yet handed to crash recovery, and how much memory they use.
+    journal: Vec<JournalOp>,
+    journal_bytes: usize,
+    /// A change was too big to journal (Replace All, or too much unwritten).
+    journal_broken: bool,
+    epoch: u64,
+    epoch_from_saved: bool,
 }
 
 impl Document {
@@ -124,6 +175,11 @@ impl Document {
             saved: Some(0),
             can_merge: false,
             version: 0,
+            journal: Vec::new(),
+            journal_bytes: 0,
+            journal_broken: false,
+            epoch: next_epoch(),
+            epoch_from_saved: true,
         }
     }
 
@@ -235,8 +291,10 @@ impl Document {
         self.version += 1;
         let (ca, cb) = (self.char_idx(a), self.char_idx(b));
         let removed = self.rope.slice(ca..cb).to_string();
+        let at = self.offset(a);
         self.rope.remove(ca..cb);
         self.rope.insert(ca, text);
+        self.journal_push(JournalOp { at, remove: removed.len(), insert: text.to_owned() });
         let end = end_of(a, text);
         (removed, EditResult { start: a, old_end: b, first: a.line, old_last: b.line, new_last: end.line, end })
     }
@@ -322,6 +380,7 @@ impl Document {
     /// another thread, from a snapshot of this exact text).
     pub fn apply_prepared(&mut self, p: Prepared) {
         self.version += 1;
+        self.journal_break();
         self.rope = p.rope;
         self.record(vec![Op::Many(p.many)], false);
     }
@@ -335,6 +394,7 @@ impl Document {
             }
             Op::Many(m) if rebuild_pays(m, &self.rope) => {
                 self.version += 1;
+                self.journal_break();
                 self.rope = splice_many(&self.rope, m, false);
                 let (l, i) = m.starts[0];
                 Cursor::new(l, i + m.removed_lens[0] as usize)
@@ -364,6 +424,7 @@ impl Document {
             }
             Op::Many(m) if rebuild_pays(m, &self.rope) => {
                 self.version += 1;
+                self.journal_break();
                 self.rope = splice_many(&self.rope, m, true);
                 let (l, i) = m.starts[0];
                 Cursor::new(l, i + m.inserted.len())
@@ -428,6 +489,54 @@ impl Document {
     pub fn mark_saved(&mut self) {
         self.saved = Some(self.depth());
         self.can_merge = false;
+        self.restart_journal();
+    }
+
+    // ------------------------------------------------------------ journal
+
+    fn journal_push(&mut self, op: JournalOp) {
+        if self.journal_broken {
+            return;
+        }
+        self.journal_bytes += op.insert.len() + std::mem::size_of::<JournalOp>();
+        self.journal.push(op);
+        if self.journal_bytes > JOURNAL_CAP {
+            self.journal_break();
+        }
+    }
+
+    fn journal_break(&mut self) {
+        self.journal_broken = true;
+        self.journal = Vec::new();
+        self.journal_bytes = 0;
+    }
+
+    /// Starts the journal afresh from the current text.
+    pub fn restart_journal(&mut self) {
+        self.journal = Vec::new();
+        self.journal_bytes = 0;
+        self.journal_broken = false;
+        self.epoch = next_epoch();
+        self.epoch_from_saved = !self.is_dirty();
+    }
+
+    /// Whether there are journal entries waiting (or the journal broke).
+    pub fn journal_pending(&self) -> bool {
+        self.journal_broken || !self.journal.is_empty()
+    }
+
+    /// Hands over the changes since the last call (or since the journal
+    /// started). Applied in order to the text as it was then, they give the
+    /// text now. If they couldn't be kept, the journal restarts from the
+    /// current text and `ops` is None: the caller must record the whole text.
+    pub fn take_journal(&mut self) -> Journal {
+        if self.journal_broken {
+            self.restart_journal();
+            return Journal { epoch: self.epoch, from_saved: self.epoch_from_saved, ops: None };
+        }
+        self.journal_bytes = 0;
+        let ops = std::mem::take(&mut self.journal);
+        Journal { epoch: self.epoch, from_saved: self.epoch_from_saved, ops: Some(ops) }
     }
 
     /// Previous code point (Backspace deletes one code point, as most editors do).
@@ -728,6 +837,43 @@ mod tests {
             d.redo();
             assert_eq!(d.to_string_eol("\n"), after);
         }
+    }
+
+    #[test]
+    fn journal_replays_to_the_same_text() {
+        let base = "héllo wörld\nsecond line\n日本語";
+        let mut d = Document::new(base);
+        let mut copy = Rope::from_str(base);
+        let check = |d: &mut Document, copy: &mut Rope| {
+            let j = d.take_journal();
+            replay(copy, &j.ops.expect("journal intact")).unwrap();
+            assert_eq!(*copy, d.rope);
+        };
+        d.replace(c(0, 1), c(0, 3), "E", false);
+        d.replace(c(2, 3), c(2, 3), "\nnew", false);
+        check(&mut d, &mut copy);
+        d.undo();
+        d.undo();
+        d.redo();
+        d.replace(c(1, 0), c(1, 6), "", false);
+        check(&mut d, &mut copy);
+        assert!(d.take_journal().ops.unwrap().is_empty());
+        // Saving starts a new journal from the saved text.
+        let e = d.epoch;
+        d.mark_saved();
+        let j = d.take_journal();
+        assert!(j.epoch != e && j.from_saved && j.ops.unwrap().is_empty());
+        // Replace All can't be journaled: the caller is told to write everything.
+        let abs = vec![0..1];
+        let p = prepare_replace_all(d.rope(), &abs, "Z");
+        d.apply_prepared(p);
+        let j = d.take_journal();
+        assert!(j.ops.is_none() && !j.from_saved);
+        assert!(d.take_journal().ops.unwrap().is_empty(), "journaling resumes after that");
+        // A damaged journal is refused, not applied.
+        let mut r = Rope::from_str("日本");
+        assert!(replay(&mut r, &[JournalOp { at: 1, remove: 0, insert: "x".into() }]).is_err());
+        assert!(replay(&mut r, &[JournalOp { at: 3, remove: 9, insert: "x".into() }]).is_err());
     }
 
     #[test]

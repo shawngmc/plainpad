@@ -379,6 +379,7 @@ impl App {
                 t.eol = l.eol;
                 t.mixed_eol = l.mixed_eol;
                 t.meta_dirty = false;
+                t.file_base = true;
                 let name = t.name();
                 if reload {
                     self.win.status_msg = Some(format!("Reloaded {name} (changed by another program)"));
@@ -433,6 +434,7 @@ impl App {
             Ok(()) => {
                 t.disk = safety::stamp(&path);
                 t.path = Some(path);
+                t.file_base = true;
                 // The text couldn't change meanwhile (the tab was read-only), but its
                 // encoding or line endings could have been switched from the menu.
                 t.view.doc.mark_saved();

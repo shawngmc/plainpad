@@ -6,18 +6,38 @@
 //! instance that is no longer running (it crashed or was killed), so its
 //! snapshots are offered back. Instances never touch each other's live folders.
 //!
-//! Snapshots are written by one background thread, in order, each to a private
-//! temporary file that is then renamed into place, so a crash mid-write never
-//! leaves a torn snapshot. The text comes from a rope clone, which is cheap.
+//! Snapshots are written by one background thread, in order. A small document
+//! is written whole each time, to a private temporary file that is then
+//! renamed into place, so a crash mid-write never leaves a torn snapshot. The
+//! text comes from a rope clone, which is cheap.
+//!
+//! Rewriting a big document after every pause in typing would be costly (a
+//! 500 MB file, 500 MB per pause), so from 1 MB up only the first snapshot
+//! records the text, and later ones append just the edits to a log. When the
+//! file on disk still holds the document's saved text, even the first one
+//! records no text: it names the file (with its modified time and size), and
+//! the log starts from there. The text is written whole again only after a
+//! change too big to log (Replace All), when the log has grown to a quarter of
+//! the document, or after a failed write.
+//!
+//! A snapshot's header names a generation, and its log is `<id>-<generation>.log`, so a
+//! new full snapshot and a stale log can never be combined.
 
-use crate::doc::{self, Encoding, Eol};
+use crate::doc::{self, Encoding, Eol, Stamp};
+use crate::document::{Journal, JournalOp};
 use ropey::Rope;
+use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::{Duration, SystemTime};
 
-const MAGIC: &str = "plainpad-recovery 1";
+const MAGIC: &str = "plainpad-recovery 2";
+/// The first format: always the whole text, no log.
+const MAGIC_V1: &str = "plainpad-recovery 1";
+/// Smaller documents are always written whole: it's cheap, and simplest.
+const JOURNAL_MIN: usize = 1 << 20;
 
 /// What a snapshot needs besides the text to restore a tab faithfully.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,12 +50,44 @@ pub struct Meta {
 /// A recovered document.
 pub struct Recovered {
     pub meta: Meta,
-    pub text: String,
+    pub text: Rope,
 }
 
 enum Job {
-    Write { id: u64, meta: Meta, text: Rope },
+    Write { id: u64, meta: Meta, text: Rope, journal: Journal, file: Option<(PathBuf, Stamp)> },
     Remove(u64),
+}
+
+/// What a snapshot's text is built on.
+#[derive(Clone)]
+enum Base {
+    /// The text is in the snapshot.
+    Text,
+    /// The file at this path, as long as it's unchanged.
+    File(PathBuf, Stamp),
+}
+
+/// What's on disk for one document, as far as the writer knows.
+struct OnDisk {
+    generation: u64,
+    base: Base,
+    log_bytes: u64,
+    meta: Meta,
+}
+
+struct Snap {
+    /// The document journal epoch the snapshot follows.
+    epoch: u64,
+    /// None after a failed write: nothing on disk can be built on.
+    disk: Option<OnDisk>,
+}
+
+/// The writer thread's side: decides, for each snapshot, whether to append
+/// to the log, start one on top of the saved file, or write the whole text.
+struct Writer {
+    dir: PathBuf,
+    snaps: HashMap<u64, Snap>,
+    next_gen: u64,
 }
 
 pub struct Recovery {
@@ -77,14 +129,11 @@ impl Recovery {
         let thread = std::thread::Builder::new()
             .name("autosave".into())
             .spawn(move || {
+                let mut w = Writer { dir: wdir, snaps: HashMap::new(), next_gen: 1 };
                 for job in rx {
                     match job {
-                        Job::Write { id, meta, text } => {
-                            let _ = write_snapshot(&wdir, id, &meta, &text);
-                        }
-                        Job::Remove(id) => {
-                            let _ = fs::remove_file(snapshot_path(&wdir, id));
-                        }
+                        Job::Write { id, meta, text, journal, file } => w.write(id, meta, &text, journal, file),
+                        Job::Remove(id) => w.remove(id),
                     }
                 }
             })
@@ -92,10 +141,12 @@ impl Recovery {
         Some(Self { dir, jobs: Some(tx), thread: Some(thread), _lock: lock })
     }
 
-    /// Queues a snapshot of a document (replacing any earlier one for `id`).
-    pub fn save(&self, id: u64, meta: Meta, text: Rope) {
+    /// Queues a snapshot of a document (replacing any earlier one for `id`):
+    /// its text, its journal since the last snapshot, and the file holding its
+    /// saved text, if that's what the journal started from.
+    pub fn save(&self, id: u64, meta: Meta, text: Rope, journal: Journal, file: Option<(PathBuf, Stamp)>) {
         if let Some(tx) = &self.jobs {
-            let _ = tx.send(Job::Write { id, meta, text });
+            let _ = tx.send(Job::Write { id, meta, text, journal, file });
         }
     }
 
@@ -114,10 +165,11 @@ impl Recovery {
         std::mem::forget(self);
     }
 
-    /// Snapshots left by instances that are no longer running. Their folders
-    /// are deleted once read; the caller re-snapshots what it restores.
-    pub fn take_orphans(&self) -> Vec<Recovered> {
-        let Some(root) = self.dir.parent() else { return Vec::new() };
+    /// Snapshots left by instances that are no longer running, and
+    /// descriptions of any that couldn't be restored. Their folders are deleted
+    /// once read; the caller re-snapshots what it restores.
+    pub fn take_orphans(&self) -> (Vec<Recovered>, Vec<String>) {
+        let Some(root) = self.dir.parent() else { return Default::default() };
         take_orphans_in(root, &self.dir)
     }
 }
@@ -134,9 +186,9 @@ impl Drop for Recovery {
     }
 }
 
-fn take_orphans_in(root: &Path, mine: &Path) -> Vec<Recovered> {
-    let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(root) else { return out };
+fn take_orphans_in(root: &Path, mine: &Path) -> (Vec<Recovered>, Vec<String>) {
+    let (mut out, mut lost) = (Vec::new(), Vec::new());
+    let Ok(entries) = fs::read_dir(root) else { return (out, lost) };
     for e in entries.flatten() {
         let dir = e.path();
         if dir == mine || !dir.is_dir() {
@@ -150,16 +202,18 @@ fn take_orphans_in(root: &Path, mine: &Path) -> Vec<Recovered> {
         let Ok(files) = fs::read_dir(&dir) else { continue };
         for f in files.flatten() {
             let p = f.path();
-            if p.extension().is_some_and(|x| x == "snap")
-                && let Some(r) = read_snapshot(&p)
-            {
-                out.push(r);
+            if p.extension().is_some_and(|x| x == "snap") {
+                match read_snapshot(&p) {
+                    Ok(Some(r)) => out.push(r),
+                    Ok(None) => {}
+                    Err(e) => lost.push(e),
+                }
             }
         }
         drop(lock);
         let _ = fs::remove_dir_all(&dir);
     }
-    out
+    (out, lost)
 }
 
 fn snapshot_path(dir: &Path, id: u64) -> PathBuf {
@@ -215,7 +269,151 @@ fn decode_path(s: &str) -> Option<PathBuf> {
     Some(PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(out) }))
 }
 
-fn write_snapshot(dir: &Path, id: u64, meta: &Meta, text: &Rope) -> io::Result<()> {
+fn log_path(dir: &Path, id: u64, generation: u64) -> PathBuf {
+    dir.join(format!("{id}-{generation}.log"))
+}
+
+fn parse_encoding(s: &str) -> Encoding {
+    match s {
+        "utf8bom" => Encoding::Utf8Bom,
+        "utf16le" => Encoding::Utf16Le,
+        "utf16be" => Encoding::Utf16Be,
+        "cp1252" => Encoding::Windows1252,
+        _ => Encoding::Utf8,
+    }
+}
+
+fn parse_eol(s: &str) -> Eol {
+    match s {
+        "crlf" => Eol::CrLf,
+        "cr" => Eol::Cr,
+        _ => Eol::Lf,
+    }
+}
+
+fn stamp_text((t, size): Stamp) -> Option<String> {
+    let d = t.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    Some(format!("{} {} {size}", d.as_secs(), d.subsec_nanos()))
+}
+
+fn parse_stamp(s: &str) -> Option<Stamp> {
+    let mut it = s.split(' ').map(str::parse::<u64>);
+    let (secs, nanos, size) = (it.next()?.ok()?, it.next()?.ok()?, it.next()?.ok()?);
+    Some((SystemTime::UNIX_EPOCH + Duration::new(secs, u32::try_from(nanos).ok()?), size))
+}
+
+impl Base {
+    /// Whether what it names is still there, unchanged.
+    fn valid(&self) -> bool {
+        match self {
+            Base::Text => true,
+            Base::File(p, st) => doc::stamp(p) == Some(*st),
+        }
+    }
+}
+
+impl Writer {
+    fn write(&mut self, id: u64, meta: Meta, text: &Rope, journal: Journal, file: Option<(PathBuf, Stamp)>) {
+        let epoch = journal.epoch;
+        let result = self.try_write(id, &meta, text, journal, file);
+        let disk = result.ok();
+        let old = self.snaps.insert(id, Snap { epoch, disk });
+        // A new generation replaces the old one's log.
+        if let Some(old) = old.and_then(|s| s.disk)
+            && self.snaps[&id].disk.as_ref().is_none_or(|d| d.generation != old.generation)
+        {
+            let _ = fs::remove_file(log_path(&self.dir, id, old.generation));
+        }
+    }
+
+    fn try_write(
+        &mut self,
+        id: u64,
+        meta: &Meta,
+        text: &Rope,
+        journal: Journal,
+        file: Option<(PathBuf, Stamp)>,
+    ) -> io::Result<OnDisk> {
+        if let Some(ops) = journal.ops.filter(|_| text.len_bytes() >= JOURNAL_MIN) {
+            let snap = self.snaps.get_mut(&id);
+            // Same journal as last time, all written: just add the new edits.
+            if let Some(Snap { epoch, disk: Some(d) }) = snap
+                && *epoch == journal.epoch
+                && d.log_bytes < (text.len_bytes() as u64 / 4).max(4 << 20)
+                && d.base.valid()
+            {
+                let changed = (d.meta != *meta).then_some(meta);
+                let n = append_log(&log_path(&self.dir, id, d.generation), &ops, changed)?;
+                return Ok(OnDisk {
+                    generation: d.generation,
+                    base: d.base.clone(),
+                    log_bytes: d.log_bytes + n,
+                    meta: meta.clone(),
+                });
+            }
+            // A journal we haven't seen, starting from the saved file: build on the file.
+            // (Seen before means some of its edits went into a write that's gone.)
+            let unseen = snap.is_none_or(|s| s.epoch != journal.epoch);
+            if unseen
+                && journal.from_saved
+                && let Some((path, st)) = file
+                && doc::stamp(&path) == Some(st)
+            {
+                let generation = self.next_generation();
+                let base = Base::File(path, st);
+                let n = append_log(&log_path(&self.dir, id, generation), &ops, None)?;
+                write_header(&self.dir, id, meta, generation, &base, None)?;
+                return Ok(OnDisk { generation, base, log_bytes: n, meta: meta.clone() });
+            }
+        }
+        let generation = self.next_generation();
+        write_header(&self.dir, id, meta, generation, &Base::Text, Some(text))?;
+        Ok(OnDisk { generation, base: Base::Text, log_bytes: 0, meta: meta.clone() })
+    }
+
+    fn next_generation(&mut self) -> u64 {
+        self.next_gen += 1;
+        self.next_gen
+    }
+
+    fn remove(&mut self, id: u64) {
+        let _ = fs::remove_file(snapshot_path(&self.dir, id));
+        if let Some(d) = self.snaps.remove(&id).and_then(|s| s.disk) {
+            let _ = fs::remove_file(log_path(&self.dir, id, d.generation));
+        }
+    }
+}
+
+/// Appends edits (and the new metadata, if it changed) to a log. Returns the bytes written.
+///
+/// Records: `E <at> <remove> <len>`, a newline, `len` bytes of inserted text and
+/// a newline; or `M <encoding> <eol> <path>` (path percent-encoded, `-` for none).
+fn append_log(path: &Path, ops: &[JournalOp], meta: Option<&Meta>) -> io::Result<u64> {
+    let mut opts = fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut w = io::BufWriter::new(opts.open(path)?);
+    let mut n = 0u64;
+    if let Some(m) = meta {
+        let p = m.path.as_deref().map_or("-".into(), |p| format!("p{}", encode_path(p)));
+        let line = format!("M {} {} {p}\n", encoding_name(m.encoding), eol_name(m.eol));
+        w.write_all(line.as_bytes())?;
+        n += line.len() as u64;
+    }
+    for op in ops {
+        let head = format!("E {} {} {}\n", op.at, op.remove, op.insert.len());
+        w.write_all(head.as_bytes())?;
+        w.write_all(op.insert.as_bytes())?;
+        w.write_all(b"\n")?;
+        n += (head.len() + op.insert.len() + 1) as u64;
+    }
+    w.flush()?;
+    Ok(n)
+}
+
+/// Writes a snapshot header (and the text, for a text base) via a temporary file.
+fn write_header(dir: &Path, id: u64, meta: &Meta, generation: u64, base: &Base, text: Option<&Rope>) -> io::Result<()> {
     let (tmp, file) = doc::create_private(dir, ".", ".tmp")?;
     let result = (|| {
         let mut w = io::BufWriter::new(file);
@@ -223,8 +421,16 @@ fn write_snapshot(dir: &Path, id: u64, meta: &Meta, text: &Rope) -> io::Result<(
         writeln!(w, "path:{}", meta.path.as_deref().map(encode_path).unwrap_or_default())?;
         writeln!(w, "encoding:{}", encoding_name(meta.encoding))?;
         writeln!(w, "eol:{}", eol_name(meta.eol))?;
+        writeln!(w, "generation:{generation}")?;
+        match base {
+            Base::Text => writeln!(w, "base:text")?,
+            Base::File(p, st) => {
+                let st = stamp_text(*st).ok_or_else(|| io::Error::other("file time out of range"))?;
+                writeln!(w, "base:file {st} {}", encode_path(p))?;
+            }
+        }
         writeln!(w)?;
-        for chunk in text.chunks() {
+        for chunk in text.iter().flat_map(|t| t.chunks()) {
             w.write_all(chunk.as_bytes())?;
         }
         w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
@@ -236,40 +442,100 @@ fn write_snapshot(dir: &Path, id: u64, meta: &Meta, text: &Rope) -> io::Result<(
     result
 }
 
-fn read_snapshot(p: &Path) -> Option<Recovered> {
-    let data = fs::read_to_string(p).ok()?;
-    let mut rest = data.as_str();
-    let mut next = || {
-        let (line, r) = rest.split_once('\n')?;
-        rest = r;
-        Some(line)
+/// Reads a snapshot and replays its log. `Ok(None)` for something that isn't
+/// a snapshot; `Err` describes a document that couldn't be restored.
+fn read_snapshot(p: &Path) -> Result<Option<Recovered>, String> {
+    let Ok(f) = fs::File::open(p) else { return Ok(None) };
+    let mut r = io::BufReader::new(f);
+    let mut line = || {
+        let mut l = String::new();
+        r.read_line(&mut l).ok().filter(|&n| n > 0)?;
+        l.pop();
+        Some(l)
     };
-    if next()? != MAGIC {
-        return None;
+    let v1 = match line().as_deref() {
+        Some(MAGIC) => false,
+        Some(MAGIC_V1) => true,
+        _ => return Ok(None),
+    };
+    let header = (|| {
+        let path = line()?.strip_prefix("path:")?.to_owned();
+        let path = if path.is_empty() { None } else { Some(decode_path(&path)?) };
+        let encoding = parse_encoding(line()?.strip_prefix("encoding:")?);
+        let eol = parse_eol(line()?.strip_prefix("eol:")?);
+        let (generation, base) = if v1 {
+            (0, "text".to_owned())
+        } else {
+            let generation = line()?.strip_prefix("generation:")?.parse::<u64>().ok()?;
+            (generation, line()?.strip_prefix("base:")?.to_owned())
+        };
+        line()?.is_empty().then_some((Meta { path, encoding, eol }, generation, base))
+    })();
+    let Some((mut meta, generation, base)) = header else { return Ok(None) };
+    let name = meta
+        .path
+        .as_deref()
+        .and_then(Path::file_name)
+        .map_or("An untitled document".into(), |n| n.to_string_lossy().into_owned());
+    let mut text = if base == "text" {
+        Rope::from_reader(r).map_err(|_| format!("{name}: its snapshot is damaged"))?
+    } else {
+        // "file <secs> <nanos> <size> <path>"
+        let (st, file) = base
+            .strip_prefix("file ")
+            .and_then(|b| b.rsplit_once(' '))
+            .and_then(|(st, p)| Some((parse_stamp(st)?, decode_path(p)?)))
+            .ok_or_else(|| format!("{name}: its snapshot is damaged"))?;
+        if doc::stamp(&file) != Some(st) {
+            return Err(format!("{name} was changed by another program, so its unsaved edits can't be rebuilt"));
+        }
+        doc::load(&file).map_err(|e| format!("{name} could not be read: {e}"))?.rope
+    };
+    let log = p.with_file_name(format!("{}-{generation}.log", p.file_stem().unwrap_or_default().to_string_lossy()));
+    if !v1 && let Ok(data) = fs::read(&log) {
+        replay_log(&data, &mut text, &mut meta).map_err(|e| format!("{name}: its edit log is damaged ({e})"))?;
     }
-    let path = next()?.strip_prefix("path:")?;
-    let path = if path.is_empty() { None } else { Some(decode_path(path)?) };
-    let encoding = match next()?.strip_prefix("encoding:")? {
-        "utf8bom" => Encoding::Utf8Bom,
-        "utf16le" => Encoding::Utf16Le,
-        "utf16be" => Encoding::Utf16Be,
-        "cp1252" => Encoding::Windows1252,
-        _ => Encoding::Utf8,
-    };
-    let eol = match next()?.strip_prefix("eol:")? {
-        "crlf" => Eol::CrLf,
-        "cr" => Eol::Cr,
-        _ => Eol::Lf,
-    };
-    if !next()?.is_empty() {
-        return None;
+    Ok(Some(Recovered { meta, text }))
+}
+
+/// Applies a log's records. A record cut short (a crash while writing it) ends the log.
+fn replay_log(mut data: &[u8], text: &mut Rope, meta: &mut Meta) -> Result<(), String> {
+    while let Some(nl) = data.iter().position(|&b| b == b'\n') {
+        let head = std::str::from_utf8(&data[..nl]).map_err(|_| "bad record")?;
+        let rest = &data[nl + 1..];
+        let mut f = head.split(' ');
+        match f.next() {
+            Some("E") => {
+                let mut num = || f.next().and_then(|n| n.parse::<usize>().ok()).ok_or("bad edit");
+                let (at, remove, len) = (num()?, num()?, num()?);
+                if rest.len() <= len {
+                    return Ok(()); // cut short
+                }
+                let insert = std::str::from_utf8(&rest[..len]).map_err(|_| "bad text")?.to_owned();
+                crate::document::replay(text, &[JournalOp { at, remove, insert }])?;
+                data = &rest[len + 1..];
+            }
+            Some("M") => {
+                let (enc, eol, path) = (f.next().ok_or("bad meta")?, f.next().ok_or("bad meta")?, f.next());
+                meta.encoding = parse_encoding(enc);
+                meta.eol = parse_eol(eol);
+                meta.path = match path.and_then(|p| p.strip_prefix('p')) {
+                    Some(p) => Some(decode_path(p).ok_or("bad path")?),
+                    None => None,
+                };
+                data = rest;
+            }
+            _ => return Err("unknown record".into()),
+        }
     }
-    Some(Recovered { meta: Meta { path, encoding, eol }, text: rest.to_string() })
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::Document;
+    use cosmic_text::Cursor;
 
     fn tmp_root() -> PathBuf {
         let (p, f) = doc::create_private(&std::env::temp_dir(), "plainpad-rec-test-", "").unwrap();
@@ -295,19 +561,21 @@ mod tests {
             Meta { path: Some(PathBuf::from("/tmp/odd name\n%.txt")), encoding: Encoding::Utf16Le, eol: Eol::CrLf };
         // A running instance writes snapshots...
         let a = Recovery::start_in(&root).unwrap();
-        a.save(1, meta.clone(), Rope::from_str("unsaved text\nline 2"));
-        a.save(2, Meta { path: None, encoding: Encoding::Utf8, eol: Eol::Lf }, Rope::from_str("gone"));
+        let mut d = Document::new("unsaved text\nline 2");
+        a.save(1, meta.clone(), d.snapshot(), d.take_journal(), None);
+        let none = Meta { path: None, encoding: Encoding::Utf8, eol: Eol::Lf };
+        a.save(2, none, Rope::from_str("gone"), Document::new("").take_journal(), None);
         a.remove(2);
         wait_for(&snapshot_path(&a.dir, 1), true);
         wait_for(&snapshot_path(&a.dir, 2), false);
         // ...and a second instance must not take them while the first is alive.
         let b = Recovery::start_in(&root).unwrap();
-        assert!(b.take_orphans().is_empty());
+        assert!(b.take_orphans().0.is_empty());
         // Simulate a crash: the first instance's lock is released without cleanup.
         let a_dir = a.dir.clone();
         a.crash();
-        let rec = b.take_orphans();
-        assert_eq!(rec.len(), 1);
+        let (rec, lost) = b.take_orphans();
+        assert_eq!((rec.len(), lost.len()), (1, 0));
         assert_eq!(rec[0].meta, meta);
         assert_eq!(rec[0].text, "unsaved text\nline 2");
         assert!(!a_dir.exists(), "orphan folder is removed once recovered");
@@ -315,6 +583,96 @@ mod tests {
         let b_dir = b.dir.clone();
         drop(b);
         assert!(!b_dir.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Waits until the writer thread has handled everything queued so far.
+    fn flush(r: &Recovery) {
+        r.save(
+            u64::MAX,
+            Meta { path: None, encoding: Encoding::Utf8, eol: Eol::Lf },
+            Rope::new(),
+            Journal { epoch: 0, from_saved: false, ops: None },
+            None,
+        );
+        wait_for(&snapshot_path(&r.dir, u64::MAX), true);
+        r.remove(u64::MAX);
+        wait_for(&snapshot_path(&r.dir, u64::MAX), false);
+    }
+
+    #[test]
+    fn big_documents_log_their_edits() {
+        let root = tmp_root();
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("big.txt");
+        let original = "0123456789 abcdé\n".repeat(80_000); // ~1.4 MB
+        fs::write(&file, &original).unwrap();
+        let meta = Meta { path: Some(file.clone()), encoding: Encoding::Utf8, eol: Eol::Lf };
+        let base = Some((file.clone(), doc::stamp(&file).unwrap()));
+        let c = |l, i| Cursor::new(l, i);
+
+        let a = Recovery::start_in(&root).unwrap();
+        let mut d = Document::from_rope(doc::load(&file).unwrap().rope);
+        d.replace(c(0, 0), c(0, 3), "START", false);
+        a.save(7, meta.clone(), d.snapshot(), d.take_journal(), base.clone());
+        d.replace(c(5, 2), c(5, 2), "é\nmore", false);
+        d.undo();
+        d.replace(c(79_999, 0), c(80_000, 0), "", false);
+        let changed = Meta { eol: Eol::CrLf, ..meta.clone() };
+        a.save(7, changed.clone(), d.snapshot(), d.take_journal(), base.clone());
+        flush(&a);
+        // Nothing but a header and a small log: the text came from the file.
+        let snap = snapshot_path(&a.dir, 7);
+        assert!(fs::metadata(&snap).unwrap().len() < 300, "header only");
+        let logs: u64 = fs::read_dir(&a.dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert!(logs < 300, "{logs} bytes of log");
+        let want = d.snapshot();
+        let a_dir = a.dir.clone();
+        a.crash();
+        let b = Recovery::start_in(&root).unwrap();
+        let (rec, lost) = b.take_orphans();
+        assert!(lost.is_empty(), "{lost:?}");
+        assert_eq!(rec[0].text, want);
+        assert_eq!(rec[0].meta, changed);
+        assert!(!a_dir.exists());
+
+        // Replace All can't be logged: the text is written whole, then logging resumes on top.
+        let p = crate::document::prepare_replace_all(d.rope(), &[0..5], "S");
+        d.apply_prepared(p);
+        b.save(8, meta.clone(), d.snapshot(), d.take_journal(), base.clone());
+        d.replace(c(1, 0), c(1, 0), "after", false);
+        b.save(8, meta.clone(), d.snapshot(), d.take_journal(), base.clone());
+        flush(&b);
+        assert!(fs::metadata(snapshot_path(&b.dir, 8)).unwrap().len() > 1_000_000, "full text");
+        // A crash while writing a log record leaves it cut short: what came before still counts.
+        let log = fs::read_dir(&b.dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "log"));
+        let mut f = fs::OpenOptions::new().append(true).open(log.unwrap()).unwrap();
+        f.write_all(b"E 0 0 100\npartial").unwrap();
+        let want = d.snapshot();
+        // A document built on the file, which then changes: reported, not rebuilt wrongly.
+        let mut e = Document::from_rope(doc::load(&file).unwrap().rope);
+        e.replace(c(0, 0), c(0, 0), "x", false);
+        b.save(9, meta.clone(), e.snapshot(), e.take_journal(), base.clone());
+        flush(&b);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&file, "changed by someone else").unwrap();
+        b.crash();
+        let c3 = Recovery::start_in(&root).unwrap();
+        let (rec, lost) = c3.take_orphans();
+        assert_eq!(rec.len(), 1);
+        assert_eq!(rec[0].text, want);
+        assert_eq!(lost.len(), 1);
+        assert!(lost[0].contains("big.txt was changed by another program"), "{}", lost[0]);
+        drop(c3);
         let _ = fs::remove_dir_all(&root);
     }
 }

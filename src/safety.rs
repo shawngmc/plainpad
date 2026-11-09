@@ -2,18 +2,10 @@
 //! when an open file is changed on disk by something else.
 
 use super::*;
-use std::time::SystemTime;
+pub(crate) use doc::{Stamp, stamp};
 
 /// How long after an edit a crash-recovery snapshot is written.
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(2);
-
-/// What we last knew about a file on disk: (modified time, size).
-pub(crate) type Stamp = (SystemTime, u64);
-
-pub(crate) fn stamp(path: &std::path::Path) -> Option<Stamp> {
-    let m = std::fs::metadata(path).ok()?;
-    Some((m.modified().ok()?, m.len()))
-}
 
 /// What a tab's snapshot reflects, so we know when it's out of date.
 #[derive(Clone, PartialEq)]
@@ -41,10 +33,18 @@ impl App {
         let Some(rec) = &self.recovery else { return };
         // Tabs that are clean again: their snapshot goes now.
         for t in std::iter::once(&mut self.win).chain(self.others.iter_mut()).flat_map(|w| w.tabs.iter_mut()) {
-            if t.snap.is_some() && !t.is_dirty() {
+            if t.is_dirty() {
+                continue;
+            }
+            if t.snap.is_some() {
                 rec.remove(t.id);
                 self.snapshots.remove(&t.id);
                 t.snap = None;
+            }
+            // Its next snapshot, if any, builds on the saved text again; and
+            // edits that were undone needn't stay in memory.
+            if t.view.doc.journal_pending() {
+                t.view.doc.restart_journal();
             }
         }
         // Tabs that were closed: likewise, so a crash can't bring back discarded text.
@@ -72,7 +72,10 @@ impl App {
             }
             let key = snap_key(t);
             if t.snap.as_ref() != Some(&key) {
-                rec.save(t.id, key.meta.clone(), t.view.doc.snapshot());
+                let journal = t.view.doc.take_journal();
+                // The file can stand in for the saved text, while it holds it.
+                let file = t.path.clone().zip(t.disk).filter(|_| t.file_base);
+                rec.save(t.id, key.meta.clone(), t.view.doc.snapshot(), journal, file);
                 written.push(t.id);
                 t.snap = Some(key);
             }
@@ -83,15 +86,15 @@ impl App {
     /// Reopens documents left unsaved by an instance that crashed.
     pub(crate) fn restore_recovered(&mut self) {
         let Some(rec) = &self.recovery else { return };
-        let found = rec.take_orphans();
-        if found.is_empty() {
+        let (found, lost) = rec.take_orphans();
+        if found.is_empty() && lost.is_empty() {
             return;
         }
         let n = found.len();
         for r in found {
             let i = if self.tab().is_pristine() { self.win.active } else { self.new_tab() };
             let t = &mut self.win.tabs[i];
-            t.view.set_document(document::Document::new(&r.text));
+            t.view.set_document(document::Document::from_rope(r.text));
             t.encoding = r.meta.encoding;
             t.eol = r.meta.eol;
             t.disk = r.meta.path.as_deref().and_then(stamp);
@@ -99,10 +102,15 @@ impl App {
             // Not saved anywhere yet: show it as modified so it gets saved (and re-snapshotted).
             t.meta_dirty = true;
         }
-        self.win.status_msg = Some(format!(
+        let mut msg = format!(
             "Recovered {n} unsaved document{} from a session that ended unexpectedly",
             if n == 1 { "" } else { "s" }
-        ));
+        );
+        for l in lost {
+            msg.push_str(". ");
+            msg.push_str(&l);
+        }
+        self.win.status_msg = Some(msg);
     }
 
     /// Checks this window's tabs for files changed or deleted on disk by
@@ -136,6 +144,7 @@ impl App {
                 None if !path.exists() => {
                     let t = &mut self.win.tabs[i];
                     t.disk = None;
+                    t.file_base = false;
                     t.meta_dirty = true; // saving will recreate it
                     self.win.status_msg = Some(format!(
                         "{} was deleted or moved by another program; save to recreate it",
@@ -175,8 +184,10 @@ impl App {
                     if c == Choice::Reload {
                         self.reload_tab(i);
                     } else if let Some(p) = self.win.tabs[i].path.clone() {
-                        // Keep mine: remember the new disk state so we don't ask again.
+                        // Keep mine: remember the new disk state so we don't ask again. The
+                        // file no longer holds this tab's saved text.
                         self.win.tabs[i].disk = stamp(&p);
+                        self.win.tabs[i].file_base = false;
                     }
                 }
                 self.check_disk();

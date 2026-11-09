@@ -517,6 +517,14 @@ impl Default for Settings {
     }
 }
 
+/// What we last knew about a file on disk: (modified time, size).
+pub type Stamp = (std::time::SystemTime, u64);
+
+pub fn stamp(path: &Path) -> Option<Stamp> {
+    let m = fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
 /// The app's own directory: settings and crash-recovery snapshots live here.
 pub fn app_dir() -> Option<PathBuf> {
     config_path().and_then(|p| p.parent().map(Path::to_path_buf))

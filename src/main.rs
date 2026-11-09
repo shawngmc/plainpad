@@ -155,6 +155,9 @@ struct Tab {
     disk: Option<safety::Stamp>,
     /// What this tab's crash-recovery snapshot contains, if it has one.
     snap: Option<safety::SnapKey>,
+    /// The file (as of `disk`) holds the document's saved text, so crash
+    /// recovery can log edits on top of it instead of copying the text.
+    file_base: bool,
 }
 
 impl Tab {
@@ -172,6 +175,7 @@ impl Tab {
             id: next_tab_id(),
             disk: None,
             snap: None,
+            file_base: false,
         }
     }
 
