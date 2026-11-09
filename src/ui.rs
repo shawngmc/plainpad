@@ -192,32 +192,56 @@ pub enum MenuHit {
     Outside,
 }
 
-/// Size of a dropdown panel for `items`: (width, height, label column width, key column width).
-fn panel_size(g: &mut Gfx, items: &[Item], s: f32) -> (f32, f32, f32, f32) {
+/// One row of a dropdown panel, as drawn.
+struct Row {
+    label: String,
+    key: String,
+    checked: bool,
+    submenu: bool,
+    enabled: bool,
+    sep: bool,
+}
+
+impl Row {
+    fn from_item(i: &Item, checked: &dyn Fn(Cmd) -> bool) -> Self {
+        Row {
+            label: i.label.to_owned(),
+            key: key_label(i.key),
+            checked: i.cmd.is_some_and(checked),
+            submenu: i.sub.is_some(),
+            enabled: true,
+            sep: i.is_sep(),
+        }
+    }
+}
+
+/// Size of a dropdown panel: (width, height, label column width, key column width).
+fn panel_size(g: &mut Gfx, rows: &[Row], s: f32) -> (f32, f32, f32, f32) {
     let row = (g.ui_line_h() + 8.0 * s).round();
     let sep = 9.0 * s;
     let mut lw: f32 = 0.0;
     let mut kw: f32 = g.text_w("▸");
-    for i in items {
-        lw = lw.max(g.text_w(i.label));
-        kw = kw.max(g.text_w(&key_label(i.key)));
+    for r in rows {
+        lw = lw.max(g.text_w(&r.label));
+        kw = kw.max(g.text_w(&r.key));
     }
     let w = 28.0 * s + lw + 32.0 * s + kw + 16.0 * s;
-    let h = items.iter().map(|i| if i.is_sep() { sep } else { row }).sum::<f32>() + 8.0 * s;
+    let h = rows.iter().map(|r| if r.sep { sep } else { row }).sum::<f32>() + 8.0 * s;
     (w, h, lw, kw)
 }
 
+/// Draws a dropdown panel with its top-left at (x, y). Disabled rows are drawn
+/// dimmed and left out of the hit-test list, so they can't be hovered or chosen.
 #[allow(clippy::too_many_arguments)]
 fn draw_panel(
     g: &mut Gfx,
     cv: &mut Canvas,
     th: &Theme,
     s: f32,
-    items: &[Item],
+    items: &[Row],
     x: f32,
     y: f32,
     highlight: &[usize],
-    checked: &dyn Fn(Cmd) -> bool,
 ) -> Panel {
     let (w, h, lw, kw) = panel_size(g, items, s);
     let row = (g.ui_line_h() + 8.0 * s).round();
@@ -230,23 +254,26 @@ fn draw_panel(
     let mut rows = Vec::new();
     let mut yy = y + 4.0 * s;
     for (idx, i) in items.iter().enumerate() {
-        if i.is_sep() {
+        if i.sep {
             cv.fill(Rect::new(x + 8.0 * s, yy + (sep / 2.0).floor(), w - 16.0 * s, s), th.border);
             yy += sep;
             continue;
         }
         let r = Rect::new(x + 4.0 * s, yy, w - 8.0 * s, row);
-        if highlight.contains(&idx) {
+        let fg = if i.enabled { th.chrome_fg } else { th.border };
+        if i.enabled && highlight.contains(&idx) {
             cv.fill(r, th.hover);
         }
-        if i.cmd.is_some_and(checked) {
-            g.text_in(cv, "✓", Rect::new(x + 10.0 * s, yy, pad, row), th.chrome_fg);
+        if i.checked {
+            g.text_in(cv, "✓", Rect::new(x + 10.0 * s, yy, pad, row), fg);
         }
-        g.text_in(cv, i.label, Rect::new(x + pad, yy, lw, row), th.chrome_fg);
-        let kl = if i.sub.is_some() { "▸".to_owned() } else { key_label(i.key) };
-        let kx = x + w - 16.0 * s - g.text_w(&kl);
-        g.text_in(cv, &kl, Rect::new(kx, yy, kw, row), th.dim);
-        rows.push((r, idx));
+        g.text_in(cv, &i.label, Rect::new(x + pad, yy, lw, row), fg);
+        let kl = if i.submenu { "▸" } else { i.key.as_str() };
+        let kx = x + w - 16.0 * s - g.text_w(kl);
+        g.text_in(cv, kl, Rect::new(kx, yy, kw, row), if i.enabled { th.dim } else { th.border });
+        if i.enabled {
+            rows.push((r, idx));
+        }
         yy += row;
     }
     Panel { rect, rows }
@@ -275,21 +302,23 @@ impl MenuState {
         self.side = Panel::default();
         let Some(m) = self.open else { return };
         let items = MENUS[m].1;
-        let (w, _, _, _) = panel_size(g, items, s);
+        let rows: Vec<Row> = items.iter().map(|i| Row::from_item(i, &checked)).collect();
+        let (w, _, _, _) = panel_size(g, &rows, s);
         let t = self.titles[m];
         let x = t.x.min(cv.w as f32 - w).max(0.0);
         let hl: Vec<usize> = self.hover.into_iter().chain(self.sub).collect();
-        self.main = draw_panel(g, cv, th, s, items, x, t.bottom() + s, &hl, &checked);
+        self.main = draw_panel(g, cv, th, s, &rows, x, t.bottom() + s, &hl);
         let Some(si) = self.sub else { return };
         let (Some(sub), Some(row)) = (items[si].sub, self.main.row_rect(si)) else { return };
-        let (sw, sh, _, _) = panel_size(g, sub, s);
+        let sub_rows: Vec<Row> = sub.iter().map(|i| Row::from_item(i, &checked)).collect();
+        let (sw, sh, _, _) = panel_size(g, &sub_rows, s);
         let mut sx = self.main.rect.right() - 4.0 * s;
         if sx + sw > cv.w as f32 {
             sx = (self.main.rect.x - sw + 4.0 * s).max(0.0);
         }
         let sy = (row.y - 4.0 * s).min(cv.h as f32 - sh).max(0.0);
         let hl: Vec<usize> = self.sub_hover.into_iter().collect();
-        self.side = draw_panel(g, cv, th, s, sub, sx, sy, &hl, &checked);
+        self.side = draw_panel(g, cv, th, s, &sub_rows, sx, sy, &hl);
     }
 
     fn sub_items(&self) -> Option<&'static [Item]> {
@@ -398,6 +427,114 @@ impl MenuState {
         self.hover = None;
         self.sub = None;
         self.sub_hover = None;
+    }
+}
+
+/// What a right-click menu item does.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CtxAction {
+    Cmd(Cmd),
+    OpenLink(String),
+    CopyLink(String),
+    CloseTab(usize),
+    CloseOtherTabs(usize),
+    CloseTabsRight(usize),
+    MoveToNewWindow(usize),
+    CopyPath(usize),
+}
+
+pub struct CtxItem {
+    pub label: &'static str,
+    pub key: &'static str,
+    /// `None` is a separator.
+    pub action: Option<CtxAction>,
+    pub enabled: bool,
+}
+
+impl CtxItem {
+    pub fn new(label: &'static str, key: &'static str, action: CtxAction, enabled: bool) -> Self {
+        Self { label, key, action: Some(action), enabled }
+    }
+
+    pub const SEP: CtxItem = CtxItem { label: "", key: "", action: None, enabled: false };
+}
+
+/// A right-click (context) menu, opened at a point.
+pub struct ContextMenu {
+    items: Vec<CtxItem>,
+    at: (f32, f32),
+    pub hover: Option<usize>,
+    panel: Panel,
+}
+
+pub enum CtxHit {
+    Item(CtxAction),
+    /// On the menu but not on a usable item (a separator or disabled item).
+    Inside,
+    Outside,
+}
+
+impl ContextMenu {
+    pub fn new(items: Vec<CtxItem>, at: (f32, f32)) -> Self {
+        Self { items, at, hover: None, panel: Panel::default() }
+    }
+
+    fn rows(&self) -> Vec<Row> {
+        self.items
+            .iter()
+            .map(|i| Row {
+                label: i.label.to_owned(),
+                key: key_label(i.key),
+                checked: false,
+                submenu: false,
+                enabled: i.enabled,
+                sep: i.action.is_none(),
+            })
+            .collect()
+    }
+
+    pub fn draw(&mut self, g: &mut Gfx, cv: &mut Canvas, th: &Theme, s: f32) {
+        let rows = self.rows();
+        let (w, h, _, _) = panel_size(g, &rows, s);
+        // Open down-right of the pointer, flipping to stay on screen.
+        let (cw, ch) = (cv.w as f32, cv.h as f32);
+        let x = if self.at.0 + w > cw { (self.at.0 - w).max(0.0) } else { self.at.0 };
+        let y = if self.at.1 + h > ch { (self.at.1 - h).max(0.0) } else { self.at.1 };
+        let hl: Vec<usize> = self.hover.into_iter().collect();
+        self.panel = draw_panel(g, cv, th, s, &rows, x, y, &hl);
+    }
+
+    pub fn hover_at(&mut self, p: (f32, f32)) -> bool {
+        let old = self.hover;
+        self.hover = self.panel.row_at(p);
+        old != self.hover
+    }
+
+    pub fn hit(&self, p: (f32, f32)) -> CtxHit {
+        match self.panel.row_at(p) {
+            Some(i) => self.items[i].action.clone().map_or(CtxHit::Inside, CtxHit::Item),
+            None if self.panel.rect.contains(p) => CtxHit::Inside,
+            None => CtxHit::Outside,
+        }
+    }
+
+    /// Up/Down move between enabled items; Enter returns the chosen action.
+    pub fn key(&mut self, k: NavKey) -> Option<CtxAction> {
+        let usable: Vec<usize> =
+            (0..self.items.len()).filter(|&i| self.items[i].enabled && self.items[i].action.is_some()).collect();
+        if usable.is_empty() {
+            return None;
+        }
+        let pos = self.hover.and_then(|h| usable.iter().position(|&i| i == h));
+        match k {
+            NavKey::Down => self.hover = Some(usable[pos.map_or(0, |p| (p + 1) % usable.len())]),
+            NavKey::Up => {
+                self.hover = Some(usable[pos.map_or(usable.len() - 1, |p| (p + usable.len() - 1) % usable.len())])
+            }
+            NavKey::Enter => return self.hover.and_then(|h| self.items[h].action.clone()),
+            NavKey::Left | NavKey::Right => {}
+        }
+        None
     }
 }
 

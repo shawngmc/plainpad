@@ -472,6 +472,12 @@ impl View {
         self.reveal = true;
     }
 
+    /// Whether the point (relative to the text origin) is inside the selection.
+    pub fn point_in_selection(&self, x: f32, y: f32) -> bool {
+        let (Some(c), Some((a, z))) = (self.hit(x, y), self.selection()) else { return false };
+        (a.line, a.index) <= (c.line, c.index) && (c.line, c.index) < (z.line, z.index)
+    }
+
     pub fn drag(&mut self, x: f32, y: f32) {
         if let Some(c) = self.hit(x, y) {
             self.cursor = c;

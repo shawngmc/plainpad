@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod commands;
+mod context;
 mod doc;
 mod document;
 mod gfx;
@@ -52,8 +53,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use ui::{
-    Choice, Cmd, DialogAction, FieldKey, FindAction, FindBar, FontDialog, MenuHit, MenuState, NavKey, Prompt, TabBar,
-    TabHit,
+    Choice, Cmd, CtxHit, DialogAction, FieldKey, FindAction, FindBar, FontDialog, MenuHit, MenuState, NavKey, Prompt,
+    TabBar, TabHit,
 };
 use view::{View, font_attrs};
 use winit::application::ApplicationHandler;
@@ -97,6 +98,14 @@ enum Pending {
     Exit,
     /// Open this (suspicious) link if the user confirms.
     OpenLink(String),
+    /// Close the tabs marked `closing` (Close Other Tabs, Close Tabs to the Right).
+    CloseMarked,
+}
+
+fn next_tab_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// One open document.
@@ -112,6 +121,10 @@ struct Tab {
     meta_dirty: bool,
     /// "Don't Save" was chosen for this tab while closing its window or exiting.
     discard: bool,
+    /// Marked for closing by Close Other Tabs / Close Tabs to the Right.
+    closing: bool,
+    /// Stable identity, unaffected by tabs moving around.
+    id: u64,
 }
 
 impl Tab {
@@ -125,6 +138,8 @@ impl Tab {
             mixed_eol: false,
             meta_dirty: false,
             discard: false,
+            closing: false,
+            id: next_tab_id(),
         }
     }
 
@@ -180,6 +195,12 @@ struct Win {
     close: bool,
     /// The window's `wl_surface` pointer on Wayland (0 elsewhere), to match drop targets.
     wl_surface: usize,
+    /// The open right-click menu.
+    ctx: Option<ui::ContextMenu>,
+    /// Where the text caret was last drawn (x, bottom), for opening the menu from the keyboard.
+    caret: Option<(f32, f32)>,
+    /// The tab to make active once a multi-tab close finishes.
+    keep_tab: Option<u64>,
 }
 
 impl Win {
@@ -210,6 +231,9 @@ impl Win {
             needs_redraw: true,
             close: false,
             wl_surface: 0,
+            ctx: None,
+            caret: None,
+            keep_tab: None,
         }
     }
 

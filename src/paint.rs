@@ -50,6 +50,7 @@ impl App {
             s,
             self.win.hover_url.as_ref(),
         );
+        self.win.caret = caret.map(|(x, y, h)| (x, y + h));
         if let Some((x, y, h)) = caret {
             cv.set_clip(area);
             if !self.win.preedit.is_empty() {
@@ -173,6 +174,9 @@ impl App {
         }
         if let Some(d) = &mut self.win.font_dlg {
             d.draw(&mut self.gfx, cv, &th, s, &mut |g, cv, r, fam, pt| draw_preview(g, cv, r, fam, pt, s, th.fg));
+        }
+        if let Some(c) = &mut self.win.ctx {
+            c.draw(&mut self.gfx, cv, &th, s);
         }
         if let Some(p) = &mut self.win.prompt {
             p.draw(&mut self.gfx, cv, &th, s);

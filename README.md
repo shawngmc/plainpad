@@ -43,6 +43,13 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
 - Line-ending detection: CRLF, LF or CR. Files with mixed endings are flagged and normalised on save.
   You can convert between them with **Format → Line Endings**.
 
+**Right-click menus**
+- In the text: Undo, Redo, Cut, Copy, Paste, Delete and Select All, with unavailable items greyed out. On a
+  link, Open Link and Copy Link Address too. Right-clicking outside the selection moves the cursor there first.
+- On a tab: Close Tab, Close Other Tabs, Close Tabs to the Right, Move to New Window and Copy File Path.
+  Closing several tabs asks about each modified one in turn, and Cancel stops the whole thing.
+- Open the text menu from the keyboard with the Menu key or Shift+F10. On macOS, Control+click also opens it.
+
 **Editing**
 - Cut, Copy and Paste with the system clipboard (Ctrl+X/C/V or the Edit menu), on Windows, macOS, X11 and
   Wayland, including GNOME
@@ -107,6 +114,7 @@ On macOS, use **Cmd** wherever this table says **Ctrl**, except for Ctrl+Tab and
 | Insert a tab | Tab |
 | Clear selection, or close the find bar | Esc |
 | Open a URL | Ctrl+click |
+| Right-click menu at the cursor | Menu key or Shift+F10 (arrows to move, Enter to choose, Esc to close) |
 
 **Find bar:** Enter finds the next match and Shift+Enter the previous one. In the Replace field, Enter replaces
 the current match. Tab switches between the Find and Replace fields, and Esc closes the bar.
@@ -267,7 +275,7 @@ Recently fixed:
 - [ ] Highlight all matches while the find bar is open
 - [ ] Support find/replace across line breaks, and regular expressions
 - [ ] Go to line (Ctrl+G, as in Notepad; this conflicts with the current Find Next binding)
-- [ ] Add a right-click context menu
+- [x] Add right-click menus for the text and the tabs
 - [ ] Auto-scroll on a timer while drag-selecting outside the view (today it only scrolls while the mouse moves)
 - [ ] Let the Tab key move keyboard focus between controls in the find bar and dialogs
 - [ ] Repaint only the changed parts of the window, using softbuffer damage regions, instead of the whole window

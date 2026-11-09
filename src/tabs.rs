@@ -286,13 +286,16 @@ impl App {
                     }
                     Pending::CloseWindow => self.request_close_window(),
                     Pending::Exit => self.request_exit(),
+                    Pending::CloseMarked => self.close_marked(),
                     Pending::OpenLink(_) => {}
                 }
             }
             Choice::Cancel => {
                 for t in self.win.tabs.iter_mut().chain(self.others.iter_mut().flat_map(|w| w.tabs.iter_mut())) {
                     t.discard = false;
+                    t.closing = false;
                 }
+                self.win.keep_tab = None;
             }
         }
     }

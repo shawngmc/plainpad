@@ -217,6 +217,14 @@ impl Document {
         Some(cursor)
     }
 
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
     pub fn is_dirty(&self) -> bool {
         Some(self.undo.len()) != self.saved
     }

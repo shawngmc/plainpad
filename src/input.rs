@@ -124,6 +124,40 @@ impl App {
             return;
         }
 
+        if let Some(ctx) = &mut self.win.ctx {
+            let nav = match named {
+                Some(NamedKey::ArrowUp) => Some(NavKey::Up),
+                Some(NamedKey::ArrowDown) => Some(NavKey::Down),
+                Some(NamedKey::Enter | NamedKey::Space) => Some(NavKey::Enter),
+                Some(NamedKey::Escape) => {
+                    self.win.ctx = None;
+                    return;
+                }
+                _ => None,
+            };
+            match nav {
+                Some(n) => {
+                    if let Some(a) = ctx.key(n) {
+                        self.run_ctx(a);
+                    }
+                    return;
+                }
+                // Any other key closes the menu and is then handled as usual.
+                None => self.win.ctx = None,
+            }
+        }
+
+        // The Menu key, or Shift+F10, opens the text area's menu at the caret.
+        if (named == Some(NamedKey::ContextMenu) || (shift && named == Some(NamedKey::F10)))
+            && self.win.menu.open.is_none()
+        {
+            let t = self.win.layout.text;
+            let at = self.win.caret.filter(|c| t.contains(*c)).unwrap_or((t.x + 20.0, t.y + 20.0));
+            let link = self.link_at_cursor();
+            self.open_text_menu(at, link);
+            return;
+        }
+
         if self.win.menu.open.is_some() {
             let nav = match named {
                 Some(NamedKey::ArrowUp) => Some(NavKey::Up),
@@ -321,7 +355,11 @@ impl App {
         let p = self.win.mouse;
         let icon = if self.win.drag == Drag::Tab {
             if self.win.layout.tabs.contains(p) { CursorIcon::Grab } else { CursorIcon::Grabbing }
-        } else if self.win.prompt.is_some() || self.win.font_dlg.is_some() || self.win.menu.open.is_some() {
+        } else if self.win.prompt.is_some()
+            || self.win.font_dlg.is_some()
+            || self.win.menu.open.is_some()
+            || self.win.ctx.is_some()
+        {
             CursorIcon::Default
         } else if self.win.layout.text.contains(p) {
             if self.primary() && self.win.hover_url.is_some() { CursorIcon::Pointer } else { CursorIcon::Text }
@@ -344,6 +382,11 @@ impl App {
         self.win.mouse_prev = self.win.mouse;
         self.win.mouse = p;
         if self.win.menu.open.is_some() && self.win.menu.hover_at(p) {
+            self.win.needs_redraw = true;
+        }
+        if let Some(c) = &mut self.win.ctx
+            && c.hover_at(p)
+        {
             self.win.needs_redraw = true;
         }
         match self.win.drag {
@@ -433,6 +476,42 @@ impl App {
             }
             return;
         }
+        if let Some(ctx) = &self.win.ctx {
+            match ctx.hit(p) {
+                CtxHit::Item(a) if button == MouseButton::Left => return self.run_ctx(a),
+                CtxHit::Item(_) | CtxHit::Inside => return,
+                // A click elsewhere closes the menu; a right-click elsewhere reopens it there.
+                CtxHit::Outside => {
+                    self.win.ctx = None;
+                    if button != MouseButton::Right {
+                        return;
+                    }
+                }
+            }
+        }
+        // Secondary click: the right button, or Control+click on macOS.
+        let secondary = button == MouseButton::Right
+            || (MAC && button == MouseButton::Left && self.mods.control_key() && !self.mods.super_key());
+        if secondary && self.win.menu.open.is_none() {
+            if self.win.layout.tabs.contains(p) {
+                if let Some(TabHit::Tab(i) | TabHit::Close(i)) = self.win.tabbar.hit(p) {
+                    self.open_tab_menu(i, p);
+                }
+                return;
+            }
+            if self.win.layout.text.contains(p) {
+                self.win.find.focus = false;
+                let (x, y) = self.text_point(p);
+                let view = &mut self.win.tabs[self.win.active].view;
+                // Right-clicking outside the selection moves the cursor there, as in most editors.
+                if !view.point_in_selection(x, y) {
+                    view.click(x, y, 1, false);
+                }
+                let link = self.url_at(p).map(|(_, _, u)| u);
+                self.open_text_menu(p, link);
+                return;
+            }
+        }
         if button == MouseButton::Middle
             && self.win.menu.open.is_none()
             && let Some(TabHit::Tab(i) | TabHit::Close(i)) = self.win.tabbar.hit(p)
@@ -518,6 +597,7 @@ impl App {
             self.win.needs_redraw = true;
             return;
         }
+        self.win.ctx = None; // scrolling dismisses a right-click menu
         if self.win.prompt.is_some() {
             return;
         }
