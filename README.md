@@ -148,13 +148,34 @@ Measured on Linux/X11 with a release build:
 
 ## Known bugs
 
-- When deleting lines makes a scrollable file short enough to fit the window, the top of the file
-  sometimes isn't fully visible.
+None open right now.
+
+Recently fixed:
+- Scrolling could go blank for a moment, especially in files with long lines, such as a PDF opened as
+  text. Lines loaded into the layout window were sometimes never laid out until a later scroll event.
+- When deleting text made a scrollable file short enough to fit the window, the top of the file was
+  partly hidden. A leftover part-line scroll offset wasn't being cleared.
 
 ## TODO
 
 - [ ] Option to show non-printable characters (tabs, spaces, control characters and other invisibles) as visible placeholders
-- [ ] Rename the project. "Plainpad" collides with existing projects.
+- [ ] Rename the project. "Plainpad" collides with existing projects, and so does the author's old name
+      "QuickJot". Candidates, with the number of GitHub repositories whose names contain each one (checked
+      November 2026; trademarks, domains, app stores and crates.io not yet checked):
+
+      | Name | Repos | Notes |
+      |---|---|---|
+      | **Quiljot** | 0 | A nod to QuickJot: a quill plus a jot. Current favourite. |
+      | Jotwright | 0 | Jot + wright (a maker), like playwright |
+      | Stillpad | 0 | Quiet: no AI, nothing running in the background |
+      | Scrivlet | 0 | A small scrivener (a scribe) |
+      | Tersepad | 0 | A lean editor |
+      | Sparepad | 0 | Spare as in lean |
+      | Barepad | 1 | Bare text, nothing else |
+      | Tacitpad | 1 | Quiet and unobtrusive |
+
+      To avoid: Featherpad and Leafpad (both existing Linux text editors), and Jotter, Quire, Inkwell,
+      Vellum, Scrawl, Plume and Notary (each in hundreds to thousands of repository names).
 - [x] Reduce memory for large files: the document is now held in a rope and only a window of lines is laid out
 - [x] Lower the peak memory while loading: files are decoded 64 KB at a time straight into the rope
 - [ ] Handle very long single lines, such as minified files. cosmic-text shapes a whole line at once, so a

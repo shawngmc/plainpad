@@ -121,6 +121,15 @@ impl View {
         Cursor { line: c.line + self.win, ..c }
     }
 
+    /// Forces the buffer to re-run layout. cosmic-text only notices freshly
+    /// inserted (never-shaped) lines when some buffer state changed, and a
+    /// `set_scroll` to the current value is ignored, so nudge it and restore it.
+    fn touch(&mut self) {
+        let s = self.buf.scroll();
+        self.buf.set_scroll(Scroll::new(s.line, s.vertical + 1.0, s.horizontal));
+        self.buf.set_scroll(s);
+    }
+
     fn new_line(&self, i: usize) -> BufferLine {
         BufferLine::new(self.doc.line(i), LineEnding::Lf, self.attrs.clone(), Shaping::Advanced)
     }
@@ -146,6 +155,7 @@ impl View {
         self.win = start;
         let h = self.buf.scroll().horizontal;
         self.buf.set_scroll(Scroll::new(top - start, vert, h));
+        self.touch();
     }
 
     /// Re-centres the window if scrolling has brought the view near its edge.
@@ -190,6 +200,30 @@ impl View {
         if self.sync_window() {
             self.buf.shape_until_scroll(fs, true);
         }
+        self.clamp_top(fs);
+    }
+
+    /// cosmic-text pulls the view back when there's empty space below the last
+    /// line, but not once it reaches the first line, which can leave the top
+    /// partly hidden after text is deleted. Clamp that case here.
+    fn clamp_top(&mut self, fs: &mut FontSystem) {
+        let s = self.buf.scroll();
+        if self.win != 0 || s.line != 0 || s.vertical <= 0.0 || self.win_end() != self.doc.len_lines() {
+            return;
+        }
+        let view_h = self.buf.size().1.unwrap_or(0.0);
+        let lh = self.line_h();
+        let mut total = 0.0;
+        for i in 0..self.buf.lines.len() {
+            let Some(layout) = self.buf.line_layout(fs, i) else { break };
+            total += layout.iter().map(|l| l.line_height_opt.unwrap_or(lh)).sum::<f32>();
+            if total >= s.vertical + view_h {
+                return; // content fills the view: nothing to fix
+            }
+        }
+        let v = (total - view_h).max(0.0);
+        self.buf.set_scroll(Scroll::new(0, v, s.horizontal));
+        self.buf.shape_until_scroll(fs, true);
     }
 
     pub fn scroll_px(&mut self, px: f32) {
@@ -255,7 +289,7 @@ impl View {
         if r.first >= ws && r.old_last < we && grown <= self.vis_rows + 4 * self.margin() {
             let new: Vec<BufferLine> = (r.first..=r.new_last).map(|i| self.new_line(i)).collect();
             self.buf.lines.splice(r.first - ws..=r.old_last - ws, new);
-            self.buf.set_redraw(true);
+            self.touch();
         } else {
             self.reload();
         }
@@ -614,5 +648,64 @@ mod tests {
             assert_eq!(l.text(), v.doc.line(v.win + k));
         }
         assert!(v.window_len() < 200);
+    }
+
+    fn runs(v: &View) -> usize {
+        v.buf.layout_runs().count()
+    }
+
+    #[test]
+    fn big_jumps_still_lay_out() {
+        let (mut fs, mut v) = view(&big(2000));
+        for _ in 0..10 {
+            v.scroll_px(18.0 * 300.0);
+            v.prepare(&mut fs);
+            assert!(runs(&v) >= 20, "blank view at top {:?}", v.scroll_info());
+        }
+        v.scroll_to_line(500);
+        v.prepare(&mut fs);
+        assert_eq!(v.scroll_info().1, 500);
+        assert!(runs(&v) >= 20);
+    }
+
+    #[test]
+    fn multi_line_insert_is_laid_out() {
+        let (mut fs, mut v) = view("a\nb");
+        v.replace_selection(&"x\n".repeat(30), false);
+        v.prepare(&mut fs);
+        assert!(runs(&v) >= 20);
+    }
+
+    #[test]
+    fn shrinking_to_fit_scrolls_to_top() {
+        let (mut fs, mut v) = view(&big(100));
+        v.motion(&mut fs, Motion::BufferEnd, false);
+        v.prepare(&mut fs);
+        assert!(v.scroll_info().1 > 50);
+        // Select from line 5 to the end and delete: the rest now fits in the view.
+        v.anchor = Some(Cursor::new(5, 0));
+        v.delete_selection();
+        v.prepare(&mut fs);
+        assert_eq!(v.scroll_info().1, 0);
+        assert_eq!(v.buf.scroll().vertical, 0.0);
+        assert_eq!(runs(&v), 6);
+    }
+
+    #[test]
+    fn deleting_to_fit_shows_the_top() {
+        let mut fs = FontSystem::new();
+        let mut v = View::new(&mut fs, "", true);
+        // A view height that isn't a whole number of lines, as in a real window.
+        v.set_geometry(14.0, 18.0, 400.0, 18.0 * 20.0 + 9.0, true);
+        v.set_text(&big(40));
+        v.prepare(&mut fs);
+        v.motion(&mut fs, Motion::BufferEnd, false);
+        v.prepare(&mut fs);
+        for _ in 0..200 {
+            v.backspace();
+            v.prepare(&mut fs);
+        }
+        assert_eq!(v.scroll_info().1, 0);
+        assert_eq!(v.buf.scroll().vertical, 0.0);
     }
 }
