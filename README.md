@@ -44,6 +44,8 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
   You can convert between them with **Format → Line Endings**.
 
 **Editing**
+- Cut, Copy and Paste with the system clipboard (Ctrl+X/C/V or the Edit menu), on Windows, macOS, X11 and
+  Wayland, including GNOME
 - Find, Find Next and Find Previous, with an optional Match case
 - Replace and Replace All. Replace All undoes as a single step.
 - Undo and redo, grouped by word
@@ -162,6 +164,11 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
 
 - **The cursor doesn't blink.** The event loop uses `ControlFlow::Wait` and only repaints after input,
   so an idle window uses no CPU and never wakes up on a timer.
+- **Native Wayland clipboard.** On Wayland the app talks to the compositor's core clipboard protocol directly,
+  which works on every compositor including GNOME, instead of relying on X11 compatibility (Xwayland) or the
+  `wlr-data-control` extension. Clipboard requests from other apps are answered on a small dedicated thread, so
+  they're served instantly, whatever the editor is doing, and a slow or stuck app can't freeze it when you
+  paste (reads time out after 2 seconds). X11, Windows and macOS use arboard, built without its image support.
 - **Tab dragging on Wayland without a toolkit.** Wayland never tells apps where their windows are, so
   dragging a tab to another window uses Wayland's own drag-and-drop protocol, as browsers do. The app binds
   a data device on winit's existing connection, starts a drag with a private MIME type, and the compositor

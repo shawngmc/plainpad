@@ -14,24 +14,30 @@ mod tabs;
 mod ui;
 mod view;
 #[cfg(all(unix, not(target_os = "macos")))]
-mod wl_drag;
+mod wayland;
 /// Wayland-only; a no-op stand-in elsewhere.
 #[cfg(not(all(unix, not(target_os = "macos"))))]
-mod wl_drag {
+mod wayland {
     #[allow(dead_code)]
     pub enum Outcome {
         Dropped { surface: usize, x: f64, y: f64 },
         Elsewhere,
     }
-    pub struct WlDrag;
-    impl WlDrag {
-        pub fn new(_: *mut std::ffi::c_void) -> Option<Self> {
+    pub struct Wayland;
+    impl Wayland {
+        pub fn new(_: *mut std::ffi::c_void, _: impl Fn() + Send + 'static) -> Option<Self> {
             None
         }
         pub fn start(&mut self, _: *mut std::ffi::c_void) -> bool {
             false
         }
         pub fn poll(&mut self) -> Option<Outcome> {
+            None
+        }
+        pub fn set_clipboard(&mut self, _: String) -> bool {
+            false
+        }
+        pub fn get_clipboard(&mut self) -> Option<String> {
             None
         }
     }
@@ -234,7 +240,15 @@ struct Spawn {
     size: PhysicalSize<u32>,
 }
 
+/// Wakes the event loop from another thread.
+#[derive(Debug, Clone, Copy)]
+enum UserEvent {
+    /// A Wayland tab drag has ended; see `App::wl`.
+    WaylandDrag,
+}
+
 struct App {
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     gfx: Gfx,
     settings: Settings,
     theme: Theme,
@@ -246,18 +260,19 @@ struct App {
     /// All other windows.
     others: Vec<Win>,
     spawn: Option<Spawn>,
-    /// Wayland drag-and-drop, when running on Wayland.
-    wl: Option<wl_drag::WlDrag>,
+    /// Native Wayland drag-and-drop and clipboard, when running on Wayland.
+    wl: Option<wayland::Wayland>,
     /// The window and tab of a Wayland drag in progress.
     wl_src: Option<(WindowId, usize)>,
     exit: bool,
 }
 
 impl App {
-    fn new(settings: Settings, files: Vec<PathBuf>) -> Self {
+    fn new(settings: Settings, files: Vec<PathBuf>, proxy: winit::event_loop::EventLoopProxy<UserEvent>) -> Self {
         let mut gfx = Gfx::new();
         let view = View::new(&mut gfx.fs, &settings.font_family, settings.wrap);
         let mut app = App {
+            proxy,
             gfx,
             settings,
             theme: Theme::LIGHT,
@@ -323,7 +338,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     /// Releases everything that holds on to the windowing system's connection
     /// while it is still open. On Wayland, winit closes the display when the
     /// event loop ends, and the drag-and-drop queue and the drawing surfaces
@@ -337,7 +352,7 @@ impl ApplicationHandler for App {
         self.others.clear();
     }
 
-    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+    fn user_event(&mut self, el: &ActiveEventLoop, _: UserEvent) {
         if let Some(outcome) = self.wl.as_mut().and_then(|w| w.poll()) {
             self.finish_wl_drag(outcome);
             self.after_event(el);
@@ -427,8 +442,8 @@ impl ApplicationHandler for App {
 fn main() {
     let settings = Settings::load();
     let files = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    let el = EventLoop::new().expect("failed to create event loop");
+    let el = EventLoop::<UserEvent>::with_user_event().build().expect("failed to create event loop");
     el.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(settings, files);
+    let mut app = App::new(settings, files, el.create_proxy());
     el.run_app(&mut app).expect("event loop error");
 }

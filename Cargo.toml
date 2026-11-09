@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-arboard = "3.7.0"
+# No image support: a text editor only needs text.
+arboard = { version = "3.7.0", default-features = false }
 cosmic-text = "0.19.0"
 miniz_oxide = "0.9.1"
 rfd = "0.18.0"

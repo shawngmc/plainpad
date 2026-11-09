@@ -359,14 +359,14 @@ impl App {
     }
 
     /// Handles the end of a Wayland tab drag.
-    pub(crate) fn finish_wl_drag(&mut self, outcome: wl_drag::Outcome) {
+    pub(crate) fn finish_wl_drag(&mut self, outcome: wayland::Outcome) {
         let Some((src, i)) = self.wl_src.take() else { return };
         if !self.focus_win(src) || i >= self.win.tabs.len() {
             return;
         }
         self.win.needs_redraw = true;
         match outcome {
-            wl_drag::Outcome::Dropped { surface, x, y } => {
+            wayland::Outcome::Dropped { surface, x, y } => {
                 if let Some(k) = self.others.iter().position(|w| w.wl_surface == surface) {
                     let sc = self.others[k].scale;
                     self.move_tab_to(i, k, Some((x as f32 * sc, y as f32 * sc)));
@@ -378,7 +378,7 @@ impl App {
                     return;
                 }
             }
-            wl_drag::Outcome::Elsewhere => {}
+            wayland::Outcome::Elsewhere => {}
         }
         if self.win.tabs.len() > 1 {
             let size = self.win.window.as_ref().map(|w| w.inner_size()).unwrap_or_default();
@@ -418,7 +418,10 @@ impl App {
             && let Ok(d) = w.display_handle()
             && let RawDisplayHandle::Wayland(dh) = d.as_raw()
         {
-            self.wl = wl_drag::WlDrag::new(dh.display.as_ptr());
+            let proxy = self.proxy.clone();
+            self.wl = wayland::Wayland::new(dh.display.as_ptr(), move || {
+                let _ = proxy.send_event(UserEvent::WaylandDrag);
+            });
         }
         win.window = Some(w.clone());
         win.surface = Some(surface);

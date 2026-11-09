@@ -17,14 +17,26 @@ impl App {
         self.clipboard.as_mut()
     }
 
+    /// Puts text on the system clipboard: natively on Wayland, through arboard
+    /// elsewhere (X11, Windows, macOS).
     pub(crate) fn set_clipboard(&mut self, text: String) {
         let text = if cfg!(windows) { text.replace('\n', "\r\n") } else { text };
-        if let Some(cb) = self.clipboard() {
-            let _ = cb.set_text(text);
+        if let Some(wl) = &mut self.wl {
+            if !wl.set_clipboard(text) {
+                self.win.status_msg = Some("Couldn't copy: no recent input to authorise it".into());
+            }
+            return;
+        }
+        let ok = self.clipboard().is_some_and(|cb| cb.set_text(text).is_ok());
+        if !ok {
+            self.win.status_msg = Some("Couldn't copy to the clipboard".into());
         }
     }
 
     pub(crate) fn get_clipboard(&mut self) -> Option<String> {
+        if let Some(wl) = &mut self.wl {
+            return wl.get_clipboard();
+        }
         self.clipboard().and_then(|cb| cb.get_text().ok())
     }
 
