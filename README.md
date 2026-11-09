@@ -34,6 +34,19 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
   tabs, and Exit asks about every modified tab in every window, in turn. Cancel stops the close or exit. The window title shows `*`
   while the file is modified, and it clears if you undo back to the saved state.
 
+**Protecting your work**
+- **Crash recovery:** about 2 seconds after you stop typing, every document with unsaved changes is
+  snapshotted to a private folder (`<settings dir>/plainpad/recovery`, readable only by you). If the editor
+  crashes or is killed, the next start reopens those documents as modified tabs, pointing at their original
+  files. Snapshots are deleted as soon as a document is saved, closed or undone back to its saved state, and
+  the folder is removed on a normal exit. Each running instance keeps its own locked folder, so several
+  instances never take each other's snapshots. The timer only runs while there are unsnapshotted edits, so an
+  idle editor still never wakes up.
+- **Files changed by other programs:** when a window regains focus, its tabs' files are checked. A tab with
+  no unsaved changes reloads silently, keeping its scroll position. A tab with unsaved changes asks whether to
+  reload or keep your version (keeping is the default). A deleted file is reported and the tab marked modified.
+  Saving over a file that changed since you opened it asks first (Cancel is the default).
+
 **Text and Unicode**
 - Shaping, bidirectional text (Arabic, Hebrew and mixed-direction lines), complex scripts and font fallback
   for CJK and other scripts
@@ -308,7 +321,7 @@ Recently fixed:
 - [x] Handle very long single lines, such as minified files (see "Long lines" under optimizations)
 - [x] Open several documents at once, in tabs
 - [ ] Restore the open tabs when the app restarts
-- [ ] Autosave unsaved changes for crash recovery (the release build aborts on a panic, losing unsaved work)
+- [x] Autosave unsaved changes for crash recovery
 - [x] Drag a tab out into its own window, or onto another window (including on Wayland)
 - [ ] On Wayland, make a dragged-out window follow the pointer while dragging, as Chrome does, using the
       `xdg-toplevel-drag` protocol where the compositor supports it (KDE, recent GNOME). Show a tab image while
@@ -325,7 +338,7 @@ Recently fixed:
 - [ ] Repaint only the changed parts of the window, using softbuffer damage regions, instead of the whole window
 - [ ] Accessibility support for screen readers (AccessKit)
 - [ ] Detect BOM-less UTF-16 files
-- [ ] Notice when the open file changes on disk and offer to reload it
+- [x] Notice when the open file changes on disk and offer to reload it
 - [ ] Optional blinking cursor, switched off by default
 - [ ] Test on real Windows and macOS hardware, especially the URL launcher (`ShellExecuteW`) and printing.
       So far Linux (X11 and Wayland) has been run; the other two have only been compile-checked and built in CI.

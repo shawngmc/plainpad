@@ -59,6 +59,7 @@ impl App {
                 t.eol = l.eol;
                 t.mixed_eol = l.mixed_eol;
                 t.meta_dirty = false;
+                t.disk = safety::stamp(&path);
                 t.path = Some(path);
                 self.activate(i);
                 self.win.status_msg =
@@ -87,7 +88,8 @@ impl App {
 
     pub(crate) fn save(&mut self) -> bool {
         match self.tab().path.clone() {
-            Some(p) => self.save_to(p),
+            // If the file changed on disk meanwhile, ask before overwriting it.
+            Some(p) => self.confirm_overwrite() && self.save_to(p),
             None => self.save_as(),
         }
     }
@@ -114,6 +116,7 @@ impl App {
         };
         match doc::save(&path, &bytes) {
             Ok(()) => {
+                t.disk = safety::stamp(&path);
                 t.path = Some(path);
                 t.view.doc.mark_saved();
                 t.meta_dirty = false;
@@ -140,6 +143,7 @@ impl App {
         }
         match std::fs::rename(&old, &new) {
             Ok(()) => {
+                self.win.tabs[self.win.active].disk = safety::stamp(&new);
                 self.win.tabs[self.win.active].path = Some(new);
                 self.win.status_msg = Some(format!("Renamed to {}", self.doc_name()));
             }
@@ -277,6 +281,9 @@ impl App {
     pub(crate) fn choose(&mut self, c: Choice) {
         self.win.prompt = None;
         let Some(pending) = self.win.pending.take() else { return };
+        if self.choose_disk(c, &pending) {
+            return;
+        }
         if let Pending::OpenLink(url) = pending {
             if c == Choice::Open
                 && let Err(e) = launch::open_url(&url)
@@ -292,7 +299,7 @@ impl App {
         };
         self.activate(i);
         match c {
-            Choice::Open => {}
+            Choice::Open | Choice::Reload | Choice::Keep | Choice::Overwrite => {}
             // A failed or cancelled save stops the close or exit, like Cancel.
             Choice::Save if !self.save() => self.abandon_close(),
             Choice::Save | Choice::Discard => {
@@ -308,7 +315,7 @@ impl App {
                     Pending::CloseWindow => self.request_close_window(),
                     Pending::Exit => self.request_exit(),
                     Pending::CloseMarked => self.close_marked(),
-                    Pending::OpenLink(_) => {}
+                    Pending::OpenLink(_) | Pending::Reload(_) | Pending::Overwrite(_) => {}
                 }
             }
             Choice::Cancel => self.abandon_close(),

@@ -103,6 +103,8 @@ pub struct Document {
     /// state is unreachable.
     saved: Option<usize>,
     can_merge: bool,
+    /// Bumped on every change to the text, so autosave knows what's new.
+    version: u64,
 }
 
 impl Document {
@@ -120,7 +122,19 @@ impl Document {
             evicted: 0,
             saved: Some(0),
             can_merge: false,
+            version: 0,
         }
+    }
+
+    /// Changes whenever the text does.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// A cheap copy of the text (ropes share their contents), for writing a
+    /// snapshot on another thread.
+    pub fn snapshot(&self) -> Rope {
+        self.rope.clone()
     }
 
     fn depth(&self) -> usize {
@@ -200,6 +214,7 @@ impl Document {
     }
 
     fn replace_raw(&mut self, a: Cursor, b: Cursor, text: &str) -> (String, EditResult) {
+        self.version += 1;
         let (ca, cb) = (self.char_idx(a), self.char_idx(b));
         let removed = self.rope.slice(ca..cb).to_string();
         self.rope.remove(ca..cb);

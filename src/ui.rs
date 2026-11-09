@@ -930,6 +930,11 @@ pub enum Choice {
     Cancel,
     /// Open a link despite the warning.
     Open,
+    /// Reload a file changed on disk / keep our version.
+    Reload,
+    Keep,
+    /// Save over a file changed on disk.
+    Overwrite,
 }
 
 /// A modal question with a row of buttons.
@@ -946,6 +951,8 @@ pub struct Prompt {
 const SAVE_CHOICES: &[(&str, Choice)] =
     &[("Save", Choice::Save), ("Don't Save", Choice::Discard), ("Cancel", Choice::Cancel)];
 const LINK_CHOICES: &[(&str, Choice)] = &[("Open Anyway", Choice::Open), ("Cancel", Choice::Cancel)];
+const CHANGED_CHOICES: &[(&str, Choice)] = &[("Reload", Choice::Reload), ("Keep My Version", Choice::Keep)];
+const OVERWRITE_CHOICES: &[(&str, Choice)] = &[("Overwrite", Choice::Overwrite), ("Cancel", Choice::Cancel)];
 
 /// Greedy word wrap of `text` to `max_w` pixels. A word too long for a line
 /// on its own (such as a long URL) is broken between characters, so nothing
@@ -983,6 +990,16 @@ impl Prompt {
     /// A warning about a suspicious link, with Open Anyway / Cancel; Cancel is the default.
     pub fn link(lines: Vec<String>) -> Self {
         Self { lines, choices: LINK_CHOICES, focus: 1, warn: true, buttons: Vec::new() }
+    }
+
+    /// A file changed on disk under unsaved edits; keeping ours is the default.
+    pub fn changed(msg: String) -> Self {
+        Self { lines: vec![msg], choices: CHANGED_CHOICES, focus: 1, warn: false, buttons: Vec::new() }
+    }
+
+    /// Saving would overwrite a file changed on disk; Cancel is the default.
+    pub fn overwrite(msg: String) -> Self {
+        Self { lines: vec![msg], choices: OVERWRITE_CHOICES, focus: 1, warn: true, buttons: Vec::new() }
     }
 
     pub fn focused(&self) -> Choice {

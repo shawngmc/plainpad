@@ -425,6 +425,11 @@ impl Default for Settings {
     }
 }
 
+/// The app's own directory: settings and crash-recovery snapshots live here.
+pub fn app_dir() -> Option<PathBuf> {
+    config_path().and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
 fn config_path() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)

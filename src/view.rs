@@ -115,6 +115,19 @@ impl View {
         self.load_window((0, 0), 0.0, false);
     }
 
+    /// Replaces the document (e.g. reloaded from disk), keeping the scroll
+    /// position and cursor as far as the new text allows.
+    pub fn reload_document(&mut self, doc: Document) {
+        let (cursor, top) = (self.cursor, self.top_line());
+        self.doc = doc;
+        self.anchor = None;
+        self.cursor_x = None;
+        let top = top.min(self.doc.len_lines() - 1);
+        let vert = self.buf.scroll().vertical;
+        self.load_window((top, 0), vert, false);
+        self.cursor = self.doc.clamp(cursor);
+    }
+
     pub fn set_font(&mut self, family: &str) {
         self.attrs = AttrsList::new(&font_attrs(family));
         for line in &mut self.buf.lines {

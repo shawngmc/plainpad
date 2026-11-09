@@ -11,6 +11,8 @@ mod linkcheck;
 mod mem;
 mod paint;
 mod print;
+mod recovery;
+mod safety;
 mod search;
 mod tabs;
 mod ui;
@@ -117,6 +119,10 @@ enum Pending {
     OpenLink(String),
     /// Close the tabs marked `closing` (Close Other Tabs, Close Tabs to the Right).
     CloseMarked,
+    /// The tab's file changed on disk while it had unsaved changes: reload or keep?
+    Reload(u64),
+    /// The tab's file changed on disk since it was loaded: overwrite it when saving?
+    Overwrite(u64),
 }
 
 fn next_tab_id() -> u64 {
@@ -142,6 +148,10 @@ struct Tab {
     closing: bool,
     /// Stable identity, unaffected by tabs moving around.
     id: u64,
+    /// The file's state on disk when last loaded or saved, to notice outside changes.
+    disk: Option<safety::Stamp>,
+    /// What this tab's crash-recovery snapshot contains, if it has one.
+    snap: Option<safety::SnapKey>,
 }
 
 impl Tab {
@@ -157,6 +167,8 @@ impl Tab {
             discard: false,
             closing: false,
             id: next_tab_id(),
+            disk: None,
+            snap: None,
         }
     }
 
@@ -340,6 +352,12 @@ struct App {
     pastes: Vec<PendingPaste>,
     paste_results: PasteResults,
     next_paste: u64,
+    /// Crash-recovery snapshots of unsaved documents.
+    recovery: Option<recovery::Recovery>,
+    /// Ids of tabs that have a snapshot on disk.
+    snapshots: std::collections::HashSet<u64>,
+    /// When the next autosave snapshot is due (the event loop sleeps until then).
+    autosave_at: Option<Instant>,
     /// The window currently being handled.
     win: Win,
     /// All other windows.
@@ -364,6 +382,9 @@ impl App {
             zoom: 1.0,
             mods: ModifiersState::empty(),
             clipboard: None,
+            recovery: recovery::Recovery::start(),
+            snapshots: Default::default(),
+            autosave_at: None,
             pastes: Vec::new(),
             paste_results: PasteResults::default(),
             next_paste: 0,
@@ -383,6 +404,7 @@ impl App {
                 app.win.tabs[i].path = Some(p);
             }
         }
+        app.restore_recovered();
         app
     }
 
@@ -400,6 +422,12 @@ impl App {
             el.exit();
             return;
         }
+        self.autosave_check();
+        // Sleep until the autosave is due, or indefinitely if nothing is pending.
+        el.set_control_flow(match self.autosave_at {
+            Some(t) => ControlFlow::WaitUntil(t),
+            None => ControlFlow::Wait,
+        });
         if let Some(sp) = self.spawn.take() {
             let mut win = Win::new(vec![sp.tab]);
             self.open_window(el, &mut win, sp.pos, Some(sp.size));
@@ -444,6 +472,17 @@ impl ApplicationHandler<UserEvent> for App {
         }
         self.others.clear();
         self.wl = None;
+        // A normal exit: every tab was saved or discarded, so the snapshots go.
+        self.recovery = None;
+    }
+
+    fn new_events(&mut self, el: &ActiveEventLoop, cause: winit::event::StartCause) {
+        if let winit::event::StartCause::ResumeTimeReached { .. } = cause
+            && self.autosave_at.is_some_and(|t| Instant::now() >= t)
+        {
+            self.autosave_now();
+            self.after_event(el);
+        }
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, _: UserEvent) {
@@ -498,6 +537,9 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(f) => {
                 self.win.focused = f;
                 self.win.needs_redraw = true;
+                if f {
+                    self.check_disk();
+                }
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.mods = m.state();
