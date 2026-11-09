@@ -423,8 +423,6 @@ impl App {
             attrs = attrs.with_position(p);
         }
         let w = Rc::new(el.create_window(attrs).expect("failed to create window"));
-        let ctx = softbuffer::Context::new(w.clone()).expect("failed to create graphics context");
-        let surface = softbuffer::Surface::new(&ctx, w.clone()).expect("failed to create surface");
         w.set_ime_allowed(true);
         win.scale = w.scale_factor() as f32;
         self.theme = if w.theme() == Some(winit::window::Theme::Dark) { Theme::DARK } else { Theme::LIGHT };
@@ -442,8 +440,16 @@ impl App {
                 let _ = proxy.send_event(UserEvent::Wake);
             });
         }
+        // On Wayland, our own presenter (much less memory); softbuffer otherwise.
+        win.fb = match (&self.wl, win.wl_surface) {
+            (Some(wl), s) if s != 0 => wl.framebuffer(s as *mut std::ffi::c_void),
+            _ => None,
+        };
+        if win.fb.is_none() {
+            let ctx = softbuffer::Context::new(w.clone()).expect("failed to create graphics context");
+            win.surface = Some(softbuffer::Surface::new(&ctx, w.clone()).expect("failed to create surface"));
+        }
         win.window = Some(w.clone());
-        win.surface = Some(surface);
         win.tabbar.reveal = true;
         w.request_redraw();
     }

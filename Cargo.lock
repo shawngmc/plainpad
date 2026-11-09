@@ -1236,9 +1236,11 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "cosmic-text",
+ "memmap2",
  "miniz_oxide",
  "rfd",
  "ropey",
+ "rustix 1.1.6",
  "softbuffer",
  "unicode-segmentation",
  "wayland-backend",

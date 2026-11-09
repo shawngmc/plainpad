@@ -138,19 +138,32 @@ impl App {
     pub(crate) fn redraw(&mut self) {
         let Some(win) = self.win.window.clone() else { return };
         self.gfx.set_ui_scale(self.win.scale);
-        let Some(mut surface) = self.win.surface.take() else { return };
         let size = win.inner_size();
-        if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-            && surface.resize(w, h).is_ok()
-        {
-            self.compute_layout(size.width as f32, size.height as f32);
-            if let Ok(mut buf) = surface.buffer_mut() {
-                let mut cv = Canvas::new(&mut buf, size.width, size.height);
-                self.paint(&mut cv);
-                let _ = buf.present();
-            }
+        if size.width == 0 || size.height == 0 {
+            return;
         }
-        self.win.surface = Some(surface);
+        if let Some(mut fb) = self.win.fb.take() {
+            self.compute_layout(size.width as f32, size.height as f32);
+            let drawn = fb.draw(size.width, size.height, |px| {
+                let mut cv = Canvas::new(px, size.width, size.height);
+                self.paint(&mut cv);
+            });
+            self.win.fb = Some(fb);
+            // Every buffer is still with the compositor: draw once it hands one back.
+            self.win.redraw_deferred |= !drawn;
+        } else if let Some(mut surface) = self.win.surface.take() {
+            if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+                && surface.resize(w, h).is_ok()
+            {
+                self.compute_layout(size.width as f32, size.height as f32);
+                if let Ok(mut buf) = surface.buffer_mut() {
+                    let mut cv = Canvas::new(&mut buf, size.width, size.height);
+                    self.paint(&mut cv);
+                    let _ = buf.present();
+                }
+            }
+            self.win.surface = Some(surface);
+        }
         let title = format!("{}{} - {APP}", if self.tab().is_dirty() { "*" } else { "" }, self.doc_name());
         if title != self.win.title {
             win.set_title(&title);

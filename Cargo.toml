@@ -21,6 +21,9 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graph
 # Wayland tab drag-and-drop, on the same libwayland connection winit uses.
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+# Frame buffers for the Wayland presenter (both already used by winit/softbuffer).
+memmap2 = "0.9"
+rustix = { version = "1", features = ["fs"] }
 
 [profile.release]
 opt-level = 3

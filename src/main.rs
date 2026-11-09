@@ -19,6 +19,12 @@ mod wayland;
 /// Wayland-only; a no-op stand-in elsewhere.
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 mod wayland {
+    pub struct Framebuffer;
+    impl Framebuffer {
+        pub fn draw(&mut self, _: u32, _: u32, _: impl FnOnce(&mut [u32])) -> bool {
+            false
+        }
+    }
     #[allow(dead_code)]
     pub enum PasteStart {
         Ready(String),
@@ -43,6 +49,9 @@ mod wayland {
         }
         pub fn set_clipboard(&mut self, _: String) -> bool {
             false
+        }
+        pub fn framebuffer(&self, _: *mut std::ffi::c_void) -> Option<Framebuffer> {
+            None
         }
         pub fn request_paste(&mut self, _: impl FnOnce(Result<String, String>) + Send + 'static) -> PasteStart {
             PasteStart::Empty
@@ -179,7 +188,12 @@ struct Win {
     active: usize,
     tabbar: TabBar,
     window: Option<Rc<Window>>,
+    /// How frames reach the screen: our own low-memory presenter on Wayland,
+    /// softbuffer elsewhere.
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    fb: Option<wayland::Framebuffer>,
+    /// A frame was skipped because the compositor still held every buffer.
+    redraw_deferred: bool,
     scale: f32,
     mouse: (f32, f32),
     mouse_prev: (f32, f32),
@@ -232,6 +246,8 @@ impl Win {
             tabbar: TabBar::default(),
             window: None,
             surface: None,
+            fb: None,
+            redraw_deferred: false,
             scale: 1.0,
             mouse: (0.0, 0.0),
             mouse_prev: (0.0, 0.0),
@@ -415,12 +431,14 @@ impl ApplicationHandler<UserEvent> for App {
     /// event loop ends, and the drag-and-drop queue and the drawing surfaces
     /// use that connection; dropping them afterwards would be a use-after-free.
     fn exiting(&mut self, _el: &ActiveEventLoop) {
-        self.wl = None;
+        // Frame buffers first (they send requests), then the Wayland module (stops its threads).
         for w in std::iter::once(&mut self.win).chain(self.others.iter_mut()) {
             w.surface = None;
+            w.fb = None;
             w.window = None;
         }
         self.others.clear();
+        self.wl = None;
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, _: UserEvent) {
@@ -428,6 +446,12 @@ impl ApplicationHandler<UserEvent> for App {
             self.finish_wl_drag(outcome);
         }
         self.finish_pastes();
+        // A frame skipped for lack of a free buffer can be drawn now.
+        for w in std::iter::once(&mut self.win).chain(self.others.iter_mut()) {
+            if std::mem::take(&mut w.redraw_deferred) {
+                w.redraw_later();
+            }
+        }
         self.after_event(el);
     }
 

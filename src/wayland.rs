@@ -15,6 +15,9 @@
 //!   serial of the key press or click that triggered it (the compositor
 //!   requires one). Pasting reads the current selection offer through a pipe.
 
+mod present;
+pub use present::Framebuffer;
+
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -105,7 +108,7 @@ struct Shared {
 /// The dispatch thread's state.
 struct State {
     shared: Arc<Mutex<Shared>>,
-    /// Wakes the main event loop (used when a drag ends).
+    /// Wakes the main event loop (a drag ended, or a frame buffer was released).
     wake: Box<dyn Fn() + Send>,
 }
 
@@ -121,6 +124,9 @@ pub struct Wayland {
     shared: Arc<Mutex<Shared>>,
     manager: WlDataDeviceManager,
     device: WlDataDevice,
+    shm: Option<wayland_client::protocol::wl_shm::WlShm>,
+    trimmer: Arc<present::Trimmer>,
+    trim_thread: Option<std::thread::JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -138,6 +144,7 @@ impl Wayland {
         let seat: WlSeat = globals.bind(&qh, 1..=7, ()).ok()?;
         let manager: WlDataDeviceManager = globals.bind(&qh, 3..=3, ()).ok()?;
         let device = manager.get_data_device(&seat, &qh, ());
+        let shm = globals.bind(&qh, 1..=1, ()).ok();
         let shared = Arc::new(Mutex::new(Shared::default()));
         let mut state = State { shared: Arc::clone(&shared), wake: Box::new(wake) };
         queue.roundtrip(&mut state).ok()?;
@@ -153,7 +160,18 @@ impl Wayland {
                 }
             })
             .ok()?;
-        Some(Self { conn, qh, shared, manager, device, stop, thread: Some(thread) })
+        let (trimmer, trim_thread) = present::Trimmer::start();
+        Some(Self { conn, qh, shared, manager, device, shm, trimmer, trim_thread, stop, thread: Some(thread) })
+    }
+
+    /// A low-memory frame presenter for a window's `wl_surface` (a pointer from
+    /// its window handle).
+    pub fn framebuffer(&self, surface: *mut c_void) -> Option<Framebuffer> {
+        let shm = self.shm.clone()?;
+        // SAFETY: the pointer is a live wl_surface owned by one of our windows.
+        let id = unsafe { ObjectId::from_ptr(WlSurface::interface(), surface.cast()) }.ok()?;
+        let surface = WlSurface::from_id(&self.conn, id).ok()?;
+        Some(Framebuffer::new(self.conn.clone(), self.qh.clone(), shm, surface, Arc::clone(&self.trimmer)))
     }
 
     fn lock(&self) -> MutexGuard<'_, Shared> {
@@ -251,6 +269,10 @@ impl Drop for Wayland {
     /// Stops the dispatch thread before the display can go away: set the flag,
     /// then make a request whose reply wakes the thread's blocking wait.
     fn drop(&mut self) {
+        self.trimmer.stop();
+        if let Some(t) = self.trim_thread.take() {
+            let _ = t.join();
+        }
         self.stop.store(true, Ordering::Release);
         self.conn.display().sync(&self.qh, ());
         let _ = self.conn.flush();

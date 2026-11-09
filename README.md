@@ -202,6 +202,17 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
   rather than taken from a widget toolkit, so the same code runs on every platform with no toolkit underneath.
 - **No GPU.** Pixels go to the window through `softbuffer`. No wgpu, OpenGL or Vulkan drivers are loaded,
   and GPU stacks typically use 60–150 MB of memory on their own.
+- **Lean frame buffers on Wayland.** A software-drawn window needs a pixel buffer the size of the window,
+  which is 16 MB at 2560×1600. softbuffer always keeps two, rounded up to a power of two and never shrunk. On
+  Wayland the app presents frames itself instead:
+  - It uses one buffer, adding a second only while the compositor still holds the first.
+  - Buffers are the exact window size and are dropped on resize.
+  - About a second after the last frame, the memory of any buffer the compositor has handed back is returned
+    to the kernel.
+
+  An idle window therefore keeps a single frame's worth of memory: typing no longer leaves a second buffer
+  behind, and shrinking the window frees memory. The release runs on a thread that sleeps until there's been
+  activity, so an idle editor still never wakes up. X11, Windows and macOS still use softbuffer.
 - **Repaints only when something changes.** Moving the mouse repaints only if the hovered URL, the menu
   highlight or a drag actually changes.
 - **The document is stored in a rope (`ropey`), outside the layout engine.** The whole text lives in a
