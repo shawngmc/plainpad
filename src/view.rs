@@ -4,7 +4,7 @@
 //! window size rather than the document size. Cursor, selection and undo are
 //! kept in document coordinates.
 
-use crate::document::{order, Document, EditResult};
+use crate::document::{Document, EditResult, order};
 use crate::gfx::{Canvas, Rect, Theme};
 use crate::search;
 use cosmic_text::{
@@ -14,11 +14,7 @@ use cosmic_text::{
 use std::ops::Range;
 
 pub fn font_attrs(family: &str) -> Attrs<'_> {
-    if family.is_empty() {
-        Attrs::new().family(Family::Monospace)
-    } else {
-        Attrs::new().family(Family::Name(family))
-    }
+    if family.is_empty() { Attrs::new().family(Family::Monospace) } else { Attrs::new().family(Family::Name(family)) }
 }
 
 pub struct View {
@@ -537,11 +533,7 @@ impl View {
                 for (k, (x, w)) in hl.into_iter().enumerate() {
                     let (mut x0, mut x1) = (ox + x, ox + x + w);
                     if k + 1 == n && z.line > li {
-                        if run.rtl {
-                            x0 = area.x
-                        } else {
-                            x1 = area.right()
-                        }
+                        if run.rtl { x0 = area.x } else { x1 = area.right() }
                     }
                     cv.fill(Rect::new(x0, top, x1 - x0, run.line_height), th.sel);
                 }
@@ -553,9 +545,18 @@ impl View {
             for g in run.glyphs {
                 let in_url = urls.iter().any(|r| g.start >= r.start && g.start < r.end);
                 let selected = sel.is_some_and(|(a, z)| {
-                    li >= a.line && li <= z.line && (a.line != li || g.end > a.index) && (z.line != li || g.start < z.index)
+                    li >= a.line
+                        && li <= z.line
+                        && (a.line != li || g.end > a.index)
+                        && (z.line != li || g.start < z.index)
                 });
-                let color = if selected { th.sel_fg } else if in_url { th.link } else { th.fg };
+                let color = if selected {
+                    th.sel_fg
+                } else if in_url {
+                    th.link
+                } else {
+                    th.fg
+                };
                 let pg = g.physical((ox, oy + run.line_y), 1.0);
                 cache.with_pixels(fs, pg.cache_key, color, |x, y, c| cv.blend(pg.x + x, pg.y + y, c));
                 if let Some((hl, hr)) = hover
@@ -632,7 +633,10 @@ mod tests {
         v.type_text("X");
         v.replace_selection("\nnew\n", false);
         v.prepare(&mut fs);
-        assert_eq!((v.doc.line(10).as_ref(), v.doc.line(11).as_ref(), v.doc.line(12).as_ref()), ("X", "new", "line 10"));
+        assert_eq!(
+            (v.doc.line(10).as_ref(), v.doc.line(11).as_ref(), v.doc.line(12).as_ref()),
+            ("X", "new", "line 10")
+        );
         // Window lines must match the document exactly.
         for (k, l) in v.buf.lines.iter().enumerate() {
             assert_eq!(l.text(), v.doc.line(v.win + k), "window line {k}");

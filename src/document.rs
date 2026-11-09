@@ -39,11 +39,7 @@ fn end_of(start: Cursor, text: &str) -> Cursor {
 }
 
 fn normalize(text: &str) -> Cow<'_, str> {
-    if text.contains('\r') {
-        Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
-    } else {
-        Cow::Borrowed(text)
-    }
+    if text.contains('\r') { Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n")) } else { Cow::Borrowed(text) }
 }
 
 pub struct Document {
@@ -57,7 +53,13 @@ pub struct Document {
 
 impl Document {
     pub fn new(text: &str) -> Self {
-        Self { rope: Rope::from_str(&normalize(text)), undo: Vec::new(), redo: Vec::new(), saved: Some(0), can_merge: false }
+        Self {
+            rope: Rope::from_str(&normalize(text)),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            saved: Some(0),
+            can_merge: false,
+        }
     }
 
     /// Takes an already-normalised (`\n`-only) rope, e.g. from the streaming loader.

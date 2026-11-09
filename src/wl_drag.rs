@@ -13,7 +13,7 @@
 
 use std::ffi::c_void;
 use wayland_backend::client::{Backend, ObjectId};
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_data_device::{self, WlDataDevice};
 use wayland_client::protocol::wl_data_device_manager::{DndAction, WlDataDeviceManager};
 use wayland_client::protocol::wl_data_offer::{self, WlDataOffer};
@@ -22,7 +22,7 @@ use wayland_client::protocol::wl_pointer::{self, WlPointer};
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{event_created_child, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, event_created_child};
 
 const MIME: &str = "application/x-plainpad-tab";
 
@@ -125,11 +125,27 @@ impl State {
 }
 
 impl Dispatch<WlRegistry, GlobalListContents> for State {
-    fn event(_: &mut Self, _: &WlRegistry, _: <WlRegistry as Proxy>::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlRegistry,
+        _: <WlRegistry as Proxy>::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<WlDataDeviceManager, ()> for State {
-    fn event(_: &mut Self, _: &WlDataDeviceManager, _: <WlDataDeviceManager as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &WlDataDeviceManager,
+        _: <WlDataDeviceManager as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<WlSeat, ()> for State {
@@ -160,7 +176,14 @@ impl Dispatch<WlPointer, ()> for State {
 }
 
 impl Dispatch<WlDataDevice, ()> for State {
-    fn event(state: &mut Self, _: &WlDataDevice, event: wl_data_device::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        _: &WlDataDevice,
+        event: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         match event {
             wl_data_device::Event::Motion { x, y, .. } => state.pos = (x, y),
             wl_data_device::Event::Enter { serial, surface, id, x, y } => {
@@ -206,7 +229,14 @@ impl Dispatch<WlDataDevice, ()> for State {
 }
 
 impl Dispatch<WlDataOffer, ()> for State {
-    fn event(state: &mut Self, _: &WlDataOffer, event: wl_data_offer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        _: &WlDataOffer,
+        event: wl_data_offer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         if let wl_data_offer::Event::Action { dnd_action: WEnum::Value(a) } = event {
             state.offer_action = a.contains(DndAction::Move);
         }
@@ -214,7 +244,14 @@ impl Dispatch<WlDataOffer, ()> for State {
 }
 
 impl Dispatch<WlDataSource, ()> for State {
-    fn event(state: &mut Self, _: &WlDataSource, event: wl_data_source::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        state: &mut Self,
+        _: &WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         match event {
             // Nothing outside this process accepts our MIME type, so no data is ever transferred.
             wl_data_source::Event::Send { fd, .. } => drop(fd),

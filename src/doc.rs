@@ -1,8 +1,8 @@
 //! File loading/saving, text encodings, line endings and persisted settings.
 
-use std::fs;
 use ropey::{Rope, RopeBuilder};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -64,9 +64,9 @@ pub struct Loaded {
 // Windows-1252 bytes 0x80..=0x9F. Undefined slots map to the C1 control of
 // the same value so that decoding and re-encoding round-trips every byte.
 const CP1252_HIGH: [u16; 32] = [
-    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039,
-    0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D,
+    0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A,
+    0x0153, 0x009D, 0x017E, 0x0178,
 ];
 
 fn cp1252(b: u8) -> char {
@@ -239,9 +239,11 @@ fn utf16(r: &mut impl Read, sink: &mut Sink, le: bool) -> io::Result<()> {
         }
         carry.extend_from_slice(&buf[..n]);
         let even = carry.len() & !1;
-        units.extend(carry[..even].chunks_exact(2).map(|c| {
-            if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }
-        }));
+        units.extend(
+            carry[..even]
+                .chunks_exact(2)
+                .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }),
+        );
         carry.drain(..even);
         // Keep a trailing high surrogate for the next chunk.
         let held = units.last().filter(|u| (0xD800..0xDC00).contains(*u)).copied();
@@ -314,29 +316,94 @@ pub fn load_from<R: Read + Seek>(mut r: R) -> io::Result<Loaded> {
 }
 
 pub fn load(path: &Path) -> io::Result<Loaded> {
+    // Opening a FIFO would block the UI forever, and a device such as /dev/zero never ends.
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
     load_from(fs::File::open(path)?)
 }
 
-/// Writes via a temporary file + rename so a failed save never truncates the
-/// original. Symlinks are resolved so the link itself is preserved.
+/// A hard-to-guess number for temporary file names. Not cryptographic; the
+/// exclusive create in [`create_private`] is what makes temp files safe.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, RandomState};
+    RandomState::new().hash_one((std::process::id(), std::time::SystemTime::now()))
+}
+
+/// Creates a brand-new file in `dir` named `{prefix}{random}{suffix}`.
+/// It fails rather than opening an existing file or following a symlink
+/// someone planted (O_CREAT|O_EXCL), and on Unix only the owner can read it.
+pub fn create_private(dir: &Path, prefix: &str, suffix: &str) -> io::Result<(PathBuf, fs::File)> {
+    for _ in 0..16 {
+        let path = dir.join(format!("{prefix}{:016x}{suffix}", random_u64()));
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        match opts.open(&path) {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not create a temporary file"))
+}
+
+fn write_in_place(target: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).open(target)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
+/// Replacing the file by renaming over it would change something about it:
+/// it has other hard links, or (on Unix) it belongs to another user.
+#[cfg(unix)]
+fn must_write_in_place(target: &fs::Metadata, tmp: &fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    target.nlink() > 1 || tmp.metadata().is_ok_and(|m| m.uid() != target.uid())
+}
+
+#[cfg(not(unix))]
+fn must_write_in_place(_: &fs::Metadata, _: &fs::File) -> bool {
+    false
+}
+
+/// Saves `bytes` to `path`. An existing file is replaced atomically: the data
+/// goes to a private temp file next to it, which is flushed to disk and then
+/// renamed over the original, so a failed save (disk full, crash) never leaves
+/// a truncated file. Symlinks are resolved so the link itself is kept, and the
+/// original's permissions are copied. Files with extra hard links or another
+/// owner are written in place instead, so they keep their identity.
 pub fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let Ok(meta) = fs::metadata(&target) else {
+        // New file: create it directly so it gets the usual default permissions.
+        return write_in_place(&target, bytes);
+    };
     let dir = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.plainpad-{}.tmp", std::process::id()));
-    let result = (|| {
-        fs::write(&tmp, bytes)?;
-        if let Ok(meta) = fs::metadata(&target) {
-            let _ = fs::set_permissions(&tmp, meta.permissions());
-        }
-        fs::rename(&tmp, &target)
-    })();
-    if result.is_err() {
+    let Ok((tmp, mut file)) = create_private(dir, &format!(".{name}."), ".plainpad-tmp") else {
+        // The directory isn't writable (but the file may be).
+        return write_in_place(&target, bytes);
+    };
+    if must_write_in_place(&meta, &file) {
+        drop(file);
         let _ = fs::remove_file(&tmp);
-        // Fall back to an in-place write (e.g. directory not writable).
-        return fs::write(&target, bytes);
+        return write_in_place(&target, bytes);
     }
-    result
+    let written = file.write_all(bytes).and_then(|_| file.sync_all());
+    drop(file);
+    if let Err(e) = written {
+        // Never fall back to writing in place here: that would truncate the original.
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let _ = fs::set_permissions(&tmp, meta.permissions());
+    if let Err(e) = fs::rename(&tmp, &target) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -470,5 +537,65 @@ mod tests {
         let l = load_str(&all);
         assert_eq!(l.encoding, Encoding::Windows1252);
         assert_eq!(encode(&l.rope.to_string(), l.encoding).unwrap(), all);
+    }
+
+    fn tmpdir() -> PathBuf {
+        let (p, f) = create_private(&std::env::temp_dir(), "plainpad-test-", "").unwrap();
+        drop(f);
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn save_replaces_and_keeps_links() {
+        let d = tmpdir();
+        let f = d.join("a.txt");
+        fs::write(&f, "old").unwrap();
+        save(&f, b"new").unwrap();
+        assert_eq!(fs::read_to_string(&f).unwrap(), "new");
+        // No temp files left behind.
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            // Saving through a symlink keeps the link and updates its target.
+            let l = d.join("link.txt");
+            symlink(&f, &l).unwrap();
+            save(&l, b"via link").unwrap();
+            assert!(fs::symlink_metadata(&l).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_to_string(&f).unwrap(), "via link");
+            // Hard links stay linked.
+            let h = d.join("hard.txt");
+            fs::hard_link(&f, &h).unwrap();
+            save(&f, b"both").unwrap();
+            assert_eq!(fs::read_to_string(&h).unwrap(), "both");
+            // Permissions are kept.
+            fs::set_permissions(&f, fs::Permissions::from_mode(0o640)).unwrap();
+            fs::remove_file(&h).unwrap();
+            save(&f, b"perm").unwrap();
+            assert_eq!(fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o640);
+        }
+        // New files are created.
+        save(&d.join("new.txt"), b"x").unwrap();
+        assert_eq!(fs::read_to_string(d.join("new.txt")).unwrap(), "x");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_files_are_exclusive_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmpdir();
+        let (p, _f) = create_private(&d, "x-", ".tmp").unwrap();
+        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_special_files() {
+        assert!(load(Path::new("/dev/zero")).is_err());
+        assert!(load(Path::new("/")).is_err());
     }
 }

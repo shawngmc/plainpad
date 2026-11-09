@@ -667,7 +667,14 @@ impl FontDialog {
         self.scroll = (self.scroll as isize + d).clamp(0, max as isize) as usize;
     }
 
-    pub fn draw(&mut self, g: &mut Gfx, cv: &mut Canvas, th: &Theme, s: f32, preview: &mut dyn FnMut(&mut Gfx, &mut Canvas, Rect, &str, f32)) {
+    pub fn draw(
+        &mut self,
+        g: &mut Gfx,
+        cv: &mut Canvas,
+        th: &Theme,
+        s: f32,
+        preview: &mut dyn FnMut(&mut Gfx, &mut Canvas, Rect, &str, f32),
+    ) {
         cv.fill(Rect::new(0.0, 0.0, cv.w as f32, cv.h as f32), th.shade);
         let w = (440.0 * s).min(cv.w as f32 - 20.0 * s);
         let h = (460.0 * s).min(cv.h as f32 - 20.0 * s);
@@ -700,12 +707,18 @@ impl FontDialog {
         let list: Vec<String> = self.filtered().into_iter().map(String::from).collect();
         let vis = self.visible_rows();
         for (k, f) in list.iter().enumerate().skip(self.scroll).take(vis + 1) {
-            let rr = Rect::new(self.list.x, self.list.y + (k - self.scroll) as f32 * self.row_h, self.list.w, self.row_h);
+            let rr =
+                Rect::new(self.list.x, self.list.y + (k - self.scroll) as f32 * self.row_h, self.list.w, self.row_h);
             let sel = self.selected.as_deref() == Some(f.as_str());
             if sel {
                 cv.fill(rr, th.accent);
             }
-            g.text_in(cv, &display_name(f), Rect::new(rr.x + 8.0 * s, rr.y, rr.w, rr.h), if sel { th.accent_fg } else { th.fg });
+            g.text_in(
+                cv,
+                &display_name(f),
+                Rect::new(rr.x + 8.0 * s, rr.y, rr.w, rr.h),
+                if sel { th.accent_fg } else { th.fg },
+            );
             self.rows.push((rr, f.to_string()));
         }
         cv.reset_clip();
@@ -721,7 +734,13 @@ impl FontDialog {
         cv.outline(pr, s, th.border);
         let pt: f32 = self.size.text.trim().parse().unwrap_or(11.0);
         cv.set_clip(pr);
-        preview(g, cv, Rect::new(pr.x + 8.0 * s, pr.y, pr.w - 16.0 * s, pr.h), self.selected.as_deref().unwrap_or(""), pt);
+        preview(
+            g,
+            cv,
+            Rect::new(pr.x + 8.0 * s, pr.y, pr.w - 16.0 * s, pr.h),
+            self.selected.as_deref().unwrap_or(""),
+            pt,
+        );
         cv.reset_clip();
         y += 48.0 * s + 8.0 * s;
         let mut x = r.right() - pad;
@@ -733,7 +752,12 @@ impl FontDialog {
             cv.fill(br, if primary { th.accent } else { th.bg });
             cv.outline(br, s, th.border);
             let tw = g.text_w(t);
-            g.text_in(cv, t, Rect::new(br.x + (bw - tw) / 2.0, br.y, tw, fh), if primary { th.accent_fg } else { th.chrome_fg });
+            g.text_in(
+                cv,
+                t,
+                Rect::new(br.x + (bw - tw) / 2.0, br.y, tw, fh),
+                if primary { th.accent_fg } else { th.chrome_fg },
+            );
             self.buttons.push((br, a));
             x -= 8.0 * s;
         }
@@ -773,7 +797,8 @@ pub struct Prompt {
     buttons: Vec<(Rect, Choice)>,
 }
 
-pub const PROMPT_CHOICES: [(&str, Choice); 3] = [("Save", Choice::Save), ("Don't Save", Choice::Discard), ("Cancel", Choice::Cancel)];
+pub const PROMPT_CHOICES: [(&str, Choice); 3] =
+    [("Save", Choice::Save), ("Don't Save", Choice::Discard), ("Cancel", Choice::Cancel)];
 
 impl Prompt {
     pub fn new(msg: String) -> Self {

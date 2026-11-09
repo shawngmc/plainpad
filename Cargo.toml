@@ -7,7 +7,6 @@ edition = "2024"
 arboard = "3.7.0"
 cosmic-text = "0.19.0"
 miniz_oxide = "0.9.1"
-open = "5.4.5"
 rfd = "0.18.0"
 ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
 softbuffer = "0.4.8"
@@ -15,7 +14,7 @@ unicode-segmentation = "1.13.3"
 winit = "0.30.13"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_Controls_Dialogs", "Win32_Storage_Xps"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_Controls_Dialogs", "Win32_Storage_Xps", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 # Wayland tab drag-and-drop, on the same libwayland connection winit uses.

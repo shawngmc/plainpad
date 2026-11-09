@@ -242,7 +242,10 @@ impl<W: Write> PdfWriter<W> {
         for off in &self.offsets {
             tail.push_str(&format!("{off:010} 00000 n \n"));
         }
-        tail.push_str(&format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", self.offsets.len() + 1));
+        tail.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            self.offsets.len() + 1
+        ));
         self.out.write_all(tail.as_bytes())?;
         self.out.flush()?;
         Ok(self.out)
@@ -253,11 +256,14 @@ impl<W: Write> PdfWriter<W> {
 #[cfg(not(windows))]
 pub fn print(fs: &mut FontSystem, cache: &mut SwashCache, job: &Job, title: &str) -> Result<String, String> {
     let page = PageSetup::default_for_locale();
-    let path = std::env::temp_dir().join(format!("plainpad-print-{}.pdf", std::process::id()));
-    let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+    // A private, unpredictable temp file: a predictable name in a shared temp
+    // directory could be pre-created as a symlink to redirect the write.
+    let (path, file) =
+        crate::doc::create_private(&std::env::temp_dir(), "plainpad-print-", ".pdf").map_err(|e| e.to_string())?;
     let mut pdf = PdfWriter::new(io::BufWriter::new(file)).map_err(|e| e.to_string())?;
     let (w_pt, h_pt) = (page.w_in * 72.0, page.h_in * 72.0);
-    let pages = render_pages(fs, cache, job, &page, |_, _, r| pdf.add_page(&r, w_pt, h_pt)).map_err(|e| e.to_string())?;
+    let pages =
+        render_pages(fs, cache, job, &page, |_, _, r| pdf.add_page(&r, w_pt, h_pt)).map_err(|e| e.to_string())?;
     pdf.finish().map_err(|e| e.to_string())?;
 
     match std::process::Command::new("lp").arg("-t").arg(title).arg(&path).output() {
@@ -267,7 +273,7 @@ pub fn print(fs: &mut FontSystem, cache: &mut SwashCache, job: &Job, title: &str
         }
         // No CUPS or no default printer: hand the PDF to the system viewer.
         _ => {
-            open::that_detached(&path).map_err(|e| e.to_string())?;
+            crate::launch::open_file(&path)?;
             Ok(format!("No default printer; opened {pages}-page PDF in viewer"))
         }
     }
@@ -314,7 +320,13 @@ mod win {
         }
     }
 
-    unsafe fn print_to_dc(dc: HDC, fs: &mut FontSystem, cache: &mut SwashCache, job: &Job, title: &str) -> Result<String, String> {
+    unsafe fn print_to_dc(
+        dc: HDC,
+        fs: &mut FontSystem,
+        cache: &mut SwashCache,
+        job: &Job,
+        title: &str,
+    ) -> Result<String, String> {
         unsafe {
             let dpi_x = GetDeviceCaps(dc, LOGPIXELSX as _).max(1) as f32;
             let dpi_y = GetDeviceCaps(dc, LOGPIXELSY as _).max(1) as f32;

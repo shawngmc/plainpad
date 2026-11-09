@@ -28,8 +28,8 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
 - New Tab, Open, Save, Save As, Rename, Close Tab, Print
 - The Open dialog can select several files. You can also drag files onto the window or pass several paths on
   the command line; each opens in its own tab.
-- Saving writes a temporary file and renames it over the original, so a failed save never truncates your file.
-  Symlinks and file permissions are kept.
+- Saving writes a temporary file, flushes it to disk and renames it over the original, so a failed save (disk
+  full, crash) never truncates your file. Symlinks, permissions and hard links are kept.
 - Closing a tab with unsaved changes asks whether to save it. Closing a window asks about each of its modified
   tabs, and Exit asks about every modified tab in every window, in turn. Cancel stops the close or exit. The window title shows `*`
   while the file is modified, and it clears if you undo back to the saved state.
@@ -55,8 +55,9 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
 - Zoom
 - A status bar you can hide, showing line and column, selection size, zoom, line ending and encoding
 - Light or dark theme, following the system
-- URL detection for `http(s)://`, `ftp://`, `file://`, `mailto:` and `www.`. URLs are coloured,
-  underlined on hover, and Ctrl+click opens them in the system browser.
+- URL detection for `http(s)://`, `ftp://`, `mailto:` and `www.`. URLs are coloured and underlined on hover,
+  the status bar shows where a link goes, and Ctrl+click (Cmd+click on macOS) opens it in the default browser or
+  mail app.
 
 **Printing**
 - Pages are laid out with the same text engine as the editor, in your chosen font, with page numbers.
@@ -113,6 +114,26 @@ size field, Enter applies and Esc cancels.
 **macOS:** Option+Left/Right moves by word, Cmd+Left/Right moves to the start or end of the line, and
 Cmd+Up/Down moves to the start or end of the document. The Alt+letter shortcuts for menus and word wrap are not
 available on macOS, because Option types characters there.
+
+## Security
+
+A text editor opens files from anywhere, so their contents are treated as untrusted:
+
+- **Links:** only `http`, `https`, `ftp` and `mailto` links can be opened, and only by an explicit Ctrl+click.
+  `file://` and other schemes aren't treated as links, so a document can't make you open or run a local
+  program. Hovering shows a link's real target in the status bar. A link ends at any invisible formatting
+  character, such as a zero-width space or a bidi override, so text can't hide or reorder part of the target.
+- **Opening links:** links are handed to the OS directly (`ShellExecuteW` on Windows, `open` on macOS,
+  `xdg-open` on Linux) as a single argument, never through a shell.
+- **Saving:** the temp file is created exclusively with an unpredictable name, so a symlink planted next to
+  the file can't redirect the write. It's readable only by you until it replaces the original, and then it
+  takes the original's permissions. Files owned by another user, or with extra hard links, are written in place
+  so they keep their owner and links.
+- **Printing:** the PDF sent to the printer is created the same way, private and with an unpredictable name.
+- **Opening files:** only regular files are opened. A FIFO or a device such as `/dev/zero` is refused rather
+  than hanging the app or filling memory.
+- **Dependencies:** `cargo audit` reports no known vulnerabilities. CI uses read-only permissions and runs
+  actions pinned to commit SHAs.
 
 ## Intentional optimizations
 

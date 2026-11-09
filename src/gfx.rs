@@ -225,9 +225,7 @@ impl Gfx {
             w = w.max(run.line_w);
             for g in run.glyphs {
                 let pg = g.physical((x, y + run.line_y), 1.0);
-                cache.with_pixels(fs, pg.cache_key, color, |gx, gy, c| {
-                    cv.blend(pg.x + gx, pg.y + gy, c)
-                });
+                cache.with_pixels(fs, pg.cache_key, color, |gx, gy, c| cv.blend(pg.x + gx, pg.y + gy, c));
             }
         }
         w
