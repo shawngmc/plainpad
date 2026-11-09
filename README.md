@@ -17,7 +17,7 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
 - Drag a tab out of the tab bar and drop it outside the window to open it in a new window. Drop it on
   another Plainpad window to move it there. Each window has its own tabs, menus and find bar; the font,
   zoom, word wrap and status bar settings are shared.
-  On Wayland the app can't see where its windows are on screen, so a dragged-out tab always opens a new window.
+  Dropping on another window's tab bar puts the tab at that spot. Dropping back on its own tab bar cancels.
 - New documents are named Untitled, Untitled 2, and so on.
 - Opening a file that's already open switches to its tab. An empty, untouched Untitled tab is reused
   rather than left behind.
@@ -120,6 +120,10 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
 
 - **The cursor doesn't blink.** The event loop uses `ControlFlow::Wait` and only repaints after input,
   so an idle window uses no CPU and never wakes up on a timer.
+- **Tab dragging on Wayland without a toolkit.** Wayland never tells apps where their windows are, so
+  dragging a tab to another window uses Wayland's own drag-and-drop protocol, as browsers do. The app binds
+  a data device on winit's existing connection, starts a drag with a private MIME type, and the compositor
+  reports which of our windows it was dropped on. X11, Windows and macOS use the pointer position instead.
 - **No GTK.** On Linux, file dialogs use the XDG desktop portal (via `rfd`) and the clipboard talks to
   X11/Wayland directly (`arboard`). This avoids loading GTK, which adds about 30 MB of memory.
 - **The GUI is drawn by the app itself.** The menus, find bar, dialogs and status bar are drawn by the app
@@ -203,7 +207,10 @@ Recently fixed:
       multi-megabyte line is slow to display.
 - [x] Open several documents at once, in tabs
 - [ ] Restore the open tabs when the app restarts
-- [x] Drag a tab out into its own window, or onto another window
+- [x] Drag a tab out into its own window, or onto another window (including on Wayland)
+- [ ] On Wayland, make a dragged-out window follow the pointer while dragging, as Chrome does, using the
+      `xdg-toplevel-drag` protocol where the compositor supports it (KDE, recent GNOME). Show a tab image while
+      dragging.
 - [ ] Use the native macOS menu bar at the top of the screen instead of the in-window menu bar
 - [ ] Add a print dialog on macOS and Linux (page setup, choice of printer, copies)
 - [ ] Add a horizontal scrollbar when word wrap is off

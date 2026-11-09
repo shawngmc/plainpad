@@ -7,6 +7,29 @@ mod print;
 mod search;
 mod ui;
 mod view;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod wl_drag;
+/// Wayland-only; a no-op stand-in elsewhere.
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+mod wl_drag {
+    #[allow(dead_code)]
+    pub enum Outcome {
+        Dropped { surface: usize, x: f64, y: f64 },
+        Elsewhere,
+    }
+    pub struct WlDrag;
+    impl WlDrag {
+        pub fn new(_: *mut std::ffi::c_void) -> Option<Self> {
+            None
+        }
+        pub fn start(&mut self, _: *mut std::ffi::c_void) -> bool {
+            false
+        }
+        pub fn poll(&mut self) -> Option<Outcome> {
+            None
+        }
+    }
+}
 
 use cosmic_text::{Buffer, Cursor, Metrics, Motion, Shaping, Wrap};
 use doc::{Encoding, Eol, Settings};
@@ -27,6 +50,7 @@ use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, W
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Window, WindowId};
 
 const APP: &str = "Plainpad";
@@ -133,6 +157,8 @@ struct Win {
     needs_redraw: bool,
     /// Close this window once the current event has been handled.
     close: bool,
+    /// The window's `wl_surface` pointer on Wayland (0 elsewhere), to match drop targets.
+    wl_surface: usize,
 }
 
 impl Win {
@@ -162,6 +188,7 @@ impl Win {
             focused: true,
             needs_redraw: true,
             close: false,
+            wl_surface: 0,
         }
     }
 
@@ -204,6 +231,10 @@ struct App {
     /// All other windows.
     others: Vec<Win>,
     spawn: Option<Spawn>,
+    /// Wayland drag-and-drop, when running on Wayland.
+    wl: Option<wl_drag::WlDrag>,
+    /// The window and tab of a Wayland drag in progress.
+    wl_src: Option<(WindowId, usize)>,
     exit: bool,
 }
 
@@ -221,6 +252,8 @@ impl App {
             win: Win::new(vec![Tab::new(view, 1)]),
             others: Vec::new(),
             spawn: None,
+            wl: None,
+            wl_src: None,
             exit: false,
         };
         for p in files {
@@ -510,35 +543,93 @@ impl App {
         }
     }
 
-    /// Finishes dragging a tab. Dropped well outside the tab bar, it moves into
-    /// the window under the pointer, or into a new window there.
-    fn finish_tab_drag(&mut self) {
+    /// Whether a dragged tab is far enough outside the tab bar to detach it.
+    fn tab_drag_outside(&self) -> bool {
         let (p, s, tabs) = (self.win.mouse, self.win.scale, self.win.layout.tabs);
         let size = self.win.window.as_ref().map(|w| w.inner_size()).unwrap_or_default();
-        let outside = p.1 < tabs.y - 20.0 * s
-            || p.1 > tabs.bottom() + 40.0 * s
-            || p.0 < 0.0
-            || p.0 > size.width as f32;
-        if !outside {
+        p.1 < tabs.y - 20.0 * s || p.1 > tabs.bottom() + 40.0 * s || p.0 < 0.0 || p.0 > size.width as f32
+    }
+
+    /// Moves tab `i` of the current window into `others[k]`. `at` is a point in
+    /// that window's pixels: dropped on its tab bar, the tab goes in there.
+    fn move_tab_to(&mut self, i: usize, k: usize, at: Option<(f32, f32)>) {
+        let tab = self.take_tab(i);
+        let w = &mut self.others[k];
+        let pos = match at.and_then(|p| w.tabbar.hit(p)) {
+            Some(TabHit::Tab(j) | TabHit::Close(j)) => j,
+            _ => w.tabs.len(),
+        };
+        w.tabs.insert(pos, tab);
+        w.active = pos;
+        w.tabbar.reveal = true;
+        w.redraw_later();
+        if let Some(win) = &w.window {
+            win.focus_window();
+        }
+    }
+
+    /// Finishes dragging a tab (X11, Windows, macOS). Dropped well outside the
+    /// tab bar, it moves into the window under the pointer, or into a new window there.
+    fn finish_tab_drag(&mut self) {
+        if !self.tab_drag_outside() {
             return;
         }
+        let (p, s) = (self.win.mouse, self.win.scale);
+        let size = self.win.window.as_ref().map(|w| w.inner_size()).unwrap_or_default();
         let screen = self.win.screen_rect().map(|r| (r.x + p.0, r.y + p.1));
-        let target = screen.and_then(|sp| self.others.iter().position(|w| w.screen_rect().is_some_and(|r| r.contains(sp))));
-        if let Some(k) = target {
-            let tab = self.take_tab(self.win.active);
-            let w = &mut self.others[k];
-            w.tabs.push(tab);
-            w.active = w.tabs.len() - 1;
-            w.tabbar.reveal = true;
-            w.redraw_later();
-            if let Some(win) = &w.window {
-                win.focus_window();
-            }
+        let target = screen.and_then(|sp| {
+            self.others.iter().position(|w| w.screen_rect().is_some_and(|r| r.contains(sp))).map(|k| (k, sp))
+        });
+        if let Some((k, (sx, sy))) = target {
+            let local = self.others[k].screen_rect().map(|r| (sx - r.x, sy - r.y));
+            self.move_tab_to(self.win.active, k, local);
         } else if self.win.tabs.len() > 1 {
             let tab = self.take_tab(self.win.active);
             // Put the new window so the pointer sits over its first tab.
             let pos = screen.map(|(x, y)| PhysicalPosition::new((x - 60.0 * s) as i32, (y - 40.0 * s) as i32));
             self.spawn = Some(Spawn { tab, pos, size });
+        }
+    }
+
+    /// Starts a Wayland drag-and-drop for the active tab, if on Wayland and
+    /// the tab has somewhere to go. Returns true if it started.
+    fn start_wl_drag(&mut self) -> bool {
+        let movable = self.win.tabs.len() > 1 || !self.others.is_empty();
+        let (Some(wl), Some(id)) = (&mut self.wl, self.win.id()) else { return false };
+        if !movable || self.win.wl_surface == 0 || !wl.start(self.win.wl_surface as *mut std::ffi::c_void) {
+            return false;
+        }
+        self.wl_src = Some((id, self.win.active));
+        self.win.drag = Drag::None;
+        true
+    }
+
+    /// Handles the end of a Wayland tab drag.
+    fn finish_wl_drag(&mut self, outcome: wl_drag::Outcome) {
+        let Some((src, i)) = self.wl_src.take() else { return };
+        if !self.focus_win(src) || i >= self.win.tabs.len() {
+            return;
+        }
+        self.win.needs_redraw = true;
+        match outcome {
+            wl_drag::Outcome::Dropped { surface, x, y } => {
+                if let Some(k) = self.others.iter().position(|w| w.wl_surface == surface) {
+                    let sc = self.others[k].scale;
+                    self.move_tab_to(i, k, Some((x as f32 * sc, y as f32 * sc)));
+                    return;
+                }
+                // Dropped back on its own window: over the tab bar cancels, elsewhere detaches.
+                let p = (x as f32 * self.win.scale, y as f32 * self.win.scale);
+                if surface != self.win.wl_surface || self.win.layout.tabs.contains(p) {
+                    return;
+                }
+            }
+            wl_drag::Outcome::Elsewhere => {}
+        }
+        if self.win.tabs.len() > 1 {
+            let size = self.win.window.as_ref().map(|w| w.inner_size()).unwrap_or_default();
+            let tab = self.take_tab(i);
+            self.spawn = Some(Spawn { tab, pos: None, size });
         }
     }
 
@@ -558,6 +649,17 @@ impl App {
         w.set_ime_allowed(true);
         win.scale = w.scale_factor() as f32;
         self.theme = if w.theme() == Some(winit::window::Theme::Dark) { Theme::DARK } else { Theme::LIGHT };
+        if let Ok(h) = w.window_handle()
+            && let RawWindowHandle::Wayland(wh) = h.as_raw()
+        {
+            win.wl_surface = wh.surface.as_ptr() as usize;
+        }
+        if self.wl.is_none()
+            && let Ok(d) = w.display_handle()
+            && let RawDisplayHandle::Wayland(dh) = d.as_raw()
+        {
+            self.wl = wl_drag::WlDrag::new(dh.display.as_ptr());
+        }
         win.window = Some(w.clone());
         win.surface = Some(surface);
         win.tabbar.reveal = true;
@@ -1189,6 +1291,10 @@ impl App {
                 }
             }
             Drag::Tab => {
+                if self.tab_drag_outside() && self.start_wl_drag() {
+                    self.update_cursor_icon();
+                    return;
+                }
                 if let Some(TabHit::Tab(j) | TabHit::Close(j)) = self.win.tabbar.hit(p)
                     && j != self.win.active
                 {
@@ -1587,7 +1693,49 @@ fn shortcut_char(ev: &KeyEvent) -> Option<char> {
     })
 }
 
+impl App {
+    /// Work that follows any event: quitting, creating a window for a
+    /// detached tab, repainting, and dropping closed windows.
+    fn after_event(&mut self, el: &ActiveEventLoop) {
+        if self.exit {
+            self.settings.save();
+            el.exit();
+            return;
+        }
+        if let Some(sp) = self.spawn.take() {
+            let mut win = Win::new(vec![sp.tab]);
+            self.open_window(el, &mut win, sp.pos, Some(sp.size));
+            self.others.push(win);
+        }
+        if std::mem::take(&mut self.win.needs_redraw) {
+            self.win.redraw_later();
+        }
+        // Drop closed windows; if the current one closed, another becomes current.
+        self.others.retain(|w| !w.close);
+        if self.win.close {
+            match self.others.pop() {
+                Some(w) => {
+                    self.win = w;
+                    self.gfx.set_ui_scale(self.win.scale);
+                    self.win.redraw_later();
+                }
+                None => {
+                    self.settings.save();
+                    el.exit();
+                }
+            }
+        }
+    }
+}
+
 impl ApplicationHandler for App {
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        if let Some(outcome) = self.wl.as_mut().and_then(|w| w.poll()) {
+            self.finish_wl_drag(outcome);
+            self.after_event(el);
+        }
+    }
+
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.win.window.is_some() {
             return;
@@ -1664,34 +1812,7 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
-        if self.exit {
-            self.settings.save();
-            el.exit();
-            return;
-        }
-        if let Some(sp) = self.spawn.take() {
-            let mut win = Win::new(vec![sp.tab]);
-            self.open_window(el, &mut win, sp.pos, Some(sp.size));
-            self.others.push(win);
-        }
-        if std::mem::take(&mut self.win.needs_redraw) {
-            self.win.redraw_later();
-        }
-        // Drop closed windows; if the current one closed, another becomes current.
-        self.others.retain(|w| !w.close);
-        if self.win.close {
-            match self.others.pop() {
-                Some(w) => {
-                    self.win = w;
-                    self.gfx.set_ui_scale(self.win.scale);
-                    self.win.redraw_later();
-                }
-                None => {
-                    self.settings.save();
-                    el.exit();
-                }
-            }
-        }
+        self.after_event(el);
     }
 }
 

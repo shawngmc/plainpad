@@ -1382,6 +1382,8 @@ dependencies = [
  "ropey",
  "softbuffer",
  "unicode-segmentation",
+ "wayland-backend",
+ "wayland-client",
  "windows-sys 0.61.2",
  "winit",
 ]
