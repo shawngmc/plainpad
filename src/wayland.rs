@@ -18,8 +18,7 @@
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
 use wayland_backend::client::{Backend, ObjectId};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_callback::WlCallback;
@@ -38,8 +37,6 @@ const TAB_MIME: &str = "application/x-plainpad-tab";
 /// Text formats offered when copying, best first. The X11-style names are what
 /// apps running under Xwayland ask for.
 const TEXT_MIMES: [&str; 5] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "TEXT", "STRING"];
-/// How long to wait for another app to hand over pasted text.
-const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The most we'll read from another app's clipboard. Without a cap, an app
 /// that never stops writing would fill memory.
 const PASTE_MAX: u64 = 256 * 1024 * 1024;
@@ -49,6 +46,16 @@ const MAX_WRITERS: usize = 8;
 static WRITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Ignore offers that advertise absurd numbers of MIME types.
 const MAX_MIMES: usize = 64;
+
+/// How a paste request started.
+pub enum PasteStart {
+    /// Our own copied text, available immediately.
+    Ready(String),
+    /// Being read from another app; the result will be delivered later.
+    Pending,
+    /// Nothing pasteable on the clipboard.
+    Empty,
+}
 
 /// How a drag ended.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -202,37 +209,41 @@ impl Wayland {
         true
     }
 
-    /// Reads the clipboard as text.
-    pub fn get_clipboard(&mut self) -> Option<String> {
+    /// Starts reading the clipboard as text. Text we copied ourselves comes back
+    /// at once; otherwise another app sends it through a pipe, which is read on a
+    /// background thread that passes the result to `deliver`. Nothing here waits
+    /// on the other app, so a slow or stuck one can't freeze the editor.
+    pub fn request_paste(&mut self, deliver: impl FnOnce(Result<String, String>) + Send + 'static) -> PasteStart {
         let sh = self.lock();
-        // While we own the clipboard, use our own copy rather than a round trip
-        // through the compositor.
         if let Some(src) = &sh.clip_source
             && let Some(SourceKind::Clipboard(text)) = src.data::<SourceKind>()
         {
-            return Some(text.to_string());
+            return PasteStart::Ready(text.to_string());
         }
         // Keep holding the lock while using the offer: the dispatch thread destroys
         // replaced offers under this lock, and libwayland doesn't allow destroying
         // an object on one thread while another sends a request on it.
-        let offer = sh.selection.as_ref()?;
-        let mimes = offer.data::<OfferMimes>()?.0.lock().ok()?.clone();
-        let mime = TEXT_MIMES.iter().find(|m| mimes.iter().any(|x| x == *m))?;
-        let (reader, writer) = std::io::pipe().ok()?;
+        let Some(offer) = sh.selection.as_ref() else { return PasteStart::Empty };
+        let mimes = offer.data::<OfferMimes>().and_then(|m| m.0.lock().ok().map(|v| v.clone())).unwrap_or_default();
+        let Some(mime) = TEXT_MIMES.iter().find(|m| mimes.iter().any(|x| x == *m)) else { return PasteStart::Empty };
+        let Ok((reader, writer)) = std::io::pipe() else { return PasteStart::Empty };
         offer.receive(mime.to_string(), std::os::fd::AsFd::as_fd(&writer));
         let _ = self.conn.flush();
         drop(sh);
         drop(writer); // our copy of the write end; the other app holds its own
-        // Read on a helper thread so a misbehaving app can't freeze the editor, and
-        // stop at PASTE_MAX so it can't exhaust memory even after we've given up.
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        // Stop at PASTE_MAX so an app that never stops sending can't exhaust memory.
+        let spawned = std::thread::Builder::new().name("clipboard-read".into()).spawn(move || {
             let mut buf = Vec::new();
-            let ok = reader.take(PASTE_MAX + 1).read_to_end(&mut buf).is_ok() && buf.len() as u64 <= PASTE_MAX;
-            let _ = tx.send(ok.then_some(buf));
+            let result = match reader.take(PASTE_MAX + 1).read_to_end(&mut buf) {
+                Ok(_) if buf.len() as u64 > PASTE_MAX => {
+                    Err("The clipboard contents are too large to paste (over 256 MB)".to_string())
+                }
+                Ok(_) => Ok(String::from_utf8_lossy(&buf).into_owned()),
+                Err(e) => Err(format!("Couldn't read the clipboard: {e}")),
+            };
+            deliver(result);
         });
-        let bytes = rx.recv_timeout(PASTE_TIMEOUT).ok().flatten()?;
-        Some(String::from_utf8_lossy(&bytes).into_owned())
+        if spawned.is_ok() { PasteStart::Pending } else { PasteStart::Empty }
     }
 }
 

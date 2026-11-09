@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// How long to wait for another app to hand over pasted text.
+const PASTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl App {
     // ---------------------------------------------------------------- editing
 
@@ -33,11 +36,112 @@ impl App {
         }
     }
 
-    pub(crate) fn get_clipboard(&mut self) -> Option<String> {
-        if let Some(wl) = &mut self.wl {
-            return wl.get_clipboard();
+    /// Starts a paste into `target`. Reading the clipboard can mean waiting on
+    /// another app, so it happens off the main thread and the text is inserted
+    /// when it arrives (see `finish_pastes`); the editor never blocks on it.
+    pub(crate) fn start_paste(&mut self, target: PasteTarget) {
+        let token = self.next_paste;
+        self.next_paste += 1;
+        let results = Arc::clone(&self.paste_results);
+        let proxy = self.proxy.clone();
+        let deliver = move |r: Result<String, String>| {
+            results.lock().unwrap_or_else(|e| e.into_inner()).push((token, r));
+            let _ = proxy.send_event(UserEvent::Wake);
+        };
+        let start = match &mut self.wl {
+            Some(wl) => wl.request_paste(deliver.clone()),
+            None => {
+                // X11, Windows, macOS: arboard on a thread, since the app that owns
+                // the clipboard may be asked to produce the data on demand.
+                let d = deliver.clone();
+                let spawned = std::thread::Builder::new().name("clipboard-read".into()).spawn(move || {
+                    let r = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                        Ok(t) => Ok(t),
+                        Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
+                        Err(e) => Err(format!("Couldn't read the clipboard: {e}")),
+                    };
+                    d(r);
+                });
+                if spawned.is_ok() { wayland::PasteStart::Pending } else { wayland::PasteStart::Empty }
+            }
+        };
+        match start {
+            wayland::PasteStart::Ready(text) => self.apply_paste(target, text),
+            wayland::PasteStart::Empty => {}
+            wayland::PasteStart::Pending => {
+                self.pastes.push(PendingPaste { token, target });
+                self.win.needs_redraw = true;
+                // Give up if the other app never answers.
+                let _ = std::thread::Builder::new().name("clipboard-timeout".into()).spawn(move || {
+                    std::thread::sleep(PASTE_TIMEOUT);
+                    deliver(Err("Paste timed out: the app that owns the clipboard didn't respond".into()));
+                });
+            }
         }
-        self.clipboard().and_then(|cb| cb.get_text().ok())
+    }
+
+    /// Applies pastes whose text has arrived (or that failed or timed out).
+    pub(crate) fn finish_pastes(&mut self) {
+        let done = std::mem::take(&mut *self.paste_results.lock().unwrap_or_else(|e| e.into_inner()));
+        for (token, result) in done {
+            // Ignore late arrivals for pastes already finished (by timeout, or the reverse).
+            let Some(pos) = self.pastes.iter().position(|p| p.token == token) else { continue };
+            let target = self.pastes.remove(pos).target;
+            let found = match target {
+                PasteTarget::Editor { tab } => self.focus_tab_window(tab),
+                PasteTarget::Find { win, .. } => self.focus_win(win),
+            };
+            if !found {
+                continue; // the tab or window has gone
+            }
+            match result {
+                Ok(text) => self.apply_paste(target, text),
+                Err(e) => self.win.status_msg = Some(e),
+            }
+            self.win.needs_redraw = true;
+        }
+    }
+
+    /// Whether a paste into the current window is waiting for its text.
+    pub(crate) fn paste_pending_here(&self) -> bool {
+        let id = self.win.id();
+        self.pastes.iter().any(|p| match p.target {
+            PasteTarget::Editor { tab } => self.win.tab_pos(tab).is_some(),
+            PasteTarget::Find { win, .. } => Some(win) == id,
+        })
+    }
+
+    /// Makes the window holding the tab with this id current.
+    fn focus_tab_window(&mut self, tab: u64) -> bool {
+        if self.win.tab_pos(tab).is_some() {
+            return true;
+        }
+        match self.others.iter().position(|w| w.tab_pos(tab).is_some()) {
+            Some(k) => {
+                self.swap_to(k);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn apply_paste(&mut self, target: PasteTarget, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        match target {
+            PasteTarget::Editor { tab } => {
+                let Some(i) = self.win.tab_pos(tab) else { return };
+                self.win.tabs[i].view.replace_selection(&text, false);
+                self.edited();
+            }
+            PasteTarget::Find { field, .. } => {
+                let first = text.lines().next().unwrap_or("");
+                self.win.find.field = field;
+                self.win.find.field_mut().key(FieldKey::Insert(first));
+            }
+        }
+        self.win.needs_redraw = true;
     }
 
     pub(crate) fn copy(&mut self) {
@@ -215,10 +319,8 @@ impl App {
             }
             Cmd::Copy => self.copy(),
             Cmd::Paste => {
-                if let Some(t) = self.get_clipboard() {
-                    self.win.tabs[self.win.active].view.replace_selection(&t, false);
-                    self.edited();
-                }
+                let tab = self.win.tabs[self.win.active].id;
+                self.start_paste(PasteTarget::Editor { tab });
             }
             Cmd::Delete => {
                 self.win.tabs[self.win.active].view.delete();

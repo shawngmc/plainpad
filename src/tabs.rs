@@ -439,7 +439,7 @@ impl App {
         {
             let proxy = self.proxy.clone();
             self.wl = wayland::Wayland::new(dh.display.as_ptr(), move || {
-                let _ = proxy.send_event(UserEvent::WaylandDrag);
+                let _ = proxy.send_event(UserEvent::Wake);
             });
         }
         win.window = Some(w.clone());

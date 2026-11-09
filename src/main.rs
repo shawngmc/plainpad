@@ -20,6 +20,12 @@ mod wayland;
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 mod wayland {
     #[allow(dead_code)]
+    pub enum PasteStart {
+        Ready(String),
+        Pending,
+        Empty,
+    }
+    #[allow(dead_code)]
     pub enum Outcome {
         Dropped { surface: usize, x: f64, y: f64 },
         Elsewhere,
@@ -38,8 +44,8 @@ mod wayland {
         pub fn set_clipboard(&mut self, _: String) -> bool {
             false
         }
-        pub fn get_clipboard(&mut self) -> Option<String> {
-            None
+        pub fn request_paste(&mut self, _: impl FnOnce(Result<String, String>) + Send + 'static) -> PasteStart {
+            PasteStart::Empty
         }
     }
 }
@@ -51,6 +57,7 @@ use std::num::NonZeroU32;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use ui::{
     Choice, Cmd, CtxHit, DialogAction, FieldKey, FindAction, FindBar, FontDialog, MenuHit, MenuState, NavKey, Prompt,
@@ -279,12 +286,30 @@ struct Spawn {
     size: PhysicalSize<u32>,
 }
 
-/// Wakes the event loop from another thread.
+/// Wakes the event loop from another thread: a Wayland tab drag has ended,
+/// or a paste has finished (or timed out).
 #[derive(Debug, Clone, Copy)]
 enum UserEvent {
-    /// A Wayland tab drag has ended; see `App::wl`.
-    WaylandDrag,
+    Wake,
 }
+
+/// Where pasted text should go when it arrives.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PasteTarget {
+    /// At the cursor of the tab with this id, wherever that tab is by then.
+    Editor { tab: u64 },
+    /// Into a find-bar field (0 = find, 1 = replace) of this window.
+    Find { win: WindowId, field: usize },
+}
+
+/// A paste waiting for its text.
+struct PendingPaste {
+    token: u64,
+    target: PasteTarget,
+}
+
+/// Finished paste reads, by token, filled in from background threads.
+type PasteResults = Arc<Mutex<Vec<(u64, Result<String, String>)>>>;
 
 struct App {
     proxy: winit::event_loop::EventLoopProxy<UserEvent>,
@@ -294,6 +319,10 @@ struct App {
     zoom: f32,
     mods: ModifiersState,
     clipboard: Option<arboard::Clipboard>,
+    /// Pastes waiting for their text, and results delivered by background threads.
+    pastes: Vec<PendingPaste>,
+    paste_results: PasteResults,
+    next_paste: u64,
     /// The window currently being handled.
     win: Win,
     /// All other windows.
@@ -318,6 +347,9 @@ impl App {
             zoom: 1.0,
             mods: ModifiersState::empty(),
             clipboard: None,
+            pastes: Vec::new(),
+            paste_results: PasteResults::default(),
+            next_paste: 0,
             win: Win::new(vec![Tab::new(view, 1)]),
             others: Vec::new(),
             spawn: None,
@@ -394,8 +426,9 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, el: &ActiveEventLoop, _: UserEvent) {
         if let Some(outcome) = self.wl.as_mut().and_then(|w| w.poll()) {
             self.finish_wl_drag(outcome);
-            self.after_event(el);
         }
+        self.finish_pastes();
+        self.after_event(el);
     }
 
     fn resumed(&mut self, el: &ActiveEventLoop) {

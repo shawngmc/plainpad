@@ -195,9 +195,9 @@ impl App {
                 match cmd {
                     Cmd::SelectAll => self.win.find.field_mut().key(FieldKey::SelectAll),
                     Cmd::Paste => {
-                        if let Some(t) = self.get_clipboard() {
-                            let first = t.lines().next().unwrap_or("").to_owned();
-                            self.win.find.field_mut().key(FieldKey::Insert(&first));
+                        if let Some(win) = self.win.id() {
+                            let field = self.win.find.field;
+                            self.start_paste(PasteTarget::Find { win, field });
                         }
                     }
                     _ => {

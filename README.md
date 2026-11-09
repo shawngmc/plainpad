@@ -163,8 +163,9 @@ A text editor opens files from anywhere, so their contents are treated as untrus
 - **Printing:** the PDF sent to the printer is created the same way, private and with an unpredictable name.
 - **Opening files:** only regular files are opened. A FIFO or a device such as `/dev/zero` is refused rather
   than hanging the app or filling memory.
-- **Clipboard (Wayland):** text pasted from another app is capped at 256 MB and the wait at 2 seconds, so an app
-  that never stops sending can't exhaust memory or freeze the editor. At most 8 transfers of our copied text
+- **Clipboard:** pasting never blocks the editor (see "Pasting never freezes" below). On Wayland, text pasted
+  from another app is capped at 256 MB, so an app that never stops sending can't exhaust memory. At most 8
+  transfers of our copied text
   run at once, so an app that keeps asking and never reads can't pile up threads. All shared Wayland
   objects are used under one lock, because libwayland forbids destroying an object on one thread while
   another uses it.
@@ -184,8 +185,13 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
 - **Native Wayland clipboard.** On Wayland the app talks to the compositor's core clipboard protocol directly,
   which works on every compositor including GNOME, instead of relying on X11 compatibility (Xwayland) or the
   `wlr-data-control` extension. Clipboard requests from other apps are answered on a small dedicated thread, so
-  they're served instantly, whatever the editor is doing, and a slow or stuck app can't freeze it when you
-  paste (reads time out after 2 seconds). X11, Windows and macOS use arboard, built without its image support.
+  they're served instantly, whatever the editor is doing. X11, Windows and macOS use arboard, built without its
+  image support.
+- **Pasting never freezes.** Reading the clipboard can mean waiting on the app that copied, which may be slow
+  or stuck. Pastes are read on a background thread on every platform, while the editor keeps working; the status
+  bar shows "Pasting…". The text is inserted when it arrives, at the cursor of the tab it was pasted into,
+  even if that tab has since moved to another window. After 10 seconds without an answer the paste is abandoned
+  with a message. Text copied within Plainpad is pasted immediately.
 - **Tab dragging on Wayland without a toolkit.** Wayland never tells apps where their windows are, so
   dragging a tab to another window uses Wayland's own drag-and-drop protocol, as browsers do. The app binds
   a data device on winit's existing connection, starts a drag with a private MIME type, and the compositor

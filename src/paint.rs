@@ -95,6 +95,7 @@ impl App {
         let key = if MAC { "Cmd" } else { "Ctrl" };
         let left = match (&self.win.status_msg, hovered) {
             (Some(m), _) => m.clone(),
+            (None, _) if self.paste_pending_here() => "Pasting…".to_owned(),
             (None, Some(info)) if info.suspicious() => {
                 warn = true;
                 format!("⚠ Suspicious link: really goes to {}. {}", info.ascii_host, info.warnings[0])
