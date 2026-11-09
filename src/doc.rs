@@ -241,8 +241,10 @@ fn utf16(r: &mut impl Read, sink: &mut Sink, le: bool) -> io::Result<()> {
         let even = carry.len() & !1;
         units.extend(
             carry[..even]
-                .chunks_exact(2)
-                .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }),
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| if le { u16::from_le_bytes(c) } else { u16::from_be_bytes(c) }),
         );
         carry.drain(..even);
         // Keep a trailing high surrogate for the next chunk.
