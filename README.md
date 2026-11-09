@@ -355,8 +355,9 @@ Recently fixed:
 - [ ] Sanitise file names shown in the title and tabs (bidi overrides and invisible characters could disguise them)
 
 **Quality**
-- [ ] Run the GUI smoke tests in CI: Xvfb for X11 and headless sway for Wayland, scripted with xdotool and
+- [x] Run the GUI smoke tests in CI: Xvfb for X11 and headless sway for Wayland, scripted with xdotool and
       a virtual pointer
+- [ ] GUI tests for Windows and macOS (CI only builds and runs unit tests there)
 - [ ] Show an error dialog instead of crashing if a window or graphics surface can't be created
 - [ ] Packaging and releases: versioning, installers (MSI, DMG, AppImage/Flatpak), code signing
 
@@ -368,3 +369,23 @@ cargo build --release
 
 On Linux you need the `libxkbcommon-x11` and `fontconfig` development packages.
 CI builds and tests on Windows, macOS and Linux, and uploads the binaries as artifacts.
+
+### GUI tests
+
+`tests/gui/run.sh` drives the release build under X11 (Xvfb) and Wayland (headless sway) with simulated
+keyboard and mouse input, and checks real outcomes: file contents, the clipboard, window titles and exit
+codes. It covers typing and saving, the clipboard both ways, the unsaved-changes prompt, dragging tabs into
+new and existing windows, crash recovery after `kill -9`, reloading a file changed on disk, opening and
+editing a 5 MB single-line file, a paste from a clipboard owner that never answers, and a clean exit. Each
+test runs a fresh instance with its own settings folder. CI runs it on every push; on failure it keeps a
+screenshot and the app's log in `target/gui-test-output`.
+
+```
+sudo apt-get install xvfb x11-utils xdotool xclip imagemagick sway wtype wl-clipboard grim
+cargo build --release
+cargo build --release --manifest-path tests/gui/testkit/Cargo.toml
+tests/gui/run.sh            # or: tests/gui/run.sh clipboard drag
+```
+
+`tests/gui/testkit` is a small helper for the Wayland tests: a virtual pointer (sway has no input devices
+when headless) and a clipboard owner that never sends its data.

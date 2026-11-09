@@ -40,3 +40,26 @@ jobs:
         with:
           name: plainpad-${{ runner.os }}
           path: target/release/${{ matrix.bin }}
+
+  # Drives the real app under X11 (Xvfb) and Wayland (headless sway) with
+  # simulated input; see tests/gui/run.sh.
+  gui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
+            xvfb x11-utils xdotool xclip imagemagick sway wtype wl-clipboard grim fonts-dejavu-core
+      - run: cargo build --locked --release
+      - run: cargo build --locked --release --manifest-path tests/gui/testkit/Cargo.toml
+      - run: tests/gui/run.sh
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gui-test-output
+          path: target/gui-test-output

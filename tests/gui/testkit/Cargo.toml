@@ -1,0 +1,13 @@
+[package]
+name = "plainpad-testkit"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Input helpers for Plainpad's GUI tests on headless Wayland (sway)"
+
+# Not part of the main crate's build.
+[workspace]
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
