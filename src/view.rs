@@ -53,8 +53,13 @@ impl View {
         v
     }
 
+    #[cfg(test)]
     pub fn set_text(&mut self, text: &str) {
-        self.doc = Document::new(text);
+        self.set_document(Document::new(text));
+    }
+
+    pub fn set_document(&mut self, doc: Document) {
+        self.doc = doc;
         self.cursor = Cursor::default();
         self.anchor = None;
         self.cursor_x = None;

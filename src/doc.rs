@@ -1,7 +1,8 @@
 //! File loading/saving, text encodings, line endings and persisted settings.
 
 use std::fs;
-use std::io;
+use ropey::{Rope, RopeBuilder};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -54,7 +55,7 @@ impl Eol {
 
 pub struct Loaded {
     /// Text with all line endings normalised to `\n`.
-    pub text: String,
+    pub rope: Rope,
     pub encoding: Encoding,
     pub eol: Eol,
     pub mixed_eol: bool,
@@ -68,34 +69,11 @@ const CP1252_HIGH: [u16; 32] = [
     0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
 ];
 
-pub fn decode(bytes: &[u8]) -> (String, Encoding) {
-    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        return (String::from_utf8_lossy(rest).into_owned(), Encoding::Utf8Bom);
+fn cp1252(b: u8) -> char {
+    match b {
+        0x80..=0x9F => char::from_u32(CP1252_HIGH[(b - 0x80) as usize] as u32).unwrap(),
+        _ => b as char,
     }
-    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        return (utf16(rest, u16::from_le_bytes), Encoding::Utf16Le);
-    }
-    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
-        return (utf16(rest, u16::from_be_bytes), Encoding::Utf16Be);
-    }
-    match std::str::from_utf8(bytes) {
-        Ok(s) => (s.to_owned(), Encoding::Utf8),
-        Err(_) => {
-            let s = bytes
-                .iter()
-                .map(|&b| match b {
-                    0x80..=0x9F => char::from_u32(CP1252_HIGH[(b - 0x80) as usize] as u32).unwrap(),
-                    _ => b as char,
-                })
-                .collect();
-            (s, Encoding::Windows1252)
-        }
-    }
-}
-
-fn utf16(bytes: &[u8], f: fn([u8; 2]) -> u16) -> String {
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| f([c[0], c[1]])).collect();
-    String::from_utf16_lossy(&units)
 }
 
 /// Encodes text. Fails (returning the first offending char) if the encoding
@@ -131,49 +109,212 @@ pub fn encode(text: &str, enc: Encoding) -> Result<Vec<u8>, char> {
     })
 }
 
-/// Returns the dominant line ending and whether the text mixes several kinds.
-pub fn detect_eol(text: &str) -> (Eol, bool) {
-    let (mut crlf, mut lf, mut cr) = (0usize, 0usize, 0usize);
-    let b = text.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'\r' if b.get(i + 1) == Some(&b'\n') => {
-                crlf += 1;
-                i += 1;
-            }
-            b'\r' => cr += 1,
-            b'\n' => lf += 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    let kinds = (crlf > 0) as u8 + (lf > 0) as u8 + (cr > 0) as u8;
-    let eol = if crlf == 0 && lf == 0 && cr == 0 {
-        Eol::platform()
-    } else if crlf >= lf && crlf >= cr {
-        Eol::CrLf
-    } else if lf >= cr {
-        Eol::Lf
-    } else {
-        Eol::Cr
-    };
-    (eol, kinds > 1)
+/// Receives decoded text in pieces, counts and normalises line endings
+/// (a `\r` at the end of one piece may pair with a `\n` at the start of the
+/// next), and appends the result to a rope.
+struct Sink {
+    rope: RopeBuilder,
+    crlf: usize,
+    lf: usize,
+    cr: usize,
+    pending_cr: bool,
 }
 
-pub fn normalize_eol(text: String) -> String {
-    if !text.contains('\r') {
-        return text;
+impl Sink {
+    fn new() -> Self {
+        Self { rope: RopeBuilder::new(), crlf: 0, lf: 0, cr: 0, pending_cr: false }
     }
-    text.replace("\r\n", "\n").replace('\r', "\n")
+
+    fn plain(&mut self, s: &str) {
+        self.lf += s.bytes().filter(|&b| b == b'\n').count();
+        self.rope.append(s);
+    }
+
+    fn push(&mut self, mut s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        if std::mem::take(&mut self.pending_cr) {
+            if let Some(rest) = s.strip_prefix('\n') {
+                self.crlf += 1;
+                s = rest;
+            } else {
+                self.cr += 1;
+            }
+            self.rope.append("\n");
+        }
+        while let Some(i) = s.find('\r') {
+            self.plain(&s[..i]);
+            s = &s[i + 1..];
+            if s.is_empty() {
+                self.pending_cr = true;
+                return;
+            }
+            if let Some(rest) = s.strip_prefix('\n') {
+                self.crlf += 1;
+                s = rest;
+            } else {
+                self.cr += 1;
+            }
+            self.rope.append("\n");
+        }
+        self.plain(s);
+    }
+
+    fn finish(mut self, encoding: Encoding) -> Loaded {
+        if self.pending_cr {
+            self.cr += 1;
+            self.rope.append("\n");
+        }
+        let (crlf, lf, cr) = (self.crlf, self.lf, self.cr);
+        let eol = if crlf == 0 && lf == 0 && cr == 0 {
+            Eol::platform()
+        } else if crlf >= lf && crlf >= cr {
+            Eol::CrLf
+        } else if lf >= cr {
+            Eol::Lf
+        } else {
+            Eol::Cr
+        };
+        let kinds = (crlf > 0) as u8 + (lf > 0) as u8 + (cr > 0) as u8;
+        Loaded { rope: self.rope.finish(), encoding, eol, mixed_eol: kinds > 1 }
+    }
+}
+
+const CHUNK: usize = 64 * 1024;
+
+/// Streams UTF-8. Returns false on invalid input unless `lossy` (then U+FFFD is substituted).
+fn utf8(r: &mut impl Read, sink: &mut Sink, lossy: bool) -> io::Result<bool> {
+    let mut buf = vec![0u8; CHUNK];
+    let mut carry: Vec<u8> = Vec::with_capacity(CHUNK + 4);
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        carry.extend_from_slice(&buf[..n]);
+        let mut start = 0;
+        loop {
+            match std::str::from_utf8(&carry[start..]) {
+                Ok(s) => {
+                    sink.push(s);
+                    start = carry.len();
+                    break;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    sink.push(std::str::from_utf8(&carry[start..start + valid]).unwrap());
+                    start += valid;
+                    match e.error_len() {
+                        None => break, // incomplete sequence at the end: wait for more bytes
+                        Some(len) if lossy => {
+                            sink.push("\u{FFFD}");
+                            start += len;
+                        }
+                        Some(_) => return Ok(false),
+                    }
+                }
+            }
+        }
+        carry.drain(..start);
+    }
+    if !carry.is_empty() {
+        if !lossy {
+            return Ok(false);
+        }
+        sink.push("\u{FFFD}");
+    }
+    Ok(true)
+}
+
+fn utf16(r: &mut impl Read, sink: &mut Sink, le: bool) -> io::Result<()> {
+    let mut buf = vec![0u8; CHUNK];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut units: Vec<u16> = Vec::new();
+    let mut text = String::new();
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        carry.extend_from_slice(&buf[..n]);
+        let even = carry.len() & !1;
+        units.extend(carry[..even].chunks_exact(2).map(|c| {
+            if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) }
+        }));
+        carry.drain(..even);
+        // Keep a trailing high surrogate for the next chunk.
+        let held = units.last().filter(|u| (0xD800..0xDC00).contains(*u)).copied();
+        if held.is_some() {
+            units.pop();
+        }
+        text.clear();
+        text.extend(char::decode_utf16(units.drain(..)).map(|c| c.unwrap_or('\u{FFFD}')));
+        sink.push(&text);
+        units.extend(held);
+    }
+    if !units.is_empty() {
+        sink.push("\u{FFFD}");
+    }
+    Ok(())
+}
+
+fn windows1252(r: &mut impl Read, sink: &mut Sink) -> io::Result<()> {
+    let mut buf = vec![0u8; CHUNK];
+    let mut text = String::with_capacity(CHUNK * 2);
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        text.clear();
+        text.extend(buf[..n].iter().map(|&b| cp1252(b)));
+        sink.push(&text);
+    }
+}
+
+/// Decodes a byte stream straight into a rope. Needs `Seek` to restart as
+/// Windows-1252 if the text turns out not to be valid UTF-8.
+pub fn load_from<R: Read + Seek>(mut r: R) -> io::Result<Loaded> {
+    let mut bom = [0u8; 3];
+    let mut got = 0;
+    while got < 3 {
+        match r.read(&mut bom[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    let bom = &bom[..got];
+    let mut sink = Sink::new();
+    let (skip, enc) = if bom.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        (3, Encoding::Utf8Bom)
+    } else if bom.starts_with(&[0xFF, 0xFE]) {
+        (2, Encoding::Utf16Le)
+    } else if bom.starts_with(&[0xFE, 0xFF]) {
+        (2, Encoding::Utf16Be)
+    } else {
+        (0, Encoding::Utf8)
+    };
+    r.seek(SeekFrom::Start(skip))?;
+    match enc {
+        Encoding::Utf16Le | Encoding::Utf16Be => utf16(&mut r, &mut sink, enc == Encoding::Utf16Le)?,
+        Encoding::Utf8Bom => {
+            utf8(&mut r, &mut sink, true)?;
+        }
+        _ => {
+            if !utf8(&mut r, &mut sink, false)? {
+                r.seek(SeekFrom::Start(0))?;
+                sink = Sink::new();
+                windows1252(&mut r, &mut sink)?;
+                return Ok(sink.finish(Encoding::Windows1252));
+            }
+        }
+    }
+    Ok(sink.finish(enc))
 }
 
 pub fn load(path: &Path) -> io::Result<Loaded> {
-    let bytes = fs::read(path)?;
-    let (text, encoding) = decode(&bytes);
-    drop(bytes);
-    let (eol, mixed_eol) = detect_eol(&text);
-    Ok(Loaded { text: normalize_eol(text), encoding, eol, mixed_eol })
+    load_from(fs::File::open(path)?)
 }
 
 /// Writes via a temporary file + rename so a failed save never truncates the
@@ -271,13 +412,47 @@ impl Settings {
 mod tests {
     use super::*;
 
+    fn load_str(bytes: &[u8]) -> Loaded {
+        load_from(std::io::Cursor::new(bytes)).unwrap()
+    }
+
     #[test]
     fn eol_detection() {
-        assert_eq!(detect_eol("a\r\nb\r\nc"), (Eol::CrLf, false));
-        assert_eq!(detect_eol("a\nb\n"), (Eol::Lf, false));
-        assert_eq!(detect_eol("a\rb\r"), (Eol::Cr, false));
-        assert_eq!(detect_eol("a\r\nb\nc\n"), (Eol::Lf, true));
-        assert_eq!(normalize_eol("a\r\nb\rc\n".into()), "a\nb\nc\n");
+        let l = load_str(b"a\r\nb\r\nc");
+        assert_eq!((l.eol, l.mixed_eol, l.rope.to_string()), (Eol::CrLf, false, "a\nb\nc".into()));
+        assert_eq!(load_str(b"a\nb\n").eol, Eol::Lf);
+        let l = load_str(b"a\rb\r");
+        assert_eq!((l.eol, l.rope.to_string()), (Eol::Cr, "a\nb\n".into()));
+        let l = load_str(b"a\r\nb\nc\n");
+        assert_eq!((l.eol, l.mixed_eol), (Eol::Lf, true));
+    }
+
+    #[test]
+    fn chunk_boundaries() {
+        // A CRLF and a multi-byte char straddling the 64 KiB read boundary.
+        let mut v = vec![b'x'; CHUNK - 1];
+        v.extend_from_slice(b"\r\n");
+        v.extend(std::iter::repeat_n(b'y', CHUNK - 2));
+        v.extend_from_slice("é€😀".as_bytes());
+        let l = load_str(&v);
+        assert_eq!(l.encoding, Encoding::Utf8);
+        assert_eq!((l.eol, l.mixed_eol), (Eol::CrLf, false));
+        assert_eq!(l.rope.len_lines(), 2);
+        assert!(l.rope.to_string().ends_with("yé€😀"));
+        // UTF-16 with a surrogate pair split across the boundary.
+        let mut text = "a".repeat(CHUNK / 2 - 2);
+        text.push('😀');
+        text.push_str("\r\nz");
+        let bytes = encode(&text, Encoding::Utf16Le).unwrap();
+        let l = load_str(&bytes);
+        assert_eq!(l.encoding, Encoding::Utf16Le);
+        assert_eq!(l.rope.to_string(), text.replace("\r\n", "\n"));
+        // Invalid UTF-8 late in a large file falls back to Windows-1252.
+        let mut v = vec![b'q'; CHUNK * 3];
+        v.push(0x80);
+        let l = load_str(&v);
+        assert_eq!(l.encoding, Encoding::Windows1252);
+        assert!(l.rope.to_string().ends_with("q€"));
     }
 
     #[test]
@@ -285,15 +460,15 @@ mod tests {
         let s = "héllo – €";
         for enc in [Encoding::Utf8, Encoding::Utf8Bom, Encoding::Utf16Le, Encoding::Utf16Be, Encoding::Windows1252] {
             let bytes = encode(s, enc).unwrap();
-            let (back, detected) = decode(&bytes);
-            assert_eq!(back, s, "{enc:?}");
-            assert_eq!(detected, enc);
+            let l = load_str(&bytes);
+            assert_eq!(l.rope.to_string(), s, "{enc:?}");
+            assert_eq!(l.encoding, enc);
         }
         assert_eq!(encode("日本", Encoding::Windows1252), Err('日'));
         // Every single byte survives a cp1252 round-trip.
         let all: Vec<u8> = (0x80..=0xFF).collect();
-        let (s, enc) = decode(&all);
-        assert_eq!(enc, Encoding::Windows1252);
-        assert_eq!(encode(&s, enc).unwrap(), all);
+        let l = load_str(&all);
+        assert_eq!(l.encoding, Encoding::Windows1252);
+        assert_eq!(encode(&l.rope.to_string(), l.encoding).unwrap(), all);
     }
 }

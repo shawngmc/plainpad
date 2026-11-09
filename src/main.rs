@@ -150,14 +150,14 @@ impl App {
         self.meta_dirty || self.view.doc.is_dirty()
     }
 
-    fn set_doc(&mut self, text: &str) {
-        self.view.set_text(text);
+    fn set_doc(&mut self, doc: document::Document) {
+        self.view.set_document(doc);
         self.meta_dirty = false;
         self.hover_url = None;
     }
 
     fn new_doc(&mut self) {
-        self.set_doc("");
+        self.set_doc(document::Document::new(""));
         self.path = None;
         self.encoding = Encoding::Utf8;
         self.eol = Eol::platform();
@@ -168,7 +168,7 @@ impl App {
     fn open_path(&mut self, path: PathBuf) {
         match doc::load(&path) {
             Ok(l) => {
-                self.set_doc(&l.text);
+                self.set_doc(document::Document::from_rope(l.rope));
                 self.encoding = l.encoding;
                 self.eol = l.eol;
                 self.mixed_eol = l.mixed_eol;

@@ -60,6 +60,11 @@ impl Document {
         Self { rope: Rope::from_str(&normalize(text)), undo: Vec::new(), redo: Vec::new(), saved: Some(0), can_merge: false }
     }
 
+    /// Takes an already-normalised (`\n`-only) rope, e.g. from the streaming loader.
+    pub fn from_rope(rope: Rope) -> Self {
+        Self { rope, undo: Vec::new(), redo: Vec::new(), saved: Some(0), can_merge: false }
+    }
+
     pub fn len_lines(&self) -> usize {
         self.rope.len_lines()
     }

@@ -116,6 +116,10 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
   count and saving all work on the rope directly.
 - **Only visible text is laid out.** Lines are shaped when they scroll into view, and the shaping data
   for lines scrolled past is discarded.
+- **Files are decoded as they're read.** Files are read 64 KB at a time and decoded into the rope as they
+  arrive, with line endings normalised along the way. The whole file is never in memory as raw bytes or as a
+  single string, so loading peaks at the same memory as the finished document. If a file turns out not to
+  be valid UTF-8, it's read again from the start as Windows-1252.
 - **Fonts are memory-mapped.** The system font database maps font files into memory rather than reading
   them into the heap, and loads only font metadata at startup.
 - **UI text is cached.** Labels such as menus and buttons are shaped once and reused. The cache is capped at 512 entries.
@@ -140,13 +144,19 @@ Measured on Linux/X11 with a release build:
 |---|---|
 | Binary size | ~5 MB |
 | Memory with a small file open | ~18 MB, of which ~14 MB is shared libraries and memory-mapped fonts and under 2 MB is the app's own heap |
-| 27 MB, 400k-line file | opens in ~0.2 s and uses ~48 MB, of which ~33 MB is the app's heap (it used ~175 MB before the rope and window change). Loading briefly peaks at ~67 MB. |
+| 27 MB, 400k-line file | opens in ~0.08 s and uses ~48 MB, of which ~33 MB is the app's heap. Peak memory while loading is the same ~48 MB. (Before the rope and window change it used ~175 MB.) |
+
+## Known bugs
+
+- When deleting lines makes a scrollable file short enough to fit the window, the top of the file
+  sometimes isn't fully visible.
 
 ## TODO
 
+- [ ] Option to show non-printable characters (tabs, spaces, control characters and other invisibles) as visible placeholders
+- [ ] Rename the project. "Plainpad" collides with existing projects.
 - [x] Reduce memory for large files: the document is now held in a rope and only a window of lines is laid out
-- [ ] Lower the peak memory while loading. Today the file bytes, the decoded string and the rope are briefly
-      in memory together. Decoding straight into the rope would avoid that.
+- [x] Lower the peak memory while loading: files are decoded 64 KB at a time straight into the rope
 - [ ] Handle very long single lines, such as minified files. cosmic-text shapes a whole line at once, so a
       multi-megabyte line is slow to display.
 - [ ] Open several documents at once, in tabs
