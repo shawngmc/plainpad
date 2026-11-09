@@ -511,11 +511,11 @@ impl View {
         }
         self.ensure_cursor_window();
         let m = if forward { Motion::NextWord } else { Motion::PreviousWord };
-        if let Some((t, _)) = self.seg_motion(fs, m, None) {
-            if (t.line, t.index) != (self.cursor.line, self.cursor.index) {
-                let r = self.doc.replace(self.cursor, t, "", false);
-                self.after_edit(r);
-            }
+        if let Some((t, _)) = self.seg_motion(fs, m, None)
+            && (t.line, t.index) != (self.cursor.line, self.cursor.index)
+        {
+            let r = self.doc.replace(self.cursor, t, "", false);
+            self.after_edit(r);
         }
     }
 
