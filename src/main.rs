@@ -53,7 +53,11 @@ enum Drag {
 /// What to do once the user answers a "save changes?" prompt.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Pending {
+    /// Close one tab.
     Close(usize),
+    /// Close the current window.
+    CloseWindow,
+    /// Quit the app.
     Exit,
 }
 
@@ -68,11 +72,13 @@ struct Tab {
     mixed_eol: bool,
     /// Encoding or line endings changed since the last save.
     meta_dirty: bool,
+    /// "Don't Save" was chosen for this tab while closing its window or exiting.
+    discard: bool,
 }
 
 impl Tab {
     fn new(view: View, untitled: usize) -> Self {
-        Self { view, untitled, path: None, encoding: Encoding::Utf8, eol: Eol::platform(), mixed_eol: false, meta_dirty: false }
+        Self { view, untitled, path: None, encoding: Encoding::Utf8, eol: Eol::platform(), mixed_eol: false, meta_dirty: false, discard: false }
     }
 
     fn name(&self) -> String {
@@ -87,24 +93,27 @@ impl Tab {
         self.meta_dirty || self.view.doc.is_dirty()
     }
 
+    /// Modified and not yet saved or explicitly discarded.
+    fn needs_save(&self) -> bool {
+        self.is_dirty() && !self.discard
+    }
+
     /// An empty, unsaved, unmodified tab that opening a file may reuse.
     fn is_pristine(&self) -> bool {
         self.path.is_none() && !self.is_dirty() && self.view.doc.len_lines() == 1 && self.view.doc.line_len(0) == 0
     }
 }
 
-struct App {
-    gfx: Gfx,
+/// Per-window state. The window an event is for is swapped into `App::win`
+/// before handling it, so most code works on `self.win` without knowing
+/// how many windows there are.
+struct Win {
     tabs: Vec<Tab>,
     active: usize,
     tabbar: TabBar,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
-    settings: Settings,
-    theme: Theme,
     scale: f32,
-    zoom: f32,
-    mods: ModifiersState,
     mouse: (f32, f32),
     mouse_prev: (f32, f32),
     drag: Drag,
@@ -117,32 +126,24 @@ struct App {
     status_msg: Option<String>,
     hover_url: Option<(usize, Range<usize>)>,
     preedit: String,
-    clipboard: Option<arboard::Clipboard>,
     layout: Layout,
-    applied: (f32, f32, f32, f32, bool),
     title: String,
     cursor_icon: CursorIcon,
     focused: bool,
     needs_redraw: bool,
-    exit: bool,
+    /// Close this window once the current event has been handled.
+    close: bool,
 }
 
-impl App {
-    fn new(settings: Settings, files: Vec<PathBuf>) -> Self {
-        let mut gfx = Gfx::new();
-        let view = View::new(&mut gfx.fs, &settings.font_family, settings.wrap);
-        let mut app = App {
-            gfx,
-            tabs: vec![Tab::new(view, 1)],
+impl Win {
+    fn new(tabs: Vec<Tab>) -> Self {
+        Win {
+            tabs,
             active: 0,
             tabbar: TabBar::default(),
             window: None,
             surface: None,
-            settings,
-            theme: Theme::LIGHT,
             scale: 1.0,
-            zoom: 1.0,
-            mods: ModifiersState::empty(),
             mouse: (0.0, 0.0),
             mouse_prev: (0.0, 0.0),
             drag: Drag::None,
@@ -155,13 +156,71 @@ impl App {
             status_msg: None,
             hover_url: None,
             preedit: String::new(),
-            clipboard: None,
             layout: Layout::default(),
-            applied: (0.0, 0.0, 0.0, 0.0, false),
             title: String::new(),
             cursor_icon: CursorIcon::Default,
             focused: true,
             needs_redraw: true,
+            close: false,
+        }
+    }
+
+    fn id(&self) -> Option<WindowId> {
+        self.window.as_ref().map(|w| w.id())
+    }
+
+    fn redraw_later(&self) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// The window's client area in screen coordinates, where the platform reports it (not on Wayland).
+    fn screen_rect(&self) -> Option<Rect> {
+        let w = self.window.as_ref()?;
+        let p = w.inner_position().ok()?;
+        let sz = w.inner_size();
+        Some(Rect::new(p.x as f32, p.y as f32, sz.width as f32, sz.height as f32))
+    }
+}
+
+/// A tab dragged out of its window, waiting for a new window to be created for it.
+struct Spawn {
+    tab: Tab,
+    /// Where to put the new window's top-left corner, in screen pixels.
+    pos: Option<PhysicalPosition<i32>>,
+    size: PhysicalSize<u32>,
+}
+
+struct App {
+    gfx: Gfx,
+    settings: Settings,
+    theme: Theme,
+    zoom: f32,
+    mods: ModifiersState,
+    clipboard: Option<arboard::Clipboard>,
+    /// The window currently being handled.
+    win: Win,
+    /// All other windows.
+    others: Vec<Win>,
+    spawn: Option<Spawn>,
+    exit: bool,
+}
+
+impl App {
+    fn new(settings: Settings, files: Vec<PathBuf>) -> Self {
+        let mut gfx = Gfx::new();
+        let view = View::new(&mut gfx.fs, &settings.font_family, settings.wrap);
+        let mut app = App {
+            gfx,
+            settings,
+            theme: Theme::LIGHT,
+            zoom: 1.0,
+            mods: ModifiersState::empty(),
+            clipboard: None,
+            win: Win::new(vec![Tab::new(view, 1)]),
+            others: Vec::new(),
+            spawn: None,
             exit: false,
         };
         for p in files {
@@ -169,8 +228,8 @@ impl App {
                 app.open_path(p);
             } else {
                 // A new file to be created on first save, as Notepad does.
-                let i = if app.tabs[app.active].is_pristine() { app.active } else { app.new_tab() };
-                app.tabs[i].path = Some(p);
+                let i = if app.win.tabs[app.win.active].is_pristine() { app.win.active } else { app.new_tab() };
+                app.win.tabs[i].path = Some(p);
             }
         }
         app
@@ -183,7 +242,7 @@ impl App {
     // ---------------------------------------------------------------- tabs & documents
 
     fn tab(&self) -> &Tab {
-        &self.tabs[self.active]
+        &self.win.tabs[self.win.active]
     }
 
     fn doc_name(&self) -> String {
@@ -191,30 +250,29 @@ impl App {
     }
 
     fn activate(&mut self, i: usize) {
-        if i >= self.tabs.len() {
+        if i >= self.win.tabs.len() {
             return;
         }
-        if i != self.active {
-            self.status_msg = None;
+        if i != self.win.active {
+            self.win.status_msg = None;
         }
-        self.active = i;
-        self.applied = Default::default(); // re-apply geometry to this tab's view
-        self.hover_url = None;
-        self.drag = if self.drag == Drag::Tab { Drag::Tab } else { Drag::None };
-        self.tabbar.reveal = true;
+        self.win.active = i;
+        self.win.hover_url = None;
+        self.win.drag = if self.win.drag == Drag::Tab { Drag::Tab } else { Drag::None };
+        self.win.tabbar.reveal = true;
     }
 
     /// Opens an empty tab after the current one and switches to it.
     /// Lowest "Untitled N" number not used by an open untitled tab.
     fn next_untitled(&self) -> usize {
-        (1..).find(|n| !self.tabs.iter().any(|t| t.path.is_none() && t.untitled == *n)).unwrap()
+        (1..).find(|n| !self.win.tabs.iter().any(|t| t.path.is_none() && t.untitled == *n)).unwrap()
     }
 
     fn new_tab(&mut self) -> usize {
         let view = View::new(&mut self.gfx.fs, &self.settings.font_family, self.settings.wrap);
-        let i = (self.active + 1).min(self.tabs.len());
+        let i = (self.win.active + 1).min(self.win.tabs.len());
         let n = self.next_untitled();
-        self.tabs.insert(i, Tab::new(view, n));
+        self.win.tabs.insert(i, Tab::new(view, n));
         self.activate(i);
         i
     }
@@ -224,14 +282,14 @@ impl App {
     fn open_path(&mut self, path: PathBuf) {
         let canon = std::fs::canonicalize(&path).ok();
         let same = |p: &PathBuf| *p == path || (canon.is_some() && std::fs::canonicalize(p).ok() == canon);
-        if let Some(i) = self.tabs.iter().position(|t| t.path.as_ref().is_some_and(same)) {
+        if let Some(i) = self.win.tabs.iter().position(|t| t.path.as_ref().is_some_and(same)) {
             self.activate(i);
             return;
         }
         match doc::load(&path) {
             Ok(l) => {
-                let i = if self.tab().is_pristine() { self.active } else { self.new_tab() };
-                let t = &mut self.tabs[i];
+                let i = if self.tab().is_pristine() { self.win.active } else { self.new_tab() };
+                let t = &mut self.win.tabs[i];
                 t.view.set_document(document::Document::from_rope(l.rope));
                 t.encoding = l.encoding;
                 t.eol = l.eol;
@@ -239,11 +297,11 @@ impl App {
                 t.meta_dirty = false;
                 t.path = Some(path);
                 self.activate(i);
-                self.status_msg = l
+                self.win.status_msg = l
                     .mixed_eol
                     .then(|| format!("Mixed line endings; will be saved as {}", l.eol.label()));
             }
-            Err(e) => self.status_msg = Some(format!("Could not open {}: {e}", path.display())),
+            Err(e) => self.win.status_msg = Some(format!("Could not open {}: {e}", path.display())),
         }
     }
 
@@ -252,7 +310,7 @@ impl App {
         if let Some(dir) = self.tab().path.as_ref().and_then(|p| p.parent()).filter(|d| !d.as_os_str().is_empty()) {
             d = d.set_directory(dir);
         }
-        if let Some(w) = &self.window {
+        if let Some(w) = &self.win.window {
             d = d.set_parent(&**w);
         }
         d
@@ -280,12 +338,12 @@ impl App {
     }
 
     fn save_to(&mut self, path: PathBuf) -> bool {
-        let t = &mut self.tabs[self.active];
+        let t = &mut self.win.tabs[self.win.active];
         let text = t.view.doc.to_string_eol(t.eol.as_str());
         let bytes = match doc::encode(&text, t.encoding) {
             Ok(b) => b,
             Err(c) => {
-                self.status_msg =
+                self.win.status_msg =
                     Some(format!("'{c}' can't be stored as {}; saved as UTF-8 instead", t.encoding.label()));
                 t.encoding = Encoding::Utf8;
                 text.into_bytes()
@@ -300,7 +358,7 @@ impl App {
                 true
             }
             Err(e) => {
-                self.status_msg = Some(format!("Could not save: {e}"));
+                self.win.status_msg = Some(format!("Could not save: {e}"));
                 false
             }
         }
@@ -319,16 +377,16 @@ impl App {
         }
         match std::fs::rename(&old, &new) {
             Ok(()) => {
-                self.tabs[self.active].path = Some(new);
-                self.status_msg = Some(format!("Renamed to {}", self.doc_name()));
+                self.win.tabs[self.win.active].path = Some(new);
+                self.win.status_msg = Some(format!("Renamed to {}", self.doc_name()));
             }
-            Err(e) => self.status_msg = Some(format!("Could not rename: {e}")),
+            Err(e) => self.win.status_msg = Some(format!("Could not rename: {e}")),
         }
     }
 
     fn print(&mut self) {
         let title = self.doc_name();
-        let doc = &self.tabs[self.active].view.doc;
+        let doc = &self.win.tabs[self.win.active].view.doc;
         let line = |i: usize| doc.line(i).into_owned();
         let job = print::Job {
             lines: doc.len_lines(),
@@ -339,35 +397,72 @@ impl App {
         // A throwaway glyph cache: print-resolution glyphs would otherwise bloat the screen cache.
         let mut cache = cosmic_text::SwashCache::new();
         let r = print::print(&mut self.gfx.fs, &mut cache, &job, &title);
-        self.status_msg = Some(r.unwrap_or_else(|e| e));
+        self.win.status_msg = Some(r.unwrap_or_else(|e| e));
     }
 
     fn ask_save(&mut self, then: Pending) {
-        self.prompt = Some(Prompt::new(format!("Do you want to save changes to {}?", self.doc_name())));
-        self.pending = Some(then);
+        self.win.prompt = Some(Prompt::new(format!("Do you want to save changes to {}?", self.doc_name())));
+        self.win.pending = Some(then);
+    }
+
+    /// Removes tab `i` from the current window and returns it. If that empties
+    /// the window, it gets a fresh tab, and if other windows exist it closes.
+    fn take_tab(&mut self, i: usize) -> Tab {
+        let t = self.win.tabs.remove(i);
+        if self.win.tabs.is_empty() {
+            let view = View::new(&mut self.gfx.fs, &self.settings.font_family, self.settings.wrap);
+            self.win.tabs.push(Tab::new(view, 1));
+            self.win.close = !self.others.is_empty();
+        }
+        let a = if i < self.win.active { self.win.active - 1 } else { self.win.active.min(self.win.tabs.len() - 1) };
+        self.win.active = usize::MAX; // force activate() to treat this as a switch
+        self.activate(a);
+        t
     }
 
     /// Closes tab `i`, first asking to save it unless `force`. Returns true if it closed.
     fn close_tab(&mut self, i: usize, force: bool) -> bool {
-        if !force && self.tabs[i].is_dirty() {
+        if !force && self.win.tabs[i].is_dirty() {
             self.activate(i);
             self.ask_save(Pending::Close(i));
             return false;
         }
-        self.tabs.remove(i);
-        if self.tabs.is_empty() {
-            let view = View::new(&mut self.gfx.fs, &self.settings.font_family, self.settings.wrap);
-            self.tabs.push(Tab::new(view, 1));
-        }
-        let a = if i < self.active { self.active - 1 } else { self.active.min(self.tabs.len() - 1) };
-        self.active = usize::MAX; // force activate() to treat this as a switch
-        self.activate(a);
+        self.take_tab(i);
         true
     }
 
-    /// Exits once every modified tab has been saved or discarded, asking about each in turn.
+    /// Makes `others[k]` the current window (the old current one goes into `others`).
+    fn swap_to(&mut self, k: usize) {
+        std::mem::swap(&mut self.win, &mut self.others[k]);
+        self.gfx.set_ui_scale(self.win.scale);
+    }
+
+    /// Makes the window with this id current. Returns false if it isn't one of ours.
+    fn focus_win(&mut self, id: WindowId) -> bool {
+        if self.win.id() == Some(id) {
+            return true;
+        }
+        match self.others.iter().position(|w| w.id() == Some(id)) {
+            Some(k) => {
+                self.swap_to(k);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Quits once every modified tab in every window has been saved or
+    /// discarded, asking about each in turn (switching windows as needed).
     fn request_exit(&mut self) {
-        match self.tabs.iter().position(Tab::is_dirty) {
+        if self.win.tabs.iter().all(|t| !t.needs_save())
+            && let Some(k) = self.others.iter().position(|w| w.tabs.iter().any(Tab::needs_save))
+        {
+            self.swap_to(k);
+            if let Some(w) = &self.win.window {
+                w.focus_window();
+            }
+        }
+        match self.win.tabs.iter().position(Tab::needs_save) {
             Some(i) => {
                 self.activate(i);
                 self.ask_save(Pending::Exit);
@@ -376,36 +471,104 @@ impl App {
         }
     }
 
+    /// Closes the current window once its modified tabs are saved or discarded.
+    /// Closing the last window quits.
+    fn request_close_window(&mut self) {
+        match self.win.tabs.iter().position(Tab::needs_save) {
+            Some(i) => {
+                self.activate(i);
+                self.ask_save(Pending::CloseWindow);
+            }
+            None if self.others.is_empty() => self.exit = true,
+            None => self.win.close = true,
+        }
+    }
+
     fn choose(&mut self, c: Choice) {
-        self.prompt = None;
-        let Some(pending) = self.pending.take() else { return };
-        match (c, pending) {
-            (Choice::Save, p) => {
-                if self.save() {
-                    match p {
-                        Pending::Close(i) => {
-                            self.close_tab(i, true);
-                        }
-                        Pending::Exit => self.request_exit(),
+        self.win.prompt = None;
+        let Some(pending) = self.win.pending.take() else { return };
+        let i = self.win.active;
+        match c {
+            Choice::Save if !self.save() => {}
+            Choice::Save | Choice::Discard => {
+                if c == Choice::Discard {
+                    self.win.tabs[i].discard = true;
+                }
+                match pending {
+                    Pending::Close(i) => {
+                        self.close_tab(i, true);
                     }
+                    Pending::CloseWindow => self.request_close_window(),
+                    Pending::Exit => self.request_exit(),
                 }
             }
-            (Choice::Discard, Pending::Close(i)) => {
-                self.close_tab(i, true);
+            Choice::Cancel => {
+                for t in self.win.tabs.iter_mut().chain(self.others.iter_mut().flat_map(|w| w.tabs.iter_mut())) {
+                    t.discard = false;
+                }
             }
-            (Choice::Discard, Pending::Exit) => {
-                self.close_tab(self.active, true);
-                self.request_exit();
-            }
-            (Choice::Cancel, _) => {}
         }
+    }
+
+    /// Finishes dragging a tab. Dropped well outside the tab bar, it moves into
+    /// the window under the pointer, or into a new window there.
+    fn finish_tab_drag(&mut self) {
+        let (p, s, tabs) = (self.win.mouse, self.win.scale, self.win.layout.tabs);
+        let size = self.win.window.as_ref().map(|w| w.inner_size()).unwrap_or_default();
+        let outside = p.1 < tabs.y - 20.0 * s
+            || p.1 > tabs.bottom() + 40.0 * s
+            || p.0 < 0.0
+            || p.0 > size.width as f32;
+        if !outside {
+            return;
+        }
+        let screen = self.win.screen_rect().map(|r| (r.x + p.0, r.y + p.1));
+        let target = screen.and_then(|sp| self.others.iter().position(|w| w.screen_rect().is_some_and(|r| r.contains(sp))));
+        if let Some(k) = target {
+            let tab = self.take_tab(self.win.active);
+            let w = &mut self.others[k];
+            w.tabs.push(tab);
+            w.active = w.tabs.len() - 1;
+            w.tabbar.reveal = true;
+            w.redraw_later();
+            if let Some(win) = &w.window {
+                win.focus_window();
+            }
+        } else if self.win.tabs.len() > 1 {
+            let tab = self.take_tab(self.win.active);
+            // Put the new window so the pointer sits over its first tab.
+            let pos = screen.map(|(x, y)| PhysicalPosition::new((x - 60.0 * s) as i32, (y - 40.0 * s) as i32));
+            self.spawn = Some(Spawn { tab, pos, size });
+        }
+    }
+
+    /// Creates an OS window for `win`.
+    fn open_window(&mut self, el: &ActiveEventLoop, win: &mut Win, pos: Option<PhysicalPosition<i32>>, size: Option<PhysicalSize<u32>>) {
+        let mut attrs = Window::default_attributes().with_title(APP).with_min_inner_size(LogicalSize::new(320, 200));
+        attrs = match size {
+            Some(sz) => attrs.with_inner_size(sz),
+            None => attrs.with_inner_size(LogicalSize::new(self.settings.win_w.max(320), self.settings.win_h.max(200))),
+        };
+        if let Some(p) = pos {
+            attrs = attrs.with_position(p);
+        }
+        let w = Rc::new(el.create_window(attrs).expect("failed to create window"));
+        let ctx = softbuffer::Context::new(w.clone()).expect("failed to create graphics context");
+        let surface = softbuffer::Surface::new(&ctx, w.clone()).expect("failed to create surface");
+        w.set_ime_allowed(true);
+        win.scale = w.scale_factor() as f32;
+        self.theme = if w.theme() == Some(winit::window::Theme::Dark) { Theme::DARK } else { Theme::LIGHT };
+        win.window = Some(w.clone());
+        win.surface = Some(surface);
+        win.tabbar.reveal = true;
+        w.request_redraw();
     }
 
     // ---------------------------------------------------------------- editing
 
     fn edited(&mut self) {
-        self.status_msg = None;
-        self.hover_url = None;
+        self.win.status_msg = None;
+        self.win.hover_url = None;
     }
 
     fn clipboard(&mut self) -> Option<&mut arboard::Clipboard> {
@@ -427,7 +590,7 @@ impl App {
     }
 
     fn copy(&mut self) {
-        if let Some(t) = self.tabs[self.active].view.selected_text() {
+        if let Some(t) = self.win.tabs[self.win.active].view.selected_text() {
             self.set_clipboard(t);
         }
     }
@@ -435,28 +598,28 @@ impl App {
     // ---------------------------------------------------------------- find
 
     fn open_find(&mut self, replace: bool) {
-        self.find.visible = true;
-        self.find.replace |= replace;
-        self.find.focus = true;
-        self.find.field = 0;
-        let sel = self.tabs[self.active].view.selection().filter(|(a, z)| a.line == z.line);
-        if let Some(sel) = sel.and_then(|_| self.tabs[self.active].view.selected_text()) {
-            self.find.find.set(&sel);
+        self.win.find.visible = true;
+        self.win.find.replace |= replace;
+        self.win.find.focus = true;
+        self.win.find.field = 0;
+        let sel = self.win.tabs[self.win.active].view.selection().filter(|(a, z)| a.line == z.line);
+        if let Some(sel) = sel.and_then(|_| self.win.tabs[self.win.active].view.selected_text()) {
+            self.win.find.find.set(&sel);
         } else {
-            self.find.find.all = true;
+            self.win.find.find.all = true;
         }
     }
 
     fn find_next(&mut self, forward: bool) -> bool {
-        let needle = self.find.find.text.clone();
+        let needle = self.win.find.find.text.clone();
         if needle.is_empty() {
             self.open_find(false);
             return false;
         }
-        let case = self.find.case;
-        let cur = self.tabs[self.active].view.cursor;
-        let (start, end) = self.tabs[self.active].view.selection().unwrap_or((cur, cur));
-        let doc = &self.tabs[self.active].view.doc;
+        let case = self.win.find.case;
+        let cur = self.win.tabs[self.win.active].view.cursor;
+        let (start, end) = self.win.tabs[self.win.active].view.selection().unwrap_or((cur, cur));
+        let doc = &self.win.tabs[self.win.active].view.doc;
         let n = doc.len_lines();
         let mut found = None;
         for k in 0..=n {
@@ -479,36 +642,36 @@ impl App {
         }
         match found {
             Some((li, r)) => {
-                self.tabs[self.active].view.set_selection(Cursor::new(li, r.start), Cursor::new(li, r.end));
-                self.status_msg = None;
+                self.win.tabs[self.win.active].view.set_selection(Cursor::new(li, r.start), Cursor::new(li, r.end));
+                self.win.status_msg = None;
                 true
             }
             None => {
-                self.status_msg = Some(format!("Cannot find \"{needle}\""));
+                self.win.status_msg = Some(format!("Cannot find \"{needle}\""));
                 false
             }
         }
     }
 
     fn replace_one(&mut self) {
-        let needle = self.find.find.text.clone();
-        let repl = self.find.repl.text.clone();
-        let sel = self.tabs[self.active].view.selected_text().unwrap_or_default();
-        if !sel.is_empty() && search::find(&sel, &needle, self.find.case, 0) == Some(0..sel.len()) {
-            self.tabs[self.active].view.replace_selection(&repl, false);
+        let needle = self.win.find.find.text.clone();
+        let repl = self.win.find.repl.text.clone();
+        let sel = self.win.tabs[self.win.active].view.selected_text().unwrap_or_default();
+        if !sel.is_empty() && search::find(&sel, &needle, self.win.find.case, 0) == Some(0..sel.len()) {
+            self.win.tabs[self.win.active].view.replace_selection(&repl, false);
             self.edited();
         }
         self.find_next(true);
     }
 
     fn replace_all(&mut self) {
-        let needle = self.find.find.text.clone();
-        let repl = self.find.repl.text.clone();
+        let needle = self.win.find.find.text.clone();
+        let repl = self.win.find.repl.text.clone();
         if needle.is_empty() {
             return;
         }
-        let case = self.find.case;
-        let doc = &self.tabs[self.active].view.doc;
+        let case = self.win.find.case;
+        let doc = &self.win.tabs[self.win.active].view.doc;
         let mut ranges = Vec::new();
         for li in 0..doc.len_lines() {
             let line = doc.line(li);
@@ -519,12 +682,12 @@ impl App {
             }
         }
         if ranges.is_empty() {
-            self.status_msg = Some(format!("Cannot find \"{needle}\""));
+            self.win.status_msg = Some(format!("Cannot find \"{needle}\""));
             return;
         }
-        self.tabs[self.active].view.replace_many(&ranges, &repl);
+        self.win.tabs[self.win.active].view.replace_many(&ranges, &repl);
         self.edited();
-        self.status_msg = Some(format!("Replaced {} occurrence(s)", ranges.len()));
+        self.win.status_msg = Some(format!("Replaced {} occurrence(s)", ranges.len()));
     }
 
     fn find_action(&mut self, a: FindAction) {
@@ -537,18 +700,18 @@ impl App {
             }
             FindAction::Replace => self.replace_one(),
             FindAction::ReplaceAll => self.replace_all(),
-            FindAction::ToggleCase => self.find.case = !self.find.case,
+            FindAction::ToggleCase => self.win.find.case = !self.win.find.case,
             FindAction::ToggleReplace => {
-                self.find.replace = !self.find.replace;
-                self.find.field = 0;
+                self.win.find.replace = !self.win.find.replace;
+                self.win.find.field = 0;
             }
             FindAction::Close => {
-                self.find.visible = false;
-                self.find.focus = false;
+                self.win.find.visible = false;
+                self.win.find.focus = false;
             }
             FindAction::FocusFind | FindAction::FocusReplace => {
-                self.find.focus = true;
-                self.find.field = (a == FindAction::FocusReplace) as usize;
+                self.win.find.focus = true;
+                self.win.find.field = (a == FindAction::FocusReplace) as usize;
             }
         }
     }
@@ -556,7 +719,13 @@ impl App {
     // ---------------------------------------------------------------- commands
 
     fn run(&mut self, cmd: Cmd) {
-        self.menu.close();
+        self.win.menu.close();
+        if matches!(cmd, Cmd::WordWrap | Cmd::StatusBar | Cmd::ZoomIn | Cmd::ZoomOut | Cmd::ZoomReset) {
+            // Shared settings: other windows pick them up when they next draw.
+            for w in &self.others {
+                w.redraw_later();
+            }
+        }
         match cmd {
             Cmd::New => {
                 self.new_tab();
@@ -564,12 +733,12 @@ impl App {
             Cmd::Open => self.open_dialog(),
             Cmd::Exit => self.request_exit(),
             Cmd::CloseTab => {
-                self.close_tab(self.active, false);
+                self.close_tab(self.win.active, false);
             }
-            Cmd::NextTab => self.activate((self.active + 1) % self.tabs.len()),
-            Cmd::PrevTab => self.activate((self.active + self.tabs.len() - 1) % self.tabs.len()),
+            Cmd::NextTab => self.activate((self.win.active + 1) % self.win.tabs.len()),
+            Cmd::PrevTab => self.activate((self.win.active + self.win.tabs.len() - 1) % self.win.tabs.len()),
             Cmd::SelectTab(n) => {
-                let i = if n >= 9 { self.tabs.len() - 1 } else { n as usize - 1 };
+                let i = if n >= 9 { self.win.tabs.len() - 1 } else { n as usize - 1 };
                 self.activate(i);
             }
             Cmd::Save => {
@@ -581,30 +750,30 @@ impl App {
             Cmd::Rename => self.rename(),
             Cmd::Print => self.print(),
             Cmd::Undo => {
-                self.tabs[self.active].view.undo();
+                self.win.tabs[self.win.active].view.undo();
                 self.edited();
             }
             Cmd::Redo => {
-                self.tabs[self.active].view.redo();
+                self.win.tabs[self.win.active].view.redo();
                 self.edited();
             }
             Cmd::Cut => {
                 self.copy();
-                self.tabs[self.active].view.delete_selection();
+                self.win.tabs[self.win.active].view.delete_selection();
                 self.edited();
             }
             Cmd::Copy => self.copy(),
             Cmd::Paste => {
                 if let Some(t) = self.get_clipboard() {
-                    self.tabs[self.active].view.replace_selection(&t, false);
+                    self.win.tabs[self.win.active].view.replace_selection(&t, false);
                     self.edited();
                 }
             }
             Cmd::Delete => {
-                self.tabs[self.active].view.delete();
+                self.win.tabs[self.win.active].view.delete();
                 self.edited();
             }
-            Cmd::SelectAll => self.tabs[self.active].view.select_all(),
+            Cmd::SelectAll => self.win.tabs[self.win.active].view.select_all(),
             Cmd::Find => self.open_find(false),
             Cmd::Replace => self.open_find(true),
             Cmd::FindNext => {
@@ -622,7 +791,7 @@ impl App {
                     self.gfx.fs.db().faces().filter_map(|f| f.families.first().map(|(n, _)| n.clone())).collect();
                 fams.sort_by_key(|f| f.to_lowercase());
                 fams.dedup();
-                self.font_dlg = Some(FontDialog::new(fams, &self.settings.font_family, self.settings.font_pt));
+                self.win.font_dlg = Some(FontDialog::new(fams, &self.settings.font_family, self.settings.font_pt));
             }
             Cmd::ZoomIn => self.zoom = (self.zoom + 0.1).min(5.0),
             Cmd::ZoomOut => self.zoom = (self.zoom - 0.1).max(0.3),
@@ -632,16 +801,16 @@ impl App {
                 self.settings.save();
             }
             Cmd::SetEol(e) => {
-                if e != self.tabs[self.active].eol || self.tabs[self.active].mixed_eol {
-                    self.tabs[self.active].eol = e;
-                    self.tabs[self.active].mixed_eol = false;
-                    self.tabs[self.active].meta_dirty = true;
+                if e != self.win.tabs[self.win.active].eol || self.win.tabs[self.win.active].mixed_eol {
+                    self.win.tabs[self.win.active].eol = e;
+                    self.win.tabs[self.win.active].mixed_eol = false;
+                    self.win.tabs[self.win.active].meta_dirty = true;
                 }
             }
             Cmd::SetEncoding(e) => {
-                if e != self.tabs[self.active].encoding {
-                    self.tabs[self.active].encoding = e;
-                    self.tabs[self.active].meta_dirty = true;
+                if e != self.win.tabs[self.win.active].encoding {
+                    self.win.tabs[self.win.active].encoding = e;
+                    self.win.tabs[self.win.active].meta_dirty = true;
                 }
             }
         }
@@ -651,14 +820,14 @@ impl App {
         match cmd {
             Cmd::WordWrap => self.settings.wrap,
             Cmd::StatusBar => self.settings.status_bar,
-            Cmd::SetEol(e) => e == self.tabs[self.active].eol,
-            Cmd::SetEncoding(e) => e == self.tabs[self.active].encoding,
+            Cmd::SetEol(e) => e == self.win.tabs[self.win.active].eol,
+            Cmd::SetEncoding(e) => e == self.win.tabs[self.win.active].encoding,
             _ => false,
         }
     }
 
     fn apply_font(&mut self) {
-        let Some(d) = self.font_dlg.take() else { return };
+        let Some(d) = self.win.font_dlg.take() else { return };
         if let Some(f) = d.selected {
             self.settings.font_family = f;
         }
@@ -666,10 +835,12 @@ impl App {
             self.settings.font_pt = pt.clamp(4.0, 200.0);
         }
         self.settings.save();
-        for t in &mut self.tabs {
-            t.view.set_font(&self.settings.font_family);
+        for w in std::iter::once(&mut self.win).chain(self.others.iter_mut()) {
+            for t in &mut w.tabs {
+                t.view.set_font(&self.settings.font_family);
+            }
+            w.redraw_later();
         }
-        self.applied.2 = 0.0; // force metrics refresh
     }
 
     // ---------------------------------------------------------------- keyboard
@@ -726,7 +897,7 @@ impl App {
         if ev.state != ElementState::Pressed {
             return;
         }
-        self.needs_redraw = true;
+        self.win.needs_redraw = true;
         let primary = self.primary();
         let (shift, alt) = (self.mods.shift_key(), self.mods.alt_key());
         let c = shortcut_char(&ev);
@@ -738,7 +909,7 @@ impl App {
         // Text is typed unless a command modifier is held (AltGr = Ctrl+Alt on Windows).
         let typing = !primary || (alt && !MAC);
 
-        if let Some(p) = &mut self.prompt {
+        if let Some(p) = &mut self.win.prompt {
             match named {
                 Some(NamedKey::Escape) => self.choose(Choice::Cancel),
                 Some(NamedKey::Enter | NamedKey::Space) => {
@@ -752,9 +923,9 @@ impl App {
             return;
         }
 
-        if let Some(d) = &mut self.font_dlg {
+        if let Some(d) = &mut self.win.font_dlg {
             match named {
-                Some(NamedKey::Escape) => self.font_dlg = None,
+                Some(NamedKey::Escape) => self.win.font_dlg = None,
                 Some(NamedKey::Enter) => self.apply_font(),
                 Some(NamedKey::ArrowUp) => d.move_sel(-1),
                 Some(NamedKey::ArrowDown) => d.move_sel(1),
@@ -774,7 +945,7 @@ impl App {
                 }
                 None => {}
             }
-            if let Some(d) = &mut self.font_dlg
+            if let Some(d) = &mut self.win.font_dlg
                 && d.field == 0
             {
                 let list = d.filtered();
@@ -786,7 +957,7 @@ impl App {
             return;
         }
 
-        if self.menu.open.is_some() {
+        if self.win.menu.open.is_some() {
             let nav = match named {
                 Some(NamedKey::ArrowUp) => Some(NavKey::Up),
                 Some(NamedKey::ArrowDown) => Some(NavKey::Down),
@@ -794,12 +965,12 @@ impl App {
                 Some(NamedKey::ArrowRight) => Some(NavKey::Right),
                 Some(NamedKey::Enter | NamedKey::Space) => Some(NavKey::Enter),
                 Some(NamedKey::Escape | NamedKey::Alt) => {
-                    self.menu.close();
+                    self.win.menu.close();
                     None
                 }
                 _ => None,
             };
-            if let Some(cmd) = nav.and_then(|n| self.menu.key(n)) {
+            if let Some(cmd) = nav.and_then(|n| self.win.menu.key(n)) {
                 self.run(cmd);
             }
             return;
@@ -811,29 +982,29 @@ impl App {
             && !MAC
             && let Some(i) = c.and_then(|c| "feov".find(c))
         {
-            self.menu.open = Some(i);
-            self.menu.hover = None;
-            self.menu.key(NavKey::Down);
+            self.win.menu.open = Some(i);
+            self.win.menu.hover = None;
+            self.win.menu.key(NavKey::Down);
             return;
         }
 
-        let in_find = self.find.visible && self.find.focus;
+        let in_find = self.win.find.visible && self.win.find.focus;
         if let Some(cmd) = self.shortcut(&ev, c, primary, shift, alt) {
             if in_find && matches!(cmd, Cmd::SelectAll | Cmd::Copy | Cmd::Cut | Cmd::Paste) {
                 match cmd {
-                    Cmd::SelectAll => self.find.field_mut().key(FieldKey::SelectAll),
+                    Cmd::SelectAll => self.win.find.field_mut().key(FieldKey::SelectAll),
                     Cmd::Paste => {
                         if let Some(t) = self.get_clipboard() {
                             let first = t.lines().next().unwrap_or("").to_owned();
-                            self.find.field_mut().key(FieldKey::Insert(&first));
+                            self.win.find.field_mut().key(FieldKey::Insert(&first));
                         }
                     }
                     _ => {
-                        let f = self.find.field_mut().clone();
+                        let f = self.win.find.field_mut().clone();
                         if f.all {
                             self.set_clipboard(f.text);
                             if cmd == Cmd::Cut {
-                                self.find.field_mut().key(FieldKey::Delete);
+                                self.win.find.field_mut().key(FieldKey::Delete);
                             }
                         }
                     }
@@ -847,21 +1018,21 @@ impl App {
         if in_find {
             match named {
                 Some(NamedKey::Escape) => self.find_action(FindAction::Close),
-                Some(NamedKey::Enter) if self.find.field == 1 => self.replace_one(),
+                Some(NamedKey::Enter) if self.win.find.field == 1 => self.replace_one(),
                 Some(NamedKey::Enter) => {
                     self.find_next(!shift);
                 }
-                Some(NamedKey::Tab) if self.find.replace => self.find.field = 1 - self.find.field,
+                Some(NamedKey::Tab) if self.win.find.replace => self.win.find.field = 1 - self.win.find.field,
                 Some(n) => {
                     if let Some(k) = field_key(n) {
-                        self.find.field_mut().key(k);
+                        self.win.find.field_mut().key(k);
                     } else if let (true, Some(t)) = (typing, text) {
-                        self.find.field_mut().key(FieldKey::Insert(t));
+                        self.win.find.field_mut().key(FieldKey::Insert(t));
                     }
                 }
                 None => {
                     if let (true, Some(t)) = (typing, text) {
-                        self.find.field_mut().key(FieldKey::Insert(t));
+                        self.win.find.field_mut().key(FieldKey::Insert(t));
                     }
                 }
             }
@@ -887,47 +1058,47 @@ impl App {
             _ => None,
         };
         if let Some(m) = motion {
-            self.tabs[self.active].view.motion(&mut self.gfx.fs, m, shift);
+            self.win.tabs[self.win.active].view.motion(&mut self.gfx.fs, m, shift);
             return;
         }
         let edited = match named {
             Some(NamedKey::Backspace) if word => {
-                self.tabs[self.active].view.delete_word(&mut self.gfx.fs, false);
+                self.win.tabs[self.win.active].view.delete_word(&mut self.gfx.fs, false);
                 true
             }
             Some(NamedKey::Backspace) => {
-                self.tabs[self.active].view.backspace();
+                self.win.tabs[self.win.active].view.backspace();
                 true
             }
             Some(NamedKey::Delete) if word => {
-                self.tabs[self.active].view.delete_word(&mut self.gfx.fs, true);
+                self.win.tabs[self.win.active].view.delete_word(&mut self.gfx.fs, true);
                 true
             }
             Some(NamedKey::Delete) => {
-                self.tabs[self.active].view.delete();
+                self.win.tabs[self.win.active].view.delete();
                 true
             }
             Some(NamedKey::Enter) => {
-                self.tabs[self.active].view.replace_selection("\n", false);
+                self.win.tabs[self.win.active].view.replace_selection("\n", false);
                 true
             }
             Some(NamedKey::Tab) => {
                 if !primary {
-                    self.tabs[self.active].view.type_text("\t");
+                    self.win.tabs[self.win.active].view.type_text("\t");
                 }
                 true
             }
             Some(NamedKey::Escape) => {
-                if self.find.visible {
+                if self.win.find.visible {
                     self.find_action(FindAction::Close);
                 } else {
-                    self.tabs[self.active].view.clear_selection();
+                    self.win.tabs[self.win.active].view.clear_selection();
                 }
                 false
             }
             _ => match text {
                 Some(t) if typing => {
-                    self.tabs[self.active].view.type_text(t);
+                    self.win.tabs[self.win.active].view.type_text(t);
                     true
                 }
                 _ => false,
@@ -942,98 +1113,100 @@ impl App {
 
     /// Converts a window point to coordinates relative to the text origin.
     fn text_point(&self, p: (f32, f32)) -> (f32, f32) {
-        let pad = (6.0 * self.scale).round();
-        (p.0 - self.layout.text.x - pad + self.tabs[self.active].view.h_scroll(), p.1 - self.layout.text.y)
+        let pad = (6.0 * self.win.scale).round();
+        (p.0 - self.win.layout.text.x - pad + self.win.tabs[self.win.active].view.h_scroll(), p.1 - self.win.layout.text.y)
     }
 
     fn url_at(&self, p: (f32, f32)) -> Option<(usize, Range<usize>, String)> {
-        if !self.layout.text.contains(p) {
+        if !self.win.layout.text.contains(p) {
             return None;
         }
         let (x, y) = self.text_point(p);
-        self.tabs[self.active].view.url_at(x, y)
+        self.win.tabs[self.win.active].view.url_at(x, y)
     }
 
     /// (thumb rect, track travel, total lines)
     fn scrollbar(&self) -> Option<(Rect, f32, usize)> {
-        let (total, line) = self.tabs[self.active].view.scroll_info();
-        let lh = self.tabs[self.active].view.line_h();
-        let track = self.layout.vbar;
+        let (total, line) = self.win.tabs[self.win.active].view.scroll_info();
+        let lh = self.win.tabs[self.win.active].view.line_h();
+        let track = self.win.layout.vbar;
         let vis = (track.h / lh).max(1.0);
         if total as f32 <= vis && line == 0 {
             return None;
         }
-        let th = (track.h * (vis / (total as f32 + vis)).min(1.0)).max(24.0 * self.scale).min(track.h);
+        let th = (track.h * (vis / (total as f32 + vis)).min(1.0)).max(24.0 * self.win.scale).min(track.h);
         let y = track.y + (track.h - th) * line as f32 / (total.saturating_sub(1).max(1)) as f32;
-        Some((Rect::new(track.x + 2.0 * self.scale, y, track.w - 4.0 * self.scale, th), track.h - th, total))
+        Some((Rect::new(track.x + 2.0 * self.win.scale, y, track.w - 4.0 * self.win.scale, th), track.h - th, total))
     }
 
     fn update_cursor_icon(&mut self) {
-        let p = self.mouse;
-        let icon = if self.prompt.is_some() || self.font_dlg.is_some() || self.menu.open.is_some() {
+        let p = self.win.mouse;
+        let icon = if self.win.drag == Drag::Tab {
+            if self.win.layout.tabs.contains(p) { CursorIcon::Grab } else { CursorIcon::Grabbing }
+        } else if self.win.prompt.is_some() || self.win.font_dlg.is_some() || self.win.menu.open.is_some() {
             CursorIcon::Default
-        } else if self.layout.text.contains(p) {
-            if self.primary() && self.hover_url.is_some() { CursorIcon::Pointer } else { CursorIcon::Text }
-        } else if self.find.visible
-            && self.find.hit(p).is_some_and(|a| matches!(a, FindAction::FocusFind | FindAction::FocusReplace))
+        } else if self.win.layout.text.contains(p) {
+            if self.primary() && self.win.hover_url.is_some() { CursorIcon::Pointer } else { CursorIcon::Text }
+        } else if self.win.find.visible
+            && self.win.find.hit(p).is_some_and(|a| matches!(a, FindAction::FocusFind | FindAction::FocusReplace))
         {
             CursorIcon::Text
         } else {
             CursorIcon::Default
         };
-        if icon != self.cursor_icon {
-            self.cursor_icon = icon;
-            if let Some(w) = &self.window {
+        if icon != self.win.cursor_icon {
+            self.win.cursor_icon = icon;
+            if let Some(w) = &self.win.window {
                 w.set_cursor(icon);
             }
         }
     }
 
     fn on_mouse_move(&mut self, p: (f32, f32)) {
-        self.mouse_prev = self.mouse;
-        self.mouse = p;
-        if self.menu.open.is_some() && self.menu.hover_at(p) {
-            self.needs_redraw = true;
+        self.win.mouse_prev = self.win.mouse;
+        self.win.mouse = p;
+        if self.win.menu.open.is_some() && self.win.menu.hover_at(p) {
+            self.win.needs_redraw = true;
         }
-        match self.drag {
+        match self.win.drag {
             Drag::Text => {
-                let t = self.layout.text;
+                let t = self.win.layout.text;
                 if p.1 < t.y {
-                    self.tabs[self.active].view.scroll_px(-(t.y - p.1));
+                    self.win.tabs[self.win.active].view.scroll_px(-(t.y - p.1));
                 } else if p.1 > t.bottom() {
-                    self.tabs[self.active].view.scroll_px(p.1 - t.bottom());
+                    self.win.tabs[self.win.active].view.scroll_px(p.1 - t.bottom());
                 }
-                self.tabs[self.active].view.prepare(&mut self.gfx.fs);
+                self.win.tabs[self.win.active].view.prepare(&mut self.gfx.fs);
                 let (x, y) = self.text_point(p);
-                self.tabs[self.active].view.drag(x, y.clamp(0.0, t.h - 1.0));
-                self.needs_redraw = true;
+                self.win.tabs[self.win.active].view.drag(x, y.clamp(0.0, t.h - 1.0));
+                self.win.needs_redraw = true;
             }
             Drag::Thumb(grab) => {
                 if let Some((_, range, total)) = self.scrollbar() {
-                    let frac = ((p.1 - grab - self.layout.vbar.y) / range.max(1.0)).clamp(0.0, 1.0);
-                    self.tabs[self.active].view.scroll_to_line((frac * (total - 1) as f32).round() as usize);
-                    self.needs_redraw = true;
+                    let frac = ((p.1 - grab - self.win.layout.vbar.y) / range.max(1.0)).clamp(0.0, 1.0);
+                    self.win.tabs[self.win.active].view.scroll_to_line((frac * (total - 1) as f32).round() as usize);
+                    self.win.needs_redraw = true;
                 }
             }
             Drag::Tab => {
-                if let Some(TabHit::Tab(j) | TabHit::Close(j)) = self.tabbar.hit(p)
-                    && j != self.active
+                if let Some(TabHit::Tab(j) | TabHit::Close(j)) = self.win.tabbar.hit(p)
+                    && j != self.win.active
                 {
-                    let t = self.tabs.remove(self.active);
-                    self.tabs.insert(j, t);
-                    self.active = j;
-                    self.tabbar.reveal = true;
+                    let t = self.win.tabs.remove(self.win.active);
+                    self.win.tabs.insert(j, t);
+                    self.win.active = j;
+                    self.win.tabbar.reveal = true;
                 }
-                self.needs_redraw = true;
+                self.win.needs_redraw = true;
             }
             Drag::None => {
-                if self.layout.tabs.contains(p) || self.layout.tabs.contains(self.mouse_prev) {
-                    self.needs_redraw = true; // tab hover highlight
+                if self.win.layout.tabs.contains(p) || self.win.layout.tabs.contains(self.win.mouse_prev) {
+                    self.win.needs_redraw = true; // tab hover highlight
                 }
                 let hover = self.url_at(p).map(|(l, r, _)| (l, r));
-                if hover != self.hover_url {
-                    self.hover_url = hover;
-                    self.needs_redraw = true;
+                if hover != self.win.hover_url {
+                    self.win.hover_url = hover;
+                    self.win.needs_redraw = true;
                 }
             }
         }
@@ -1041,32 +1214,36 @@ impl App {
     }
 
     fn on_mouse_button(&mut self, state: ElementState, button: MouseButton) {
-        self.needs_redraw = true;
-        let p = self.mouse;
+        self.win.needs_redraw = true;
+        let p = self.win.mouse;
         if state == ElementState::Released {
-            self.drag = Drag::None;
+            if self.win.drag == Drag::Tab {
+                self.finish_tab_drag();
+            }
+            self.win.drag = Drag::None;
+            self.update_cursor_icon();
             return;
         }
         // Click counting for double/triple click.
         let now = Instant::now();
-        let (t, lp, n) = self.clicks;
+        let (t, lp, n) = self.win.clicks;
         let n = if now - t < Duration::from_millis(450) && (p.0 - lp.0).abs() < 5.0 && (p.1 - lp.1).abs() < 5.0 {
             n % 3 + 1
         } else {
             1
         };
-        self.clicks = (now, p, n);
+        self.win.clicks = (now, p, n);
 
-        if let Some(pr) = &self.prompt {
+        if let Some(pr) = &self.win.prompt {
             if let Some(c) = pr.hit(p) {
                 self.choose(c);
             }
             return;
         }
-        if let Some(d) = &mut self.font_dlg {
+        if let Some(d) = &mut self.win.font_dlg {
             match d.hit(p) {
                 Some(DialogAction::Ok) => self.apply_font(),
-                Some(DialogAction::Cancel) => self.font_dlg = None,
+                Some(DialogAction::Cancel) => self.win.font_dlg = None,
                 Some(DialogAction::FocusFilter) => d.field = 0,
                 Some(DialogAction::FocusSize) => d.field = 1,
                 None if n == 2 && d.in_list(p) => self.apply_font(),
@@ -1075,37 +1252,37 @@ impl App {
             return;
         }
         if button == MouseButton::Middle
-            && self.menu.open.is_none()
-            && let Some(TabHit::Tab(i) | TabHit::Close(i)) = self.tabbar.hit(p)
+            && self.win.menu.open.is_none()
+            && let Some(TabHit::Tab(i) | TabHit::Close(i)) = self.win.tabbar.hit(p)
         {
             self.close_tab(i, false);
             return;
         }
         if button != MouseButton::Left {
-            if self.menu.open.is_some() {
-                self.menu.close();
+            if self.win.menu.open.is_some() {
+                self.win.menu.close();
             }
             return;
         }
-        match self.menu.hit(p) {
+        match self.win.menu.hit(p) {
             MenuHit::Title(i) => {
-                self.menu.open = if self.menu.open == Some(i) { None } else { Some(i) };
-                self.menu.hover = None;
+                self.win.menu.open = if self.win.menu.open == Some(i) { None } else { Some(i) };
+                self.win.menu.hover = None;
                 return;
             }
             MenuHit::Item(cmd) => return self.run(cmd),
             MenuHit::Inside => return,
-            MenuHit::Outside if self.menu.open.is_some() => return self.menu.close(),
+            MenuHit::Outside if self.win.menu.open.is_some() => return self.win.menu.close(),
             MenuHit::Outside => {}
         }
-        if self.layout.tabs.contains(p) {
-            match self.tabbar.hit(p) {
+        if self.win.layout.tabs.contains(p) {
+            match self.win.tabbar.hit(p) {
                 Some(TabHit::Close(i)) => {
                     self.close_tab(i, false);
                 }
                 Some(TabHit::Tab(i)) => {
                     self.activate(i);
-                    self.drag = Drag::Tab;
+                    self.win.drag = Drag::Tab;
                 }
                 Some(TabHit::New) => {
                     self.new_tab();
@@ -1117,63 +1294,63 @@ impl App {
             }
             return;
         }
-        if self.find.visible && self.layout.find.contains(p) {
-            if let Some(a) = self.find.hit(p) {
+        if self.win.find.visible && self.win.layout.find.contains(p) {
+            if let Some(a) = self.win.find.hit(p) {
                 self.find_action(a);
             }
             return;
         }
-        if self.layout.vbar.contains(p) {
+        if self.win.layout.vbar.contains(p) {
             if let Some((thumb, _, _)) = self.scrollbar() {
                 if p.1 >= thumb.y && p.1 < thumb.bottom() {
-                    self.drag = Drag::Thumb(p.1 - thumb.y);
+                    self.win.drag = Drag::Thumb(p.1 - thumb.y);
                 } else {
-                    let page = self.layout.text.h * 0.9;
-                    self.tabs[self.active].view.scroll_px(if p.1 < thumb.y { -page } else { page });
+                    let page = self.win.layout.text.h * 0.9;
+                    self.win.tabs[self.win.active].view.scroll_px(if p.1 < thumb.y { -page } else { page });
                 }
             }
             return;
         }
-        if self.layout.text.contains(p) {
-            self.find.focus = false;
+        if self.win.layout.text.contains(p) {
+            self.win.find.focus = false;
             if self.primary()
                 && let Some((_, _, url)) = self.url_at(p)
             {
                 let target = search::url_target(&url);
                 if let Err(e) = open::that_detached(&target) {
-                    self.status_msg = Some(format!("Could not open {target}: {e}"));
+                    self.win.status_msg = Some(format!("Could not open {target}: {e}"));
                 }
                 return;
             }
             let (x, y) = self.text_point(p);
-            self.tabs[self.active].view.click(x, y, n, self.mods.shift_key());
-            self.drag = Drag::Text;
+            self.win.tabs[self.win.active].view.click(x, y, n, self.mods.shift_key());
+            self.win.drag = Drag::Text;
         }
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
-        let lh = self.tabs[self.active].view.line_h();
+        let lh = self.win.tabs[self.win.active].view.line_h();
         let (mut dx, mut dy) = match delta {
             MouseScrollDelta::LineDelta(x, y) => (x * 3.0 * lh, y * 3.0 * lh),
             MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
         };
-        if let Some(d) = &mut self.font_dlg {
+        if let Some(d) = &mut self.win.font_dlg {
             d.scroll_by(if dy > 0.0 { -3 } else { 3 });
-            self.needs_redraw = true;
+            self.win.needs_redraw = true;
             return;
         }
-        if self.prompt.is_some() {
+        if self.win.prompt.is_some() {
             return;
         }
-        if self.layout.tabs.contains(self.mouse) {
-            self.tabbar.scroll(-(if dx != 0.0 { dx } else { dy }));
-            self.needs_redraw = true;
+        if self.win.layout.tabs.contains(self.win.mouse) {
+            self.win.tabbar.scroll(-(if dx != 0.0 { dx } else { dy }));
+            self.win.needs_redraw = true;
             return;
         }
         if self.primary() {
             if dy != 0.0 {
                 self.run(if dy > 0.0 { Cmd::ZoomIn } else { Cmd::ZoomOut });
-                self.needs_redraw = true;
+                self.win.needs_redraw = true;
             }
             return;
         }
@@ -1181,28 +1358,28 @@ impl App {
             (dx, dy) = (dy, 0.0);
         }
         if dy != 0.0 {
-            self.tabs[self.active].view.scroll_px(-dy);
+            self.win.tabs[self.win.active].view.scroll_px(-dy);
         }
         if dx != 0.0 && !self.settings.wrap {
-            self.tabs[self.active].view.scroll_h(-dx);
+            self.win.tabs[self.win.active].view.scroll_h(-dx);
         }
-        self.hover_url = None;
-        self.needs_redraw = true;
+        self.win.hover_url = None;
+        self.win.needs_redraw = true;
     }
 
     // ---------------------------------------------------------------- drawing
 
     fn compute_layout(&mut self, w: f32, h: f32) {
-        let s = self.scale;
+        let s = self.win.scale;
         let lh = self.gfx.ui_line_h();
         let menu_h = (lh + 8.0 * s).round();
         let tabs_h = TabBar::height(&self.gfx, s);
         let status_h = if self.settings.status_bar { (lh + 6.0 * s).round() } else { 0.0 };
-        let find_h = self.find.height(&self.gfx, s).round();
+        let find_h = self.win.find.height(&self.gfx, s).round();
         let vbar_w = (12.0 * s).round();
         let text_h = (h - menu_h - tabs_h - find_h - status_h).max(1.0);
         let top = menu_h + tabs_h;
-        self.layout = Layout {
+        self.win.layout = Layout {
             menu: Rect::new(0.0, 0.0, w, menu_h),
             tabs: Rect::new(0.0, menu_h, w, tabs_h),
             text: Rect::new(0.0, top, (w - vbar_w).max(1.0), text_h),
@@ -1213,60 +1390,57 @@ impl App {
         let pad = (6.0 * s).round();
         let font_px = (self.settings.font_pt * self.zoom * 4.0 / 3.0 * s).max(4.0);
         let line_h = (font_px * 1.3).ceil();
-        let want = ((self.layout.text.w - 2.0 * pad).max(1.0), text_h, font_px, line_h, self.settings.wrap);
-        if want != self.applied {
-            self.applied = want;
-            self.tabs[self.active].view.set_geometry(font_px, line_h, want.0, want.1, want.4);
-        }
+        let want = ((self.win.layout.text.w - 2.0 * pad).max(1.0), text_h, font_px, line_h, self.settings.wrap);
+        self.win.tabs[self.win.active].view.set_geometry(font_px, line_h, want.0, want.1, want.4);
     }
 
     fn draw_editor(&mut self, cv: &mut Canvas) {
         let th = self.theme;
-        let s = self.scale;
-        let area = self.layout.text;
+        let s = self.win.scale;
+        let area = self.win.layout.text;
         let pad = (6.0 * s).round();
         let show_caret =
-            self.focused && !(self.find.visible && self.find.focus) && self.prompt.is_none() && self.font_dlg.is_none();
-        self.tabs[self.active].view.prepare(&mut self.gfx.fs);
+            self.win.focused && !(self.win.find.visible && self.win.find.focus) && self.win.prompt.is_none() && self.win.font_dlg.is_none();
+        self.win.tabs[self.win.active].view.prepare(&mut self.gfx.fs);
         let caret =
-            self.tabs[self.active].view.draw(&mut self.gfx.fs, &mut self.gfx.cache, cv, area, pad, &th, s, self.hover_url.as_ref());
+            self.win.tabs[self.win.active].view.draw(&mut self.gfx.fs, &mut self.gfx.cache, cv, area, pad, &th, s, self.win.hover_url.as_ref());
         if let Some((x, y, h)) = caret {
             cv.set_clip(area);
-            if !self.preedit.is_empty() {
-                let w = self.gfx.text_w(&self.preedit);
+            if !self.win.preedit.is_empty() {
+                let w = self.gfx.text_w(&self.win.preedit);
                 let r = Rect::new(x, y, w + 4.0 * s, h);
                 cv.fill(r, th.field);
-                self.gfx.text_in(cv, &self.preedit, Rect::new(x + 2.0 * s, y, w, h), th.fg);
+                self.gfx.text_in(cv, &self.win.preedit, Rect::new(x + 2.0 * s, y, w, h), th.fg);
                 cv.fill(Rect::new(x, r.bottom() - 2.0 * s, r.w, s.max(1.0)), th.fg);
             } else if show_caret {
                 cv.fill(Rect::new(x, y, s.max(1.0).round(), h), th.fg);
             }
             cv.reset_clip();
-            if let Some(w) = &self.window {
+            if let Some(w) = &self.win.window {
                 w.set_ime_cursor_area(PhysicalPosition::new(x as f64, y as f64), PhysicalSize::new(1.0, h as f64));
             }
         }
 
         // Scrollbar.
-        cv.fill(self.layout.vbar, th.bg);
+        cv.fill(self.win.layout.vbar, th.bg);
         if let Some((thumb, _, _)) = self.scrollbar() {
-            cv.fill(thumb, if matches!(self.drag, Drag::Thumb(_)) { th.dim } else { th.border });
+            cv.fill(thumb, if matches!(self.win.drag, Drag::Thumb(_)) { th.dim } else { th.border });
         }
     }
 
     fn draw_status(&mut self, cv: &mut Canvas) {
-        let r = self.layout.status;
+        let r = self.win.layout.status;
         if r.h <= 0.0 {
             return;
         }
-        let (th, s) = (self.theme, self.scale);
+        let (th, s) = (self.theme, self.win.scale);
         cv.fill(r, th.chrome);
         cv.fill(Rect::new(r.x, r.y, r.w, s.max(1.0)), th.border);
-        let cur = self.tabs[self.active].view.cursor;
-        let doc = &self.tabs[self.active].view.doc;
+        let cur = self.win.tabs[self.win.active].view.cursor;
+        let doc = &self.win.tabs[self.win.active].view.doc;
         let col = doc.line(cur.line)[..cur.index].chars().count() + 1;
-        let selected = self.tabs[self.active].view.selection().map(|(a, z)| doc.chars_between(a, z));
-        let left = match &self.status_msg {
+        let selected = self.win.tabs[self.win.active].view.selection().map(|(a, z)| doc.chars_between(a, z));
+        let left = match &self.win.status_msg {
             Some(m) => m.clone(),
             None => match selected {
                 Some(n) => format!("Ln {}, Col {}   ({n} selected)", cur.line + 1, col),
@@ -1275,8 +1449,8 @@ impl App {
         };
         let row = Rect::new(r.x + 10.0 * s, r.y, r.w, r.h);
         cv.set_clip(r);
-        let eol = if self.tabs[self.active].mixed_eol { format!("{} (mixed)", self.tabs[self.active].eol.label()) } else { self.tabs[self.active].eol.label().to_owned() };
-        let segs = [format!("{}%", (self.zoom * 100.0).round()), eol, self.tabs[self.active].encoding.label().to_owned()];
+        let eol = if self.win.tabs[self.win.active].mixed_eol { format!("{} (mixed)", self.win.tabs[self.win.active].eol.label()) } else { self.win.tabs[self.win.active].eol.label().to_owned() };
+        let segs = [format!("{}%", (self.zoom * 100.0).round()), eol, self.win.tabs[self.win.active].encoding.label().to_owned()];
         let mut x = r.right() - 10.0 * s;
         for seg in segs.iter().rev() {
             let w = self.gfx.text_w(seg);
@@ -1292,8 +1466,9 @@ impl App {
     }
 
     fn redraw(&mut self) {
-        let Some(win) = self.window.clone() else { return };
-        let Some(mut surface) = self.surface.take() else { return };
+        let Some(win) = self.win.window.clone() else { return };
+        self.gfx.set_ui_scale(self.win.scale);
+        let Some(mut surface) = self.win.surface.take() else { return };
         let size = win.inner_size();
         if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
             && surface.resize(w, h).is_ok()
@@ -1305,37 +1480,33 @@ impl App {
                 let _ = buf.present();
             }
         }
-        self.surface = Some(surface);
+        self.win.surface = Some(surface);
         let title = format!("{}{} - {APP}", if self.tab().is_dirty() { "*" } else { "" }, self.doc_name());
-        if title != self.title {
+        if title != self.win.title {
             win.set_title(&title);
-            self.title = title;
+            self.win.title = title;
         }
     }
 
     fn paint(&mut self, cv: &mut Canvas) {
-        let (th, s) = (self.theme, self.scale);
+        let (th, s) = (self.theme, self.win.scale);
         cv.fill(Rect::new(0.0, 0.0, cv.w as f32, cv.h as f32), th.bg);
         self.draw_editor(cv);
-        if self.find.visible {
-            self.find.draw(&mut self.gfx, cv, &th, self.layout.find, s);
+        if self.win.find.visible {
+            self.win.find.draw(&mut self.gfx, cv, &th, self.win.layout.find, s);
         }
         self.draw_status(cv);
-        let items: Vec<(String, bool)> = self.tabs.iter().map(|t| (t.name(), t.is_dirty())).collect();
-        self.tabbar.draw(&mut self.gfx, cv, &th, self.layout.tabs, s, &items, self.active, self.mouse);
-        self.menu.draw_bar(&mut self.gfx, cv, &th, self.layout.menu, s);
-        if self.menu.open.is_some() {
-            let states: Vec<(Cmd, bool)> = ui::MENUS
-                .iter()
-                .flat_map(|(_, items)| items.iter().filter_map(|i| i.cmd))
-                .map(|c| (c, self.checked(c)))
-                .collect();
-            self.menu.draw_dropdown(&mut self.gfx, cv, &th, s, |c| states.iter().any(|(k, v)| *k == c && *v));
+        let items: Vec<(String, bool)> = self.win.tabs.iter().map(|t| (t.name(), t.is_dirty())).collect();
+        self.win.tabbar.draw(&mut self.gfx, cv, &th, self.win.layout.tabs, s, &items, self.win.active, self.win.mouse);
+        self.win.menu.draw_bar(&mut self.gfx, cv, &th, self.win.layout.menu, s);
+        if self.win.menu.open.is_some() {
+            let states: Vec<(Cmd, bool)> = ui::all_menu_cmds().map(|c| (c, self.checked(c))).collect();
+            self.win.menu.draw_dropdown(&mut self.gfx, cv, &th, s, |c| states.iter().any(|(k, v)| *k == c && *v));
         }
-        if let Some(d) = &mut self.font_dlg {
+        if let Some(d) = &mut self.win.font_dlg {
             d.draw(&mut self.gfx, cv, &th, s, &mut |g, cv, r, fam, pt| draw_preview(g, cv, r, fam, pt, s, th.fg));
         }
-        if let Some(p) = &mut self.prompt {
+        if let Some(p) = &mut self.win.prompt {
             p.draw(&mut self.gfx, cv, &th, s);
         }
     }
@@ -1418,50 +1589,43 @@ fn shortcut_char(ev: &KeyEvent) -> Option<char> {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.win.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title(APP)
-            .with_inner_size(LogicalSize::new(self.settings.win_w.max(320), self.settings.win_h.max(200)))
-            .with_min_inner_size(LogicalSize::new(320, 200));
-        let win = Rc::new(el.create_window(attrs).expect("failed to create window"));
-        let ctx = softbuffer::Context::new(win.clone()).expect("failed to create graphics context");
-        let surface = softbuffer::Surface::new(&ctx, win.clone()).expect("failed to create surface");
-        win.set_ime_allowed(true);
-        self.scale = win.scale_factor() as f32;
-        self.gfx.set_ui_scale(self.scale);
-        self.theme = if win.theme() == Some(winit::window::Theme::Dark) { Theme::DARK } else { Theme::LIGHT };
-        self.window = Some(win.clone());
-        self.surface = Some(surface);
-        win.request_redraw();
+        let mut win = std::mem::replace(&mut self.win, Win::new(Vec::new()));
+        self.open_window(el, &mut win, None, None);
+        self.win = win;
+        self.gfx.set_ui_scale(self.win.scale);
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, el: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if !self.focus_win(id) {
+            return;
+        }
         match event {
             WindowEvent::RedrawRequested => {
                 self.redraw();
                 return;
             }
-            WindowEvent::CloseRequested => self.run(Cmd::Exit),
+            WindowEvent::CloseRequested => self.request_close_window(),
             WindowEvent::Resized(sz) => {
-                let l = sz.to_logical::<f64>(self.scale as f64);
+                let l = sz.to_logical::<f64>(self.win.scale as f64);
                 self.settings.win_w = l.width.round() as u32;
                 self.settings.win_h = l.height.round() as u32;
-                self.needs_redraw = true;
+                self.win.needs_redraw = true;
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.scale = scale_factor as f32;
-                self.gfx.set_ui_scale(self.scale);
-                self.needs_redraw = true;
+                self.win.scale = scale_factor as f32;
+                self.gfx.set_ui_scale(self.win.scale);
+                self.win.needs_redraw = true;
             }
             WindowEvent::ThemeChanged(t) => {
                 self.theme = if t == winit::window::Theme::Dark { Theme::DARK } else { Theme::LIGHT };
-                self.needs_redraw = true;
+                self.win.needs_redraw = true;
             }
             WindowEvent::Focused(f) => {
-                self.focused = f;
-                self.needs_redraw = true;
+                self.win.focused = f;
+                self.win.needs_redraw = true;
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.mods = m.state();
@@ -1470,33 +1634,33 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.on_key(event),
             WindowEvent::Ime(ime) => {
                 match ime {
-                    Ime::Preedit(text, _) => self.preedit = text,
+                    Ime::Preedit(text, _) => self.win.preedit = text,
                     Ime::Commit(text) => {
-                        self.preedit.clear();
-                        if self.prompt.is_none() && self.font_dlg.is_none() {
-                            if self.find.visible && self.find.focus {
-                                self.find.field_mut().key(FieldKey::Insert(&text));
+                        self.win.preedit.clear();
+                        if self.win.prompt.is_none() && self.win.font_dlg.is_none() {
+                            if self.win.find.visible && self.win.find.focus {
+                                self.win.find.field_mut().key(FieldKey::Insert(&text));
                             } else {
-                                self.tabs[self.active].view.type_text(&text);
+                                self.win.tabs[self.win.active].view.type_text(&text);
                                 self.edited();
                             }
                         }
                     }
-                    Ime::Enabled | Ime::Disabled => self.preedit.clear(),
+                    Ime::Enabled | Ime::Disabled => self.win.preedit.clear(),
                 }
-                self.needs_redraw = true;
+                self.win.needs_redraw = true;
             }
             WindowEvent::CursorMoved { position, .. } => self.on_mouse_move((position.x as f32, position.y as f32)),
             WindowEvent::CursorLeft { .. } => {
-                if self.hover_url.take().is_some() {
-                    self.needs_redraw = true;
+                if self.win.hover_url.take().is_some() {
+                    self.win.needs_redraw = true;
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => self.on_mouse_button(state, button),
             WindowEvent::MouseWheel { delta, .. } => self.on_wheel(delta),
             WindowEvent::DroppedFile(path) => {
                 self.open_path(path);
-                self.needs_redraw = true;
+                self.win.needs_redraw = true;
             }
             _ => {}
         }
@@ -1505,10 +1669,28 @@ impl ApplicationHandler for App {
             el.exit();
             return;
         }
-        if std::mem::take(&mut self.needs_redraw)
-            && let Some(w) = &self.window
-        {
-            w.request_redraw();
+        if let Some(sp) = self.spawn.take() {
+            let mut win = Win::new(vec![sp.tab]);
+            self.open_window(el, &mut win, sp.pos, Some(sp.size));
+            self.others.push(win);
+        }
+        if std::mem::take(&mut self.win.needs_redraw) {
+            self.win.redraw_later();
+        }
+        // Drop closed windows; if the current one closed, another becomes current.
+        self.others.retain(|w| !w.close);
+        if self.win.close {
+            match self.others.pop() {
+                Some(w) => {
+                    self.win = w;
+                    self.gfx.set_ui_scale(self.win.scale);
+                    self.win.redraw_later();
+                }
+                None => {
+                    self.settings.save();
+                    el.exit();
+                }
+            }
         }
     }
 }

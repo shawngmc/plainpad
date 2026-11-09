@@ -13,10 +13,16 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
 - A ● on a tab means it has unsaved changes. Click × or middle-click a tab to close it, click + or
   double-click the empty part of the tab bar for a new tab, and drag tabs to reorder them.
 - When there are too many tabs to fit, the tab bar scrolls (mouse wheel) and keeps the active tab visible.
+- Each tab keeps its own scroll position, so switching away and back returns you to the same place.
+- Drag a tab out of the tab bar and drop it outside the window to open it in a new window. Drop it on
+  another Plainpad window to move it there. Each window has its own tabs, menus and find bar; the font,
+  zoom, word wrap and status bar settings are shared.
+  On Wayland the app can't see where its windows are on screen, so a dragged-out tab always opens a new window.
 - New documents are named Untitled, Untitled 2, and so on.
 - Opening a file that's already open switches to its tab. An empty, untouched Untitled tab is reused
   rather than left behind.
-- Closing the last tab leaves a fresh empty one instead of quitting.
+- Closing the last tab leaves a fresh empty one instead of quitting. In a second window, closing its last tab
+  closes that window.
 
 **Files**
 - New Tab, Open, Save, Save As, Rename, Close Tab, Print
@@ -24,7 +30,8 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
   the command line; each opens in its own tab.
 - Saving writes a temporary file and renames it over the original, so a failed save never truncates your file.
   Symlinks and file permissions are kept.
-- Closing a tab with unsaved changes asks whether to save it. Exit asks about each modified tab in turn. The window title shows `*`
+- Closing a tab with unsaved changes asks whether to save it. Closing a window asks about each of its modified
+  tabs, and Exit asks about every modified tab in every window, in turn. Cancel stops the close or exit. The window title shows `*`
   while the file is modified, and it clears if you undo back to the saved state.
 
 **Text and Unicode**
@@ -32,9 +39,9 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
   for CJK and other scripts
 - IME input with inline display of in-progress composition
 - Encoding detection: UTF-8, UTF-8 with BOM, UTF-16 LE/BE (with BOM), and Windows-1252 as a fallback.
-  Every byte round-trips unchanged. You can change the encoding from the Format menu.
+  Every byte round-trips unchanged. You can change the encoding used for saving with **Format → Encoding**.
 - Line-ending detection: CRLF, LF or CR. Files with mixed endings are flagged and normalised on save.
-  You can convert between them from the Format menu.
+  You can convert between them with **Format → Line Endings**.
 
 **Editing**
 - Find, Find Next and Find Previous, with an optional Match case
@@ -86,7 +93,7 @@ On macOS, use **Cmd** wherever this table says **Ctrl**, except for Ctrl+Tab and
 | Word wrap | Alt+Z |
 | Zoom in / out / reset | Ctrl+= / Ctrl+- / Ctrl+0, or Ctrl+mouse wheel |
 | Open the File / Edit / Format / View menu | Alt+F / Alt+E / Alt+O / Alt+V |
-| Move between menu items | Arrow keys, Enter to choose, Esc to close |
+| Move between menu items | Arrow keys (Right opens a submenu, Left closes it), Enter to choose, Esc to close |
 | Move by word | Ctrl+Left / Ctrl+Right |
 | Start / end of line | Home / End |
 | Start / end of document | Ctrl+Home / Ctrl+End |
@@ -196,7 +203,7 @@ Recently fixed:
       multi-megabyte line is slow to display.
 - [x] Open several documents at once, in tabs
 - [ ] Restore the open tabs when the app restarts
-- [ ] Drag a tab out into its own window
+- [x] Drag a tab out into its own window, or onto another window
 - [ ] Use the native macOS menu bar at the top of the screen instead of the in-window menu bar
 - [ ] Add a print dialog on macOS and Linux (page setup, choice of printer, copies)
 - [ ] Add a horizontal scrollbar when word wrap is off

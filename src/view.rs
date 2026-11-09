@@ -32,6 +32,7 @@ pub struct View {
     reveal: bool,
     attrs: AttrsList,
     vis_rows: usize,
+    geom: Option<(f32, f32, f32, f32, bool)>,
 }
 
 impl View {
@@ -48,6 +49,7 @@ impl View {
             reveal: false,
             attrs: AttrsList::new(&font_attrs(family)),
             vis_rows: 40,
+            geom: None,
         };
         v.load_window(0, 0.0, false);
         v
@@ -75,7 +77,16 @@ impl View {
         self.buf.set_redraw(true);
     }
 
+    /// Applies the text area's size, font metrics and wrap mode. Does nothing if
+    /// they're unchanged, so switching back to a tab keeps its scroll position.
+    /// On a real change the top visible line stays put rather than jumping to the cursor.
     pub fn set_geometry(&mut self, font_px: f32, line_h: f32, w: f32, h: f32, wrap: bool) {
+        let g = (font_px, line_h, w, h, wrap);
+        if self.geom == Some(g) {
+            return;
+        }
+        let first = self.geom.is_none();
+        self.geom = Some(g);
         self.buf.set_metrics_and_size(Metrics::new(font_px, line_h), Some(w), Some(h));
         self.buf.set_wrap(if wrap { Wrap::WordOrGlyph } else { Wrap::None });
         if wrap {
@@ -84,7 +95,7 @@ impl View {
             self.buf.set_scroll(s);
         }
         self.vis_rows = ((h / line_h).ceil() as usize).max(1);
-        self.reveal = true;
+        self.reveal |= first;
     }
 
     pub fn line_h(&self) -> f32 {
@@ -707,5 +718,23 @@ mod tests {
         }
         assert_eq!(v.scroll_info().1, 0);
         assert_eq!(v.buf.scroll().vertical, 0.0);
+    }
+
+    #[test]
+    fn unchanged_geometry_keeps_scroll() {
+        let (mut fs, mut v) = view(&big(1000));
+        v.scroll_px(18.0 * 300.0);
+        v.prepare(&mut fs);
+        let top = v.scroll_info().1;
+        assert!(top > 200);
+        // Re-applying the same geometry (as on a tab switch) must not move the view,
+        // even though the cursor is far away at the start.
+        v.set_geometry(14.0, 18.0, 400.0, 18.0 * 20.0, true);
+        v.prepare(&mut fs);
+        assert_eq!(v.scroll_info().1, top);
+        // A real change (e.g. a resize) keeps the top line too.
+        v.set_geometry(14.0, 18.0, 300.0, 18.0 * 15.0, true);
+        v.prepare(&mut fs);
+        assert_eq!(v.scroll_info().1, top);
     }
 }

@@ -42,12 +42,22 @@ pub struct Item {
     pub label: &'static str,
     pub key: &'static str,
     pub cmd: Option<Cmd>,
+    pub sub: Option<&'static [Item]>,
+}
+
+impl Item {
+    fn is_sep(&self) -> bool {
+        self.cmd.is_none() && self.sub.is_none()
+    }
 }
 
 const fn it(label: &'static str, key: &'static str, cmd: Cmd) -> Item {
-    Item { label, key, cmd: Some(cmd) }
+    Item { label, key, cmd: Some(cmd), sub: None }
 }
-const SEP: Item = Item { label: "", key: "", cmd: None };
+const fn submenu(label: &'static str, items: &'static [Item]) -> Item {
+    Item { label, key: "", cmd: None, sub: Some(items) }
+}
+const SEP: Item = Item { label: "", key: "", cmd: None, sub: None };
 
 pub const MENUS: &[(&str, &[Item])] = &[
     (
@@ -90,15 +100,24 @@ pub const MENUS: &[(&str, &[Item])] = &[
             it("Word Wrap", "Alt+Z", Cmd::WordWrap),
             it("Font…", "", Cmd::Font),
             SEP,
-            it("Line Endings: Windows (CRLF)", "", Cmd::SetEol(Eol::CrLf)),
-            it("Line Endings: Unix (LF)", "", Cmd::SetEol(Eol::Lf)),
-            it("Line Endings: Classic Mac (CR)", "", Cmd::SetEol(Eol::Cr)),
-            SEP,
-            it("Encoding: UTF-8", "", Cmd::SetEncoding(Encoding::Utf8)),
-            it("Encoding: UTF-8 with BOM", "", Cmd::SetEncoding(Encoding::Utf8Bom)),
-            it("Encoding: UTF-16 LE", "", Cmd::SetEncoding(Encoding::Utf16Le)),
-            it("Encoding: UTF-16 BE", "", Cmd::SetEncoding(Encoding::Utf16Be)),
-            it("Encoding: Windows-1252", "", Cmd::SetEncoding(Encoding::Windows1252)),
+            submenu(
+                "Line Endings",
+                &[
+                    it("Windows (CRLF)", "", Cmd::SetEol(Eol::CrLf)),
+                    it("Unix (LF)", "", Cmd::SetEol(Eol::Lf)),
+                    it("Classic Mac (CR)", "", Cmd::SetEol(Eol::Cr)),
+                ],
+            ),
+            submenu(
+                "Encoding",
+                &[
+                    it("UTF-8", "", Cmd::SetEncoding(Encoding::Utf8)),
+                    it("UTF-8 with BOM", "", Cmd::SetEncoding(Encoding::Utf8Bom)),
+                    it("UTF-16 LE", "", Cmd::SetEncoding(Encoding::Utf16Le)),
+                    it("UTF-16 BE", "", Cmd::SetEncoding(Encoding::Utf16Be)),
+                    it("Windows-1252", "", Cmd::SetEncoding(Encoding::Windows1252)),
+                ],
+            ),
         ],
     ),
     (
@@ -116,6 +135,13 @@ pub const MENUS: &[(&str, &[Item])] = &[
     ),
 ];
 
+/// Every command reachable from the menus, including submenus.
+pub fn all_menu_cmds() -> impl Iterator<Item = Cmd> {
+    MENUS.iter().flat_map(|(_, items)| {
+        items.iter().flat_map(|i| i.cmd.into_iter().chain(i.sub.into_iter().flatten().filter_map(|s| s.cmd)))
+    })
+}
+
 /// Shortcut text as shown on this platform.
 pub fn key_label(k: &str) -> String {
     if cfg!(target_os = "macos") && k.ends_with("Tab") {
@@ -128,13 +154,35 @@ pub fn key_label(k: &str) -> String {
     }
 }
 
+/// A drawn dropdown panel and the screen rect of each selectable row.
+#[derive(Default)]
+struct Panel {
+    rect: Rect,
+    rows: Vec<(Rect, usize)>,
+}
+
+impl Panel {
+    fn row_at(&self, p: (f32, f32)) -> Option<usize> {
+        self.rows.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i)
+    }
+
+    fn row_rect(&self, idx: usize) -> Option<Rect> {
+        self.rows.iter().find(|(_, i)| *i == idx).map(|(r, _)| *r)
+    }
+}
+
 #[derive(Default)]
 pub struct MenuState {
     pub open: Option<usize>,
+    /// Highlighted row in the open menu.
     pub hover: Option<usize>,
+    /// Row of the open menu whose submenu is showing.
+    pub sub: Option<usize>,
+    /// Highlighted row in the submenu; `Some` also means keyboard focus is in the submenu.
+    pub sub_hover: Option<usize>,
     titles: Vec<Rect>,
-    drop: Rect,
-    items: Vec<(Rect, usize)>,
+    main: Panel,
+    side: Panel,
 }
 
 pub enum MenuHit {
@@ -142,6 +190,66 @@ pub enum MenuHit {
     Item(Cmd),
     Inside,
     Outside,
+}
+
+/// Size of a dropdown panel for `items`: (width, height, label column width, key column width).
+fn panel_size(g: &mut Gfx, items: &[Item], s: f32) -> (f32, f32, f32, f32) {
+    let row = (g.ui_line_h() + 8.0 * s).round();
+    let sep = 9.0 * s;
+    let mut lw: f32 = 0.0;
+    let mut kw: f32 = g.text_w("▸");
+    for i in items {
+        lw = lw.max(g.text_w(i.label));
+        kw = kw.max(g.text_w(&key_label(i.key)));
+    }
+    let w = 28.0 * s + lw + 32.0 * s + kw + 16.0 * s;
+    let h = items.iter().map(|i| if i.is_sep() { sep } else { row }).sum::<f32>() + 8.0 * s;
+    (w, h, lw, kw)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_panel(
+    g: &mut Gfx,
+    cv: &mut Canvas,
+    th: &Theme,
+    s: f32,
+    items: &[Item],
+    x: f32,
+    y: f32,
+    highlight: &[usize],
+    checked: &dyn Fn(Cmd) -> bool,
+) -> Panel {
+    let (w, h, lw, kw) = panel_size(g, items, s);
+    let row = (g.ui_line_h() + 8.0 * s).round();
+    let sep = 9.0 * s;
+    let pad = 28.0 * s;
+    let rect = Rect::new(x, y, w, h);
+    cv.fill(Rect::new(x + 2.0 * s, y + 2.0 * s, w, h), th.shade);
+    cv.fill(rect, th.chrome);
+    cv.outline(rect, s, th.border);
+    let mut rows = Vec::new();
+    let mut yy = y + 4.0 * s;
+    for (idx, i) in items.iter().enumerate() {
+        if i.is_sep() {
+            cv.fill(Rect::new(x + 8.0 * s, yy + (sep / 2.0).floor(), w - 16.0 * s, s), th.border);
+            yy += sep;
+            continue;
+        }
+        let r = Rect::new(x + 4.0 * s, yy, w - 8.0 * s, row);
+        if highlight.contains(&idx) {
+            cv.fill(r, th.hover);
+        }
+        if i.cmd.is_some_and(checked) {
+            g.text_in(cv, "✓", Rect::new(x + 10.0 * s, yy, pad, row), th.chrome_fg);
+        }
+        g.text_in(cv, i.label, Rect::new(x + pad, yy, lw, row), th.chrome_fg);
+        let kl = if i.sub.is_some() { "▸".to_owned() } else { key_label(i.key) };
+        let kx = x + w - 16.0 * s - g.text_w(&kl);
+        g.text_in(cv, &kl, Rect::new(kx, yy, kw, row), th.dim);
+        rows.push((r, idx));
+        yy += row;
+    }
+    Panel { rect, rows }
 }
 
 impl MenuState {
@@ -163,102 +271,124 @@ impl MenuState {
     }
 
     pub fn draw_dropdown(&mut self, g: &mut Gfx, cv: &mut Canvas, th: &Theme, s: f32, checked: impl Fn(Cmd) -> bool) {
-        self.items.clear();
+        self.main = Panel::default();
+        self.side = Panel::default();
         let Some(m) = self.open else { return };
         let items = MENUS[m].1;
-        let row = (g.ui_line_h() + 8.0 * s).round();
-        let sep = 9.0 * s;
-        let pad = 28.0 * s;
-        let mut lw: f32 = 0.0;
-        let mut kw: f32 = 0.0;
-        for i in items {
-            lw = lw.max(g.text_w(i.label));
-            kw = kw.max(g.text_w(&key_label(i.key)));
-        }
-        let w = pad + lw + 32.0 * s + kw + 16.0 * s;
-        let h: f32 = items.iter().map(|i| if i.cmd.is_some() { row } else { sep }).sum::<f32>() + 8.0 * s;
+        let (w, _, _, _) = panel_size(g, items, s);
         let t = self.titles[m];
         let x = t.x.min(cv.w as f32 - w).max(0.0);
-        self.drop = Rect::new(x, t.bottom() + s, w, h);
-        // Shadow, body, border.
-        cv.fill(Rect::new(self.drop.x + 2.0 * s, self.drop.y + 2.0 * s, w, h), th.shade);
-        cv.fill(self.drop, th.chrome);
-        cv.outline(self.drop, s, th.border);
-        let mut y = self.drop.y + 4.0 * s;
-        for (idx, i) in items.iter().enumerate() {
-            let Some(cmd) = i.cmd else {
-                cv.fill(Rect::new(x + 8.0 * s, y + (sep / 2.0).floor(), w - 16.0 * s, s), th.border);
-                y += sep;
-                continue;
-            };
-            let r = Rect::new(x + 4.0 * s, y, w - 8.0 * s, row);
-            if self.hover == Some(idx) {
-                cv.fill(r, th.hover);
-            }
-            if checked(cmd) {
-                g.text_in(cv, "✓", Rect::new(x + 10.0 * s, y, pad, row), th.chrome_fg);
-            }
-            g.text_in(cv, i.label, Rect::new(x + pad, y, lw, row), th.chrome_fg);
-            let kl = key_label(i.key);
-            let kx = x + w - 16.0 * s - g.text_w(&kl);
-            g.text_in(cv, &kl, Rect::new(kx, y, kw, row), th.dim);
-            self.items.push((r, idx));
-            y += row;
+        let hl: Vec<usize> = self.hover.into_iter().chain(self.sub).collect();
+        self.main = draw_panel(g, cv, th, s, items, x, t.bottom() + s, &hl, &checked);
+        let Some(si) = self.sub else { return };
+        let (Some(sub), Some(row)) = (items[si].sub, self.main.row_rect(si)) else { return };
+        let (sw, sh, _, _) = panel_size(g, sub, s);
+        let mut sx = self.main.rect.right() - 4.0 * s;
+        if sx + sw > cv.w as f32 {
+            sx = (self.main.rect.x - sw + 4.0 * s).max(0.0);
         }
+        let sy = (row.y - 4.0 * s).min(cv.h as f32 - sh).max(0.0);
+        let hl: Vec<usize> = self.sub_hover.into_iter().collect();
+        self.side = draw_panel(g, cv, th, s, sub, sx, sy, &hl, &checked);
     }
 
-    pub fn hit(&self, p: (f32, f32)) -> MenuHit {
+    fn sub_items(&self) -> Option<&'static [Item]> {
+        MENUS[self.open?].1[self.sub?].sub
+    }
+
+    pub fn hit(&mut self, p: (f32, f32)) -> MenuHit {
         if let Some(i) = self.titles.iter().position(|r| r.contains(p)) {
             return MenuHit::Title(i);
         }
-        if let Some(m) = self.open {
-            if let Some((_, idx)) = self.items.iter().find(|(r, _)| r.contains(p)) {
-                return MenuHit::Item(MENUS[m].1[*idx].cmd.unwrap());
-            }
-            if self.drop.contains(p) {
+        let Some(m) = self.open else { return MenuHit::Outside };
+        if let (Some(sub), Some(idx)) = (self.sub_items(), self.side.row_at(p)) {
+            return sub[idx].cmd.map_or(MenuHit::Inside, MenuHit::Item);
+        }
+        if self.side.rect.contains(p) {
+            return MenuHit::Inside;
+        }
+        if let Some(idx) = self.main.row_at(p) {
+            let item = &MENUS[m].1[idx];
+            if item.sub.is_some() {
+                self.sub = Some(idx);
                 return MenuHit::Inside;
             }
+            return item.cmd.map_or(MenuHit::Inside, MenuHit::Item);
         }
-        MenuHit::Outside
+        if self.main.rect.contains(p) { MenuHit::Inside } else { MenuHit::Outside }
     }
 
     pub fn hover_at(&mut self, p: (f32, f32)) -> bool {
-        let old = (self.open, self.hover);
+        let old = (self.open, self.hover, self.sub, self.sub_hover);
         if let Some(i) = self.titles.iter().position(|r| r.contains(p))
-            && self.open.is_some() {
-                self.open = Some(i);
+            && self.open.is_some()
+            && self.open != Some(i)
+        {
+            self.open = Some(i);
+            self.hover = None;
+            self.sub = None;
+            self.sub_hover = None;
+        }
+        if self.side.rect.contains(p) {
+            self.sub_hover = self.side.row_at(p);
+        } else if let Some(m) = self.open {
+            self.hover = self.main.row_at(p);
+            self.sub_hover = None;
+            // Hovering another row closes the submenu; moving off the panel keeps it open.
+            if let Some(h) = self.hover {
+                self.sub = MENUS[m].1[h].sub.map(|_| h);
             }
-        self.hover = self.items.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i);
-        old != (self.open, self.hover)
+        }
+        old != (self.open, self.hover, self.sub, self.sub_hover)
     }
 
     /// Keyboard navigation inside an open menu. Returns a command on Enter.
     pub fn key(&mut self, k: NavKey) -> Option<Cmd> {
         let m = self.open?;
         let items = MENUS[m].1;
-        let step = |from: Option<usize>, d: isize| -> Option<usize> {
+        let step = |items: &[Item], from: Option<usize>, d: isize| -> Option<usize> {
             let n = items.len() as isize;
             let mut i = from.map_or(if d > 0 { -1 } else { n }, |v| v as isize);
             for _ in 0..n {
                 i = (i + d).rem_euclid(n);
-                if items[i as usize].cmd.is_some() {
+                if !items[i as usize].is_sep() {
                     return Some(i as usize);
                 }
             }
             None
         };
+        let switch_menu = |me: &mut Self, d: usize| {
+            me.open = Some((m + d) % MENUS.len());
+            me.hover = None;
+            me.sub = None;
+            me.sub_hover = None;
+        };
+        // Keyboard focus inside a submenu.
+        if let (Some(sub), Some(sh)) = (self.sub_items(), self.sub_hover) {
+            match k {
+                NavKey::Up => self.sub_hover = step(sub, Some(sh), -1),
+                NavKey::Down => self.sub_hover = step(sub, Some(sh), 1),
+                NavKey::Left => self.sub_hover = None,
+                NavKey::Right => switch_menu(self, 1),
+                NavKey::Enter => return sub[sh].cmd,
+            }
+            return None;
+        }
+        let opens_sub = self.hover.and_then(|h| items[h].sub.map(|s| (h, s)));
         match k {
-            NavKey::Up => self.hover = step(self.hover, -1),
-            NavKey::Down => self.hover = step(self.hover, 1),
-            NavKey::Left => {
-                self.open = Some((m + MENUS.len() - 1) % MENUS.len());
-                self.hover = None;
+            NavKey::Up => self.hover = step(items, self.hover, -1),
+            NavKey::Down => self.hover = step(items, self.hover, 1),
+            NavKey::Left => switch_menu(self, MENUS.len() - 1),
+            NavKey::Right | NavKey::Enter if opens_sub.is_some() => {
+                let (h, sub) = opens_sub.unwrap();
+                self.sub = Some(h);
+                self.sub_hover = step(sub, None, 1);
             }
-            NavKey::Right => {
-                self.open = Some((m + 1) % MENUS.len());
-                self.hover = None;
-            }
+            NavKey::Right => switch_menu(self, 1),
             NavKey::Enter => return self.hover.and_then(|i| items[i].cmd),
+        }
+        if !matches!(k, NavKey::Right | NavKey::Enter) {
+            self.sub = self.hover.filter(|&h| items[h].sub.is_some());
         }
         None
     }
@@ -266,6 +396,8 @@ impl MenuState {
     pub fn close(&mut self) {
         self.open = None;
         self.hover = None;
+        self.sub = None;
+        self.sub_hover = None;
     }
 }
 
