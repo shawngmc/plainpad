@@ -953,6 +953,7 @@ const SAVE_CHOICES: &[(&str, Choice)] =
 const LINK_CHOICES: &[(&str, Choice)] = &[("Open Anyway", Choice::Open), ("Cancel", Choice::Cancel)];
 const CHANGED_CHOICES: &[(&str, Choice)] = &[("Reload", Choice::Reload), ("Keep My Version", Choice::Keep)];
 const OVERWRITE_CHOICES: &[(&str, Choice)] = &[("Overwrite", Choice::Overwrite), ("Cancel", Choice::Cancel)];
+const LARGE_CHOICES: &[(&str, Choice)] = &[("Open", Choice::Open), ("Cancel", Choice::Cancel)];
 
 /// Greedy word wrap of `text` to `max_w` pixels. A word too long for a line
 /// on its own (such as a long URL) is broken between characters, so nothing
@@ -1000,6 +1001,11 @@ impl Prompt {
     /// Saving would overwrite a file changed on disk; Cancel is the default.
     pub fn overwrite(msg: String) -> Self {
         Self { lines: vec![msg], choices: OVERWRITE_CHOICES, focus: 1, warn: true, buttons: Vec::new() }
+    }
+
+    /// Opening a very large file; Cancel is the default.
+    pub fn large(msg: String) -> Self {
+        Self { lines: vec![msg], choices: LARGE_CHOICES, focus: 1, warn: false, buttons: Vec::new() }
     }
 
     pub fn focused(&self) -> Choice {

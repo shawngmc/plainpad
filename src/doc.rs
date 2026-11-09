@@ -78,35 +78,105 @@ fn cp1252(b: u8) -> char {
 
 /// Encodes text. Fails (returning the first offending char) if the encoding
 /// cannot represent it.
-pub fn encode(text: &str, enc: Encoding) -> Result<Vec<u8>, char> {
-    Ok(match enc {
-        Encoding::Utf8 => text.as_bytes().to_vec(),
-        Encoding::Utf8Bom => [&[0xEF, 0xBB, 0xBF][..], text.as_bytes()].concat(),
+/// The byte order mark written at the start of a file in this encoding.
+fn bom(enc: Encoding) -> &'static [u8] {
+    match enc {
+        Encoding::Utf8Bom => &[0xEF, 0xBB, 0xBF],
+        Encoding::Utf16Le => &[0xFF, 0xFE],
+        Encoding::Utf16Be => &[0xFE, 0xFF],
+        Encoding::Utf8 | Encoding::Windows1252 => &[],
+    }
+}
+
+fn to_cp1252(c: char) -> Option<u8> {
+    let cp = c as u32;
+    if cp < 0x80 || (0xA0..=0xFF).contains(&cp) {
+        Some(cp as u8)
+    } else {
+        CP1252_HIGH.iter().position(|&u| u as u32 == cp).map(|i| 0x80 + i as u8)
+    }
+}
+
+/// Appends `text` in encoding `enc` (without a BOM), or returns the first
+/// character the encoding can't represent.
+fn encode_into(out: &mut Vec<u8>, text: &str, enc: Encoding) -> Result<(), char> {
+    match enc {
+        Encoding::Utf8 | Encoding::Utf8Bom => out.extend_from_slice(text.as_bytes()),
         Encoding::Utf16Le | Encoding::Utf16Be => {
             let le = enc == Encoding::Utf16Le;
-            let mut v = Vec::with_capacity(text.len() * 2 + 2);
-            v.extend_from_slice(if le { &[0xFF, 0xFE] } else { &[0xFE, 0xFF] });
+            out.reserve(text.len() * 2);
             for u in text.encode_utf16() {
-                v.extend_from_slice(&if le { u.to_le_bytes() } else { u.to_be_bytes() });
+                out.extend_from_slice(&if le { u.to_le_bytes() } else { u.to_be_bytes() });
             }
-            v
         }
         Encoding::Windows1252 => {
-            let mut v = Vec::with_capacity(text.len());
+            out.reserve(text.len());
             for c in text.chars() {
-                let cp = c as u32;
-                let b = if cp < 0x80 || (0xA0..=0xFF).contains(&cp) {
-                    cp as u8
-                } else if let Some(i) = CP1252_HIGH.iter().position(|&u| u as u32 == cp) {
-                    0x80 + i as u8
-                } else {
-                    return Err(c);
-                };
-                v.push(b);
+                out.push(to_cp1252(c).ok_or(c)?);
             }
-            v
         }
-    })
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn encode(text: &str, enc: Encoding) -> Result<Vec<u8>, char> {
+    let mut v = bom(enc).to_vec();
+    encode_into(&mut v, text, enc)?;
+    Ok(v)
+}
+
+/// The first character in `rope` that `enc` can't store, if any.
+pub fn unencodable(rope: &Rope, enc: Encoding) -> Option<char> {
+    match enc {
+        Encoding::Windows1252 => rope.chunks().flat_map(str::chars).find(|&c| to_cp1252(c).is_none()),
+        _ => None,
+    }
+}
+
+/// Writes `rope` with `\n` turned into `eol`, encoded as `enc` (which must be
+/// able to store every character; see [`unencodable`]). Reports progress in bytes of text.
+pub fn write_text(w: &mut dyn Write, rope: &Rope, eol: Eol, enc: Encoding, progress: &dyn Fn(u64)) -> io::Result<()> {
+    w.write_all(bom(enc))?;
+    let eol = eol.as_str();
+    let mut out = Vec::new();
+    let mut done = 0u64;
+    for chunk in rope.chunks() {
+        let replaced;
+        let text = if eol == "\n" || !chunk.contains('\n') {
+            chunk
+        } else {
+            replaced = chunk.replace('\n', eol);
+            &replaced
+        };
+        if matches!(enc, Encoding::Utf8 | Encoding::Utf8Bom) {
+            w.write_all(text.as_bytes())?;
+        } else {
+            out.clear();
+            encode_into(&mut out, text, enc).map_err(|c| io::Error::other(format!("'{c}' can't be encoded")))?;
+            w.write_all(&out)?;
+        }
+        done += chunk.len() as u64;
+        progress(done);
+    }
+    Ok(())
+}
+
+/// What happened when a document was saved.
+pub struct SaveOutcome {
+    pub result: io::Result<()>,
+    /// The encoding actually used.
+    pub encoding: Encoding,
+    /// A character the requested encoding couldn't store, so UTF-8 was used instead.
+    pub fell_back: Option<char>,
+}
+
+/// Saves a document's text to `path` (see [`save_with`]).
+pub fn save_rope(path: &Path, rope: &Rope, eol: Eol, enc: Encoding, progress: &dyn Fn(u64)) -> SaveOutcome {
+    let fell_back = unencodable(rope, enc);
+    let encoding = if fell_back.is_some() { Encoding::Utf8 } else { enc };
+    let result = save_with(path, &mut |w| write_text(w, rope, eol, encoding, progress));
+    SaveOutcome { result, encoding, fell_back }
 }
 
 /// Receives decoded text in pieces, counts and normalises line endings
@@ -318,11 +388,16 @@ pub fn load_from<R: Read + Seek>(mut r: R) -> io::Result<Loaded> {
 }
 
 pub fn load(path: &Path) -> io::Result<Loaded> {
-    // Opening a FIFO would block the UI forever, and a device such as /dev/zero never ends.
+    load_from(open_regular(path)?)
+}
+
+/// Opens a file for reading, refusing anything but a regular file: opening a
+/// FIFO would block forever, and a device such as /dev/zero never ends.
+pub fn open_regular(path: &Path) -> io::Result<fs::File> {
     if !fs::metadata(path)?.is_file() {
         return Err(io::Error::other("not a regular file"));
     }
-    load_from(fs::File::open(path)?)
+    fs::File::open(path)
 }
 
 /// A hard-to-guess number for temporary file names. Not cryptographic; the
@@ -351,10 +426,21 @@ pub fn create_private(dir: &Path, prefix: &str, suffix: &str) -> io::Result<(Pat
     Err(io::Error::new(io::ErrorKind::AlreadyExists, "could not create a temporary file"))
 }
 
-fn write_in_place(target: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Produces a file's contents.
+type Writer<'a> = dyn FnMut(&mut dyn Write) -> io::Result<()> + 'a;
+
+/// Runs `write` into `file` through a buffer, then flushes it all to disk.
+fn fill(file: &mut fs::File, write: &mut Writer) -> io::Result<()> {
+    let mut w = io::BufWriter::with_capacity(256 * 1024, &mut *file);
+    write(&mut w)?;
+    w.flush()?;
+    drop(w);
+    file.sync_all()
+}
+
+fn write_in_place(target: &Path, write: &mut Writer) -> io::Result<()> {
     let mut f = fs::OpenOptions::new().write(true).create(true).truncate(true).open(target)?;
-    f.write_all(bytes)?;
-    f.sync_all()
+    fill(&mut f, write)
 }
 
 /// Replacing the file by renaming over it would change something about it:
@@ -370,30 +456,36 @@ fn must_write_in_place(_: &fs::Metadata, _: &fs::File) -> bool {
     false
 }
 
-/// Saves `bytes` to `path`. An existing file is replaced atomically: the data
-/// goes to a private temp file next to it, which is flushed to disk and then
-/// renamed over the original, so a failed save (disk full, crash) never leaves
-/// a truncated file. Symlinks are resolved so the link itself is kept, and the
-/// original's permissions are copied. Files with extra hard links or another
-/// owner are written in place instead, so they keep their identity.
+#[cfg(test)]
 pub fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    save_with(path, &mut |w| w.write_all(bytes))
+}
+
+/// Saves what `write` produces to `path`. An existing file is replaced
+/// atomically: the data goes to a private temp file next to it, which is
+/// flushed to disk and then renamed over the original, so a failed save (disk
+/// full, crash) never leaves a truncated file. Symlinks are resolved so the
+/// link itself is kept, and the original's permissions are copied. Files with
+/// extra hard links or another owner are written in place instead, so they
+/// keep their identity.
+pub fn save_with(path: &Path, write: &mut Writer) -> io::Result<()> {
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let Ok(meta) = fs::metadata(&target) else {
         // New file: create it directly so it gets the usual default permissions.
-        return write_in_place(&target, bytes);
+        return write_in_place(&target, write);
     };
     let dir = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let Ok((tmp, mut file)) = create_private(dir, &format!(".{name}."), ".plainpad-tmp") else {
         // The directory isn't writable (but the file may be).
-        return write_in_place(&target, bytes);
+        return write_in_place(&target, write);
     };
     if must_write_in_place(&meta, &file) {
         drop(file);
         let _ = fs::remove_file(&tmp);
-        return write_in_place(&target, bytes);
+        return write_in_place(&target, write);
     }
-    let written = file.write_all(bytes).and_then(|_| file.sync_all());
+    let written = fill(&mut file, write);
     drop(file);
     if let Err(e) = written {
         // Never fall back to writing in place here: that would truncate the original.
@@ -552,6 +644,35 @@ mod tests {
         fs::remove_file(&p).unwrap();
         fs::create_dir(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn save_streams_the_rope() {
+        let d = tmpdir();
+        let f = d.join("s.txt");
+        // Many chunks, so line endings are converted across chunk boundaries.
+        let text: String = (0..5000).map(|i| format!("line {i} é€\n")).collect();
+        let rope = Rope::from_str(&text);
+        for (eol, enc) in [(Eol::CrLf, Encoding::Utf8), (Eol::Lf, Encoding::Utf16Be), (Eol::Cr, Encoding::Windows1252)]
+        {
+            let last = std::cell::Cell::new(0);
+            let out = save_rope(&f, &rope, eol, enc, &|d| last.set(d));
+            out.result.unwrap();
+            assert_eq!((out.encoding, out.fell_back), (enc, None));
+            assert_eq!(last.get(), text.len() as u64);
+            let want = encode(&text.replace('\n', eol.as_str()), enc).unwrap();
+            assert_eq!(fs::read(&f).unwrap(), want, "{eol:?} {enc:?}");
+            let back = load(&f).unwrap();
+            assert_eq!(back.rope, rope);
+            assert_eq!(back.eol, eol);
+        }
+        // A character Windows-1252 can't store: saved as UTF-8 instead, and said so.
+        let rope = Rope::from_str("ok 日本");
+        let out = save_rope(&f, &rope, Eol::Lf, Encoding::Windows1252, &|_| {});
+        out.result.unwrap();
+        assert_eq!((out.encoding, out.fell_back), (Encoding::Utf8, Some('日')));
+        assert_eq!(fs::read_to_string(&f).unwrap(), "ok 日本");
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

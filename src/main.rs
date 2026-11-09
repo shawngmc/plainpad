@@ -6,6 +6,7 @@ mod doc;
 mod document;
 mod gfx;
 mod input;
+mod jobs;
 mod launch;
 mod linkcheck;
 mod mem;
@@ -62,7 +63,7 @@ mod wayland {
     }
 }
 
-use cosmic_text::{Buffer, Cursor, Metrics, Motion, Shaping, Wrap};
+use cosmic_text::{Buffer, Metrics, Motion, Shaping, Wrap};
 use doc::{Encoding, Eol, Settings};
 use gfx::{Canvas, Gfx, Rect, Theme};
 use std::num::NonZeroU32;
@@ -123,6 +124,8 @@ enum Pending {
     Reload(u64),
     /// The tab's file changed on disk since it was loaded: overwrite it when saving?
     Overwrite(u64),
+    /// Open this very large file if the user confirms.
+    OpenLarge(PathBuf),
 }
 
 fn next_tab_id() -> u64 {
@@ -358,6 +361,8 @@ struct App {
     snapshots: std::collections::HashSet<u64>,
     /// When the next autosave snapshot is due (the event loop sleeps until then).
     autosave_at: Option<Instant>,
+    /// Loading, saving and searching big documents in the background.
+    jobs: jobs::Jobs,
     /// The window currently being handled.
     win: Win,
     /// All other windows.
@@ -385,6 +390,7 @@ impl App {
             recovery: recovery::Recovery::start(),
             snapshots: Default::default(),
             autosave_at: None,
+            jobs: Default::default(),
             pastes: Vec::new(),
             paste_results: PasteResults::default(),
             next_paste: 0,
@@ -423,16 +429,23 @@ impl App {
             return;
         }
         self.autosave_check();
-        // Sleep until the autosave is due, or indefinitely if nothing is pending.
-        el.set_control_flow(match self.autosave_at {
-            Some(t) => ControlFlow::WaitUntil(t),
-            None => ControlFlow::Wait,
-        });
         if let Some(sp) = self.spawn.take() {
             let mut win = Win::new(vec![sp.tab]);
             self.open_window(el, &mut win, sp.pos, Some(sp.size));
             self.others.push(win);
         }
+        self.cancel_orphan_jobs();
+        // While background work runs, redraw its progress now and then.
+        if self.jobs.is_empty() {
+            self.jobs.tick_at = None;
+        } else if self.jobs.tick_at.is_none() {
+            self.jobs.tick_at = Some(Instant::now() + jobs::TICK);
+        }
+        // Sleep until the next timer, or indefinitely if nothing is pending.
+        el.set_control_flow(match self.autosave_at.into_iter().chain(self.jobs.tick_at).min() {
+            Some(t) => ControlFlow::WaitUntil(t),
+            None => ControlFlow::Wait,
+        });
         if std::mem::take(&mut self.win.needs_redraw) {
             self.win.redraw_later();
         }
@@ -477,11 +490,19 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn new_events(&mut self, el: &ActiveEventLoop, cause: winit::event::StartCause) {
-        if let winit::event::StartCause::ResumeTimeReached { .. } = cause
-            && self.autosave_at.is_some_and(|t| Instant::now() >= t)
-        {
-            self.autosave_now();
-            self.after_event(el);
+        if let winit::event::StartCause::ResumeTimeReached { .. } = cause {
+            let now = Instant::now();
+            let autosave = self.autosave_at.is_some_and(|t| now >= t);
+            let tick = self.jobs.tick_at.is_some_and(|t| now >= t);
+            if autosave {
+                self.autosave_now();
+            }
+            if tick {
+                self.tick();
+            }
+            if autosave || tick {
+                self.after_event(el);
+            }
         }
     }
 
@@ -490,6 +511,7 @@ impl ApplicationHandler<UserEvent> for App {
             self.finish_wl_drag(outcome);
         }
         self.finish_pastes();
+        self.finish_jobs();
         // A frame skipped for lack of a free buffer can be drawn now.
         for w in std::iter::once(&mut self.win).chain(self.others.iter_mut()) {
             if std::mem::take(&mut w.redraw_deferred) {

@@ -165,49 +165,6 @@ impl App {
         }
     }
 
-    pub(crate) fn find_next(&mut self, forward: bool) -> bool {
-        let needle = self.win.find.find.text.clone();
-        if needle.is_empty() {
-            self.open_find(false);
-            return false;
-        }
-        let case = self.win.find.case;
-        let cur = self.win.tabs[self.win.active].view.cursor;
-        let (start, end) = self.win.tabs[self.win.active].view.selection().unwrap_or((cur, cur));
-        let doc = &self.win.tabs[self.win.active].view.doc;
-        let n = doc.len_lines();
-        let mut found = None;
-        for k in 0..=n {
-            if forward {
-                let li = (end.line + k) % n;
-                let from = if k == 0 { end.index } else { 0 };
-                if let Some(r) = search::find(&doc.line(li), &needle, case, from) {
-                    found = Some((li, r));
-                    break;
-                }
-            } else {
-                let li = (start.line + n * 2 - k) % n;
-                let hay = doc.line(li);
-                let before = if k == 0 { start.index } else { hay.len() };
-                if let Some(r) = search::rfind(&hay, &needle, case, before) {
-                    found = Some((li, r));
-                    break;
-                }
-            }
-        }
-        match found {
-            Some((li, r)) => {
-                self.win.tabs[self.win.active].view.set_selection(Cursor::new(li, r.start), Cursor::new(li, r.end));
-                self.win.status_msg = None;
-                true
-            }
-            None => {
-                self.win.status_msg = Some(format!("Cannot find \"{needle}\""));
-                false
-            }
-        }
-    }
-
     pub(crate) fn replace_one(&mut self) {
         let needle = self.win.find.find.text.clone();
         let repl = self.win.find.repl.text.clone();
@@ -217,33 +174,6 @@ impl App {
             self.edited();
         }
         self.find_next(true);
-    }
-
-    pub(crate) fn replace_all(&mut self) {
-        let needle = self.win.find.find.text.clone();
-        let repl = self.win.find.repl.text.clone();
-        if needle.is_empty() {
-            return;
-        }
-        let case = self.win.find.case;
-        let doc = &self.win.tabs[self.win.active].view.doc;
-        let mut ranges = Vec::new();
-        for li in 0..doc.len_lines() {
-            let line = doc.line(li);
-            let mut from = 0;
-            while let Some(r) = search::find(&line, &needle, case, from) {
-                from = r.end;
-                ranges.push((Cursor::new(li, r.start), Cursor::new(li, r.end)));
-            }
-        }
-        if ranges.is_empty() {
-            self.win.status_msg = Some(format!("Cannot find \"{needle}\""));
-            return;
-        }
-        self.win.tabs[self.win.active].view.replace_many(&ranges, &repl);
-        crate::mem::trim(); // the match list and removed text were temporary
-        self.edited();
-        self.win.status_msg = Some(format!("Replaced {} occurrence(s)", ranges.len()));
     }
 
     pub(crate) fn find_action(&mut self, a: FindAction) {
@@ -298,10 +228,10 @@ impl App {
                 self.activate(i);
             }
             Cmd::Save => {
-                self.save();
+                self.save(None);
             }
             Cmd::SaveAs => {
-                self.save_as();
+                self.save_as(None);
             }
             Cmd::Rename => self.rename(),
             Cmd::Print => self.print(),

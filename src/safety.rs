@@ -115,6 +115,9 @@ impl App {
         for i in 0..self.win.tabs.len() {
             let t = &self.win.tabs[i];
             let (Some(path), Some(known)) = (t.path.clone(), t.disk) else { continue };
+            if self.busy(t.id) {
+                continue; // being read or written by us right now
+            }
             match stamp(&path) {
                 Some(now) if now == known => {}
                 Some(_) => {
@@ -142,27 +145,6 @@ impl App {
                 None => {}
             }
         }
-    }
-
-    /// Replaces tab `i`'s contents with the file on disk, keeping the cursor and
-    /// scroll position as far as possible.
-    pub(crate) fn reload_tab(&mut self, i: usize) {
-        let Some(path) = self.win.tabs[i].path.clone() else { return };
-        match doc::load(&path) {
-            Ok(l) => {
-                let t = &mut self.win.tabs[i];
-                t.view.reload_document(document::Document::from_rope(l.rope));
-                t.encoding = l.encoding;
-                t.eol = l.eol;
-                t.mixed_eol = l.mixed_eol;
-                t.meta_dirty = false;
-                t.disk = stamp(&path);
-                self.win.status_msg =
-                    Some(format!("Reloaded {} (changed by another program)", self.win.tabs[i].name()));
-            }
-            Err(e) => self.win.status_msg = Some(format!("Could not reload {}: {e}", path.display())),
-        }
-        self.win.needs_redraw = true;
     }
 
     /// Before saving over the tab's file: if it changed on disk since we loaded
@@ -208,7 +190,7 @@ impl App {
                     if let Some(p) = self.win.tabs[i].path.clone() {
                         self.win.tabs[i].disk = stamp(&p);
                     }
-                    self.save();
+                    self.save(None);
                 }
                 true
             }

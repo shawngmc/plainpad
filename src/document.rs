@@ -6,6 +6,7 @@ use cosmic_text::Cursor;
 use ropey::Rope;
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Undo and redo history may use about this much memory together; beyond it the
@@ -137,6 +138,22 @@ impl Document {
         self.rope.clone()
     }
 
+    /// The text, for searching and saving (on this thread; use [`Self::snapshot`] for another).
+    pub fn rope(&self) -> &Rope {
+        &self.rope
+    }
+
+    /// Absolute byte offset of a position.
+    pub fn offset(&self, c: Cursor) -> usize {
+        self.rope.line_to_byte(c.line) + c.index
+    }
+
+    /// The position at an absolute byte offset.
+    pub fn cursor_at(&self, byte: usize) -> Cursor {
+        let line = self.rope.byte_to_line(byte);
+        Cursor::new(line, byte - self.rope.line_to_byte(line))
+    }
+
     fn depth(&self) -> usize {
         self.evicted + self.undo.len()
     }
@@ -185,6 +202,7 @@ impl Document {
     }
 
     /// Whole text with `\n` replaced by `eol`.
+    #[cfg(test)]
     pub fn to_string_eol(&self, eol: &str) -> String {
         let mut s = String::with_capacity(self.rope.len_bytes() + self.len_lines() * (eol.len() - 1));
         for chunk in self.rope.chunks() {
@@ -278,6 +296,7 @@ impl Document {
 
     /// Replaces many non-overlapping single-line ranges (sorted ascending) as one
     /// undo step, stored compactly.
+    #[cfg(test)]
     pub fn replace_many(&mut self, ranges: &[(Cursor, Cursor)], text: &str) {
         if ranges.is_empty() {
             return;
@@ -294,22 +313,17 @@ impl Document {
             self.record(ops, false);
             return;
         }
-        let mut lens = Vec::with_capacity(ranges.len());
-        let mut parts = Vec::with_capacity(ranges.len());
-        for &(a, b) in ranges.iter().rev() {
-            let (removed, _) = self.replace_raw(a, b, &text);
-            lens.push(removed.len() as u32);
-            parts.push(removed);
-        }
-        lens.reverse();
-        parts.reverse();
-        let many = Many {
-            starts: ranges.iter().map(|(a, _)| (a.line, a.index)).collect(),
-            removed: parts.concat(),
-            removed_lens: lens,
-            inserted: text.into_owned(),
-        };
-        self.record(vec![Op::Many(many)], false);
+        let abs: Vec<Range<usize>> = ranges.iter().map(|&(a, b)| self.offset(a)..self.offset(b)).collect();
+        let p = prepare_replace_all(&self.rope, &abs, &text);
+        self.apply_prepared(p);
+    }
+
+    /// Installs a Replace All computed by [`prepare_replace_all`] (possibly on
+    /// another thread, from a snapshot of this exact text).
+    pub fn apply_prepared(&mut self, p: Prepared) {
+        self.version += 1;
+        self.rope = p.rope;
+        self.record(vec![Op::Many(p.many)], false);
     }
 
     /// Reverts one op, returning where the cursor should go.
@@ -318,6 +332,12 @@ impl Document {
             Op::Edit { start, removed, inserted } => {
                 self.replace_raw(*start, end_of(*start, inserted), removed);
                 end_of(*start, removed)
+            }
+            Op::Many(m) if rebuild_pays(m, &self.rope) => {
+                self.version += 1;
+                self.rope = splice_many(&self.rope, m, false);
+                let (l, i) = m.starts[0];
+                Cursor::new(l, i + m.removed_lens[0] as usize)
             }
             Op::Many(m) => {
                 // Restore left to right: everything before each match is then back to
@@ -341,6 +361,12 @@ impl Document {
             Op::Edit { start, removed, inserted } => {
                 self.replace_raw(*start, end_of(*start, removed), inserted);
                 end_of(*start, inserted)
+            }
+            Op::Many(m) if rebuild_pays(m, &self.rope) => {
+                self.version += 1;
+                self.rope = splice_many(&self.rope, m, true);
+                let (l, i) = m.starts[0];
+                Cursor::new(l, i + m.inserted.len())
             }
             Op::Many(m) => {
                 for (&(l, i), &rl) in m.starts.iter().zip(&m.removed_lens).rev() {
@@ -457,6 +483,136 @@ impl Document {
     }
 }
 
+/// A Replace All ready to install: the new text and its undo record.
+pub struct Prepared {
+    rope: Rope,
+    many: Many,
+}
+
+impl Prepared {
+    pub fn count(&self) -> usize {
+        self.many.starts.len()
+    }
+
+    /// Where the first replacement starts.
+    pub fn first(&self) -> Cursor {
+        let (l, i) = self.many.starts[0];
+        Cursor::new(l, i)
+    }
+}
+
+/// Walks forward through a rope once, handing on the text it passes over and
+/// keeping count of lines. Replace All and its undo use it to visit every
+/// match in a single pass, instead of looking each one up in the tree.
+struct Walk<'a> {
+    chunks: ropey::iter::Chunks<'a>,
+    /// The not yet visited part of the current chunk.
+    rest: &'a str,
+    /// Byte offset of `rest`, its line, and where that line starts.
+    pos: usize,
+    line: usize,
+    line_start: usize,
+}
+
+impl<'a> Walk<'a> {
+    fn new(rope: &'a Rope) -> Self {
+        Self { chunks: rope.chunks(), rest: "", pos: 0, line: 0, line_start: 0 }
+    }
+
+    /// The next non-empty piece of text, or None at the end.
+    fn fill(&mut self) -> bool {
+        while self.rest.is_empty() {
+            match self.chunks.next() {
+                Some(c) => self.rest = c,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Moves to byte `to` (a char boundary), handing each piece passed over to `out`.
+    fn advance(&mut self, to: usize, out: &mut dyn FnMut(&'a str)) {
+        while self.pos < to && self.fill() {
+            let (piece, rest) = self.rest.split_at((to - self.pos).min(self.rest.len()));
+            if let Some(k) = piece.rfind('\n') {
+                self.line += piece.bytes().filter(|&b| b == b'\n').count();
+                self.line_start = self.pos + k + 1;
+            }
+            out(piece);
+            self.pos += piece.len();
+            self.rest = rest;
+        }
+    }
+
+    /// Moves to the start of line `l` (unless already on it).
+    fn skip_to_line(&mut self, l: usize, out: &mut dyn FnMut(&'a str)) {
+        while self.line < l && self.fill() {
+            let n = self.rest.find('\n').map_or(self.rest.len(), |k| k + 1);
+            let pos = self.pos + n;
+            self.advance(pos, out);
+        }
+    }
+}
+
+/// Builds the result of replacing every range in `matches` (absolute byte
+/// ranges, ascending, non-overlapping, none containing a line break) with
+/// `text` (no line breaks either), in one pass over the rope. This can run on
+/// a background thread with a snapshot. `matches` must not be empty.
+pub fn prepare_replace_all(rope: &Rope, matches: &[Range<usize>], text: &str) -> Prepared {
+    debug_assert!(!text.contains('\n') && !matches.is_empty());
+    let mut starts = Vec::with_capacity(matches.len());
+    let mut removed = String::new();
+    let mut removed_lens = Vec::with_capacity(matches.len());
+    let mut b = ropey::RopeBuilder::new();
+    let mut w = Walk::new(rope);
+    for r in matches {
+        w.advance(r.start, &mut |p| b.append(p));
+        starts.push((w.line, r.start - w.line_start));
+        w.advance(r.end, &mut |p| removed.push_str(p));
+        b.append(text);
+        removed_lens.push((r.end - r.start) as u32);
+    }
+    w.advance(rope.len_bytes(), &mut |p| b.append(p));
+    removed.shrink_to_fit();
+    let many = Many { starts, removed, removed_lens, inserted: text.to_owned() };
+    Prepared { rope: b.finish(), many }
+}
+
+/// Rebuilding the whole rope beats editing it match by match (each edit is
+/// O(log n) but slow in absolute terms) once there are many matches.
+fn rebuild_pays(m: &Many, rope: &Rope) -> bool {
+    m.starts.len() * 1000 > rope.len_bytes()
+}
+
+/// Applies (`forward`) or reverts a Replace All in one pass, copying the text
+/// between matches into a new rope.
+fn splice_many(rope: &Rope, m: &Many, forward: bool) -> Rope {
+    let mut b = ropey::RopeBuilder::new();
+    let mut w = Walk::new(rope);
+    let ins = m.inserted.len();
+    let (mut off, mut prev_line, mut shift) = (0, usize::MAX, 0isize);
+    for (&(l, i), &rl) in m.starts.iter().zip(&m.removed_lens) {
+        let rl = rl as usize;
+        w.skip_to_line(l, &mut |p| b.append(p));
+        if l != prev_line {
+            (prev_line, shift) = (l, 0);
+        }
+        // Positions are in the original text. In the replaced text (when
+        // reverting), earlier matches on the same line have shifted this one.
+        let at = (w.line_start + i).wrapping_add_signed(shift);
+        let (old_len, new) = if forward { (rl, &m.inserted[..]) } else { (ins, &m.removed[off..off + rl]) };
+        w.advance(at, &mut |p| b.append(p));
+        b.append(new);
+        w.advance(at + old_len, &mut |_| {});
+        if !forward {
+            shift += ins as isize - rl as isize;
+        }
+        off += rl;
+    }
+    w.advance(rope.len_bytes(), &mut |p| b.append(p));
+    b.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,6 +708,26 @@ mod tests {
         assert!(d.is_dirty());
         assert_eq!(d.len_lines(), 1);
         assert_eq!(d.line_len(0), (40 - steps) * chunk.len());
+    }
+
+    #[test]
+    fn replace_all_undo_both_ways() {
+        // Few matches in a long text are undone match by match; many in a short
+        // one by rebuilding the rope. Both must restore the text exactly.
+        for filler in ["", &"-".repeat(20_000)] {
+            let text = format!("Ab ab{filler}\nx AB ab ab\n{filler}ab");
+            let mut d = Document::new(&text);
+            let abs: Vec<_> = text.match_indices(['a', 'A']).map(|(i, _)| i..i + 2).collect();
+            let p = prepare_replace_all(d.rope(), &abs, "Q");
+            assert_eq!(p.count(), 6);
+            d.apply_prepared(p);
+            let after = text.replace("Ab", "Q").replace("ab", "Q").replace("AB", "Q");
+            assert_eq!(d.to_string_eol("\n"), after);
+            assert_eq!(d.undo(), Some(c(0, 2)));
+            assert_eq!(d.to_string_eol("\n"), text);
+            d.redo();
+            assert_eq!(d.to_string_eol("\n"), after);
+        }
     }
 
     #[test]

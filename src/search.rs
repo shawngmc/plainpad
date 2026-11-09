@@ -1,5 +1,7 @@
 //! Plain-text search and URL detection within a single line.
 
+use ropey::Rope;
+use std::borrow::Cow;
 use std::ops::Range;
 
 /// Finds the first match of `needle` in `hay` starting at byte `from`.
@@ -12,7 +14,38 @@ pub fn find(hay: &str, needle: &str, case: bool, from: usize) -> Option<Range<us
         return hay[from..].find(needle).map(|i| from + i..from + i + needle.len());
     }
     let n: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    hay[from..].char_indices().find_map(|(i, _)| match_at(&hay[from + i..], &n).map(|len| from + i..from + i + len))
+    find_nocase(hay, &n, from)
+}
+
+/// Case-insensitive search. Only positions whose character could start a match
+/// are tried: for an ASCII first letter that is a quick byte comparison, plus a
+/// check of each non-ASCII character (a few, such as the Kelvin sign, lowercase
+/// to ASCII letters).
+fn find_nocase(hay: &str, lower: &[char], from: usize) -> Option<Range<usize>> {
+    let first = lower[0];
+    let try_at = |i: usize| match_at(&hay[i..], lower).map(|len| i..i + len);
+    if first.is_ascii() {
+        let (lo, up) = (first as u8, first.to_ascii_uppercase() as u8);
+        let b = hay.as_bytes();
+        let mut i = from;
+        while i < b.len() {
+            let c = b[i];
+            if (c == lo || c == up || (c >= 0xC0 && starts_lower(&hay[i..], first)))
+                && let Some(r) = try_at(i)
+            {
+                return Some(r);
+            }
+            i += 1;
+        }
+        None
+    } else {
+        hay[from..].char_indices().map(|(i, _)| from + i).filter(|&i| starts_lower(&hay[i..], first)).find_map(try_at)
+    }
+}
+
+/// Whether the first character of `s` lowercases to something starting with `first`.
+fn starts_lower(s: &str, first: char) -> bool {
+    s.chars().next().and_then(|c| c.to_lowercase().next()) == Some(first)
 }
 
 /// Finds the last match of `needle` in `hay` that ends at or before byte `before`.
@@ -25,7 +58,156 @@ pub fn rfind(hay: &str, needle: &str, case: bool, before: usize) -> Option<Range
         return hay[..before].rfind(needle).map(|i| i..i + needle.len());
     }
     let n: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    hay[..before].char_indices().rev().find_map(|(i, _)| match_at(&hay[i..before], &n).map(|len| i..i + len))
+    hay[..before]
+        .char_indices()
+        .rev()
+        .filter(|&(i, _)| starts_lower(&hay[i..], n[0]))
+        .find_map(|(i, _)| match_at(&hay[i..before], &n).map(|len| i..i + len))
+}
+
+// ---------------------------------------------------------------- whole documents
+
+/// The document is searched in windows of about this many bytes.
+#[cfg(not(test))]
+fn window() -> usize {
+    1 << 20
+}
+
+// Tests can make windows tiny, to cross many window boundaries.
+#[cfg(test)]
+thread_local!(static TEST_WINDOW: std::cell::Cell<usize> = const { std::cell::Cell::new(1 << 20) });
+#[cfg(test)]
+fn window() -> usize {
+    TEST_WINDOW.with(|w| w.get())
+}
+
+/// A search over a whole rope, in absolute byte offsets. Matches never span
+/// lines: the find field can't contain a line break.
+pub struct Query {
+    needle: String,
+    case: bool,
+    /// The longest a match can be in the text, in bytes, so windows overlap enough.
+    max_len: usize,
+}
+
+impl Query {
+    pub fn new(needle: &str, case: bool) -> Self {
+        let max_len = if case { needle.len() } else { needle.chars().flat_map(char::to_lowercase).count() * 4 };
+        Self { needle: needle.to_owned(), case, max_len }
+    }
+}
+
+/// Rounds a byte offset down to a char boundary.
+fn floor_char(rope: &Rope, i: usize) -> usize {
+    rope.char_to_byte(rope.byte_to_char(i.min(rope.len_bytes())))
+}
+
+/// The text from `a` to `b` (both char boundaries), borrowed when it's one rope chunk.
+fn text(rope: &Rope, a: usize, b: usize) -> Cow<'_, str> {
+    rope.byte_slice(a..b).into()
+}
+
+/// The first match starting in `from..to`. `more(done)` reports progress (bytes
+/// searched) and returns false to give up.
+pub fn find_forward(
+    rope: &Rope,
+    q: &Query,
+    from: usize,
+    to: usize,
+    more: &mut dyn FnMut(usize) -> bool,
+) -> Option<Range<usize>> {
+    let len = rope.len_bytes();
+    let mut pos = floor_char(rope, from);
+    while pos < to {
+        let end = floor_char(rope, (pos + window()).min(to)).max(floor_char(rope, pos + 4).min(to));
+        let stop = floor_char(rope, (end + q.max_len).min(len));
+        let t = text(rope, pos, stop);
+        if let Some(r) = find(&t, &q.needle, q.case, 0)
+            && pos + r.start < end
+        {
+            return Some(pos + r.start..pos + r.end);
+        }
+        pos = end;
+        if !more(pos) {
+            return None;
+        }
+    }
+    None
+}
+
+/// The last match that ends at or before `before`.
+pub fn find_backward(
+    rope: &Rope,
+    q: &Query,
+    before: usize,
+    more: &mut dyn FnMut(usize) -> bool,
+) -> Option<Range<usize>> {
+    let mut end = floor_char(rope, before);
+    let mut done = 0;
+    while end > 0 {
+        let start = floor_char(rope, end.saturating_sub(window()));
+        // Reach back far enough to see a match that crosses `start`.
+        let from = floor_char(rope, start.saturating_sub(q.max_len));
+        let t = text(rope, from, end);
+        if let Some(r) = rfind(&t, &q.needle, q.case, t.len()) {
+            return Some(from + r.start..from + r.end);
+        }
+        done += end - start;
+        end = start;
+        if !more(done) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Find Next / Find Previous from byte `at`, wrapping around the end of the document.
+pub fn find_wrapping(
+    rope: &Rope,
+    q: &Query,
+    at: usize,
+    forward: bool,
+    more: &mut dyn FnMut(usize) -> bool,
+) -> Option<Range<usize>> {
+    let len = rope.len_bytes();
+    if forward {
+        let mut wrapped = |d: usize| more(d);
+        find_forward(rope, q, at, len, &mut wrapped).or_else(|| {
+            let mut wrapped = |d: usize| more(len - at + d);
+            find_forward(rope, q, 0, at, &mut wrapped)
+        })
+    } else {
+        find_backward(rope, q, at, more).or_else(|| {
+            let mut wrapped = |d: usize| more(at + d);
+            find_backward(rope, q, len, &mut wrapped).filter(|r| r.end > at)
+        })
+    }
+}
+
+/// Every match, left to right and not overlapping. None if `more` gave up.
+pub fn find_all(rope: &Rope, q: &Query, more: &mut dyn FnMut(usize) -> bool) -> Option<Vec<Range<usize>>> {
+    let len = rope.len_bytes();
+    let mut found = Vec::new();
+    let (mut pos, mut next) = (0, 0);
+    while pos < len {
+        let end = floor_char(rope, (pos + window()).min(len)).max(floor_char(rope, pos + 4).min(len));
+        let stop = floor_char(rope, (end + q.max_len).min(len));
+        let t = text(rope, pos, stop);
+        let mut from = next.max(pos) - pos;
+        while let Some(r) = find(&t, &q.needle, q.case, from) {
+            if pos + r.start >= end {
+                break;
+            }
+            from = r.end;
+            next = pos + r.end;
+            found.push(pos + r.start..pos + r.end);
+        }
+        pos = end;
+        if !more(pos) {
+            return None;
+        }
+    }
+    Some(found)
 }
 
 /// Rounds a byte offset down to a char boundary, so a stale offset can't panic.
@@ -154,5 +336,53 @@ mod tests {
         // Offsets inside a multi-byte char are rounded down instead of panicking.
         assert_eq!(find("éa", "a", true, 1), Some(2..3));
         assert_eq!(rfind("éa", "é", true, 1), None);
+    }
+
+    /// Every match by brute force, per line (the old way), as absolute byte ranges.
+    fn naive_all(text: &str, needle: &str, case: bool) -> Vec<Range<usize>> {
+        let mut out = Vec::new();
+        let mut base = 0;
+        for line in text.split('\n') {
+            let mut from = 0;
+            while let Some(r) = find(line, needle, case, from) {
+                from = r.end;
+                out.push(base + r.start..base + r.end);
+            }
+            base += line.len() + 1;
+        }
+        out
+    }
+
+    fn sample() -> String {
+        // Mixed scripts, multi-byte characters and case variants, across many 64-byte windows.
+        let parts = ["fox ", "FOX ", "Fox\n", "ÄBC äbc ", "\u{212A}elvin ", "日本語 ", "x", "İstanbul ", "fo", "x\n"];
+        (0..400).map(|i| parts[(i * 7 + i / 3) % parts.len()]).collect()
+    }
+
+    #[test]
+    fn whole_document_search_matches_line_search() {
+        TEST_WINDOW.with(|w| w.set(64));
+        let text = sample();
+        let rope = Rope::from_str(&text);
+        let mut go = |_: usize| true;
+        let cases =
+            [("fox", false), ("fox", true), ("äbc", false), ("kelvin", false), ("日本", true), ("i\u{307}stan", false)];
+        for (needle, case) in cases {
+            let q = Query::new(needle, case);
+            let want = naive_all(&text, needle, case);
+            assert!(!want.is_empty(), "{needle}");
+            assert_eq!(find_all(&rope, &q, &mut go).unwrap(), want, "{needle} {case}");
+            // Find Next from each match lands on the next one, wrapping; Find Previous likewise.
+            for (k, r) in want.iter().enumerate() {
+                let next = &want[(k + 1) % want.len()];
+                assert_eq!(find_wrapping(&rope, &q, r.end, true, &mut go).as_ref(), Some(next), "{needle} next");
+                let prev = &want[(k + want.len() - 1) % want.len()];
+                assert_eq!(find_wrapping(&rope, &q, r.start, false, &mut go).as_ref(), Some(prev), "{needle} prev");
+            }
+        }
+        // A cancelled search reports nothing; a missing needle finds nothing.
+        assert_eq!(find_all(&rope, &Query::new("fox", false), &mut |_| false), None);
+        assert_eq!(find_wrapping(&rope, &Query::new("zzz", false), 10, true, &mut go), None);
+        assert_eq!(find_wrapping(&rope, &Query::new("zzz", false), 10, false, &mut go), None);
     }
 }

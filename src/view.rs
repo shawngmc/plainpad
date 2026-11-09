@@ -78,6 +78,8 @@ pub struct View {
     attrs: AttrsList,
     vis_rows: usize,
     geom: Option<(f32, f32, f32, f32, bool)>,
+    /// Refuse edits (while the document is loaded, saved or replaced in the background).
+    pub read_only: bool,
 }
 
 impl View {
@@ -96,6 +98,7 @@ impl View {
             attrs: AttrsList::new(&font_attrs(family)),
             vis_rows: 40,
             geom: None,
+            read_only: false,
         };
         v.load_window((0, 0), 0.0, false);
         v
@@ -471,6 +474,9 @@ impl View {
     }
 
     pub fn replace_selection(&mut self, text: &str, merge: bool) {
+        if self.read_only {
+            return;
+        }
         let (a, b) = self.selection().unwrap_or((self.cursor, self.cursor));
         let r = self.doc.replace(a, b, text, merge);
         self.after_edit(r);
@@ -497,6 +503,9 @@ impl View {
     }
 
     pub fn backspace(&mut self) {
+        if self.read_only {
+            return;
+        }
         if self.selection().is_some() {
             return self.delete_selection();
         }
@@ -508,6 +517,9 @@ impl View {
     }
 
     pub fn delete(&mut self) {
+        if self.read_only {
+            return;
+        }
         if self.selection().is_some() {
             return self.delete_selection();
         }
@@ -519,6 +531,9 @@ impl View {
     }
 
     pub fn delete_word(&mut self, fs: &mut FontSystem, forward: bool) {
+        if self.read_only {
+            return;
+        }
         if self.selection().is_some() {
             return self.delete_selection();
         }
@@ -533,6 +548,9 @@ impl View {
     }
 
     pub fn undo(&mut self) {
+        if self.read_only {
+            return;
+        }
         if let Some(c) = self.doc.undo() {
             self.reload();
             self.place_cursor(c);
@@ -540,15 +558,19 @@ impl View {
     }
 
     pub fn redo(&mut self) {
+        if self.read_only {
+            return;
+        }
         if let Some(c) = self.doc.redo() {
             self.reload();
             self.place_cursor(c);
         }
     }
 
-    pub fn replace_many(&mut self, ranges: &[(Cursor, Cursor)], text: &str) {
-        let Some(&(first, _)) = ranges.first() else { return };
-        self.doc.replace_many(ranges, text);
+    /// Installs a Replace All result.
+    pub fn apply_prepared(&mut self, p: crate::document::Prepared) {
+        let first = p.first();
+        self.doc.apply_prepared(p);
         self.reload();
         self.place_cursor(first);
     }

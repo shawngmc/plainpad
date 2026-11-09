@@ -50,23 +50,7 @@ impl App {
             self.activate(i);
             return;
         }
-        match doc::load(&path) {
-            Ok(l) => {
-                let i = if self.tab().is_pristine() { self.win.active } else { self.new_tab() };
-                let t = &mut self.win.tabs[i];
-                t.view.set_document(document::Document::from_rope(l.rope));
-                t.encoding = l.encoding;
-                t.eol = l.eol;
-                t.mixed_eol = l.mixed_eol;
-                t.meta_dirty = false;
-                t.disk = safety::stamp(&path);
-                t.path = Some(path);
-                self.activate(i);
-                self.win.status_msg =
-                    l.mixed_eol.then(|| format!("Mixed line endings; will be saved as {}", l.eol.label()));
-            }
-            Err(e) => self.win.status_msg = Some(format!("Could not open {}: {e}", path.display())),
-        }
+        self.open_new(path, false);
     }
 
     pub(crate) fn dialog(&self) -> rfd::FileDialog {
@@ -86,53 +70,31 @@ impl App {
         }
     }
 
-    pub(crate) fn save(&mut self) -> bool {
+    /// Saves the active tab (asking for a name if it has none). `then`
+    /// continues a close or exit once the save is done.
+    pub(crate) fn save(&mut self, then: Option<Pending>) -> jobs::Saving {
         match self.tab().path.clone() {
             // If the file changed on disk meanwhile, ask before overwriting it.
-            Some(p) => self.confirm_overwrite() && self.save_to(p),
-            None => self.save_as(),
+            Some(p) if self.confirm_overwrite() => self.save_to(p, then),
+            Some(_) => jobs::Saving::Failed,
+            None => self.save_as(then),
         }
     }
 
-    pub(crate) fn save_as(&mut self) -> bool {
+    pub(crate) fn save_as(&mut self, then: Option<Pending>) -> jobs::Saving {
         let name = self.tab().path.as_ref().map_or("Untitled.txt".into(), |_| self.doc_name());
         match self.dialog().set_title("Save As").set_file_name(name).save_file() {
-            Some(p) => self.save_to(p),
-            None => false,
-        }
-    }
-
-    pub(crate) fn save_to(&mut self, path: PathBuf) -> bool {
-        let t = &mut self.win.tabs[self.win.active];
-        let text = t.view.doc.to_string_eol(t.eol.as_str());
-        let bytes = match doc::encode(&text, t.encoding) {
-            Ok(b) => b,
-            Err(c) => {
-                self.win.status_msg =
-                    Some(format!("'{c}' can't be stored as {}; saved as UTF-8 instead", t.encoding.label()));
-                t.encoding = Encoding::Utf8;
-                text.into_bytes()
-            }
-        };
-        match doc::save(&path, &bytes) {
-            Ok(()) => {
-                t.disk = safety::stamp(&path);
-                t.path = Some(path);
-                t.view.doc.mark_saved();
-                t.meta_dirty = false;
-                t.mixed_eol = false;
-                true
-            }
-            Err(e) => {
-                self.win.status_msg = Some(format!("Could not save: {e}"));
-                false
-            }
+            Some(p) => self.save_to(p, then),
+            None => jobs::Saving::Failed,
         }
     }
 
     pub(crate) fn rename(&mut self) {
+        if self.busy(self.tab().id) {
+            return;
+        }
         let Some(old) = self.tab().path.clone().filter(|p| p.exists()) else {
-            self.save_as();
+            self.save_as(None);
             return;
         };
         let Some(new) = self.dialog().set_title("Rename").set_file_name(self.doc_name()).save_file() else {
@@ -152,6 +114,9 @@ impl App {
     }
 
     pub(crate) fn print(&mut self) {
+        if self.opening(self.tab().id).is_some() {
+            return;
+        }
         let title = self.doc_name();
         let doc = &self.win.tabs[self.win.active].view.doc;
         let line = |i: usize| doc.line(i).into_owned();
@@ -176,7 +141,7 @@ impl App {
     }
 
     /// Clears every pending "Don't Save" and "closing" mark, abandoning a close or exit.
-    fn abandon_close(&mut self) {
+    pub(crate) fn abandon_close(&mut self) {
         for t in self.win.tabs.iter_mut().chain(self.others.iter_mut().flat_map(|w| w.tabs.iter_mut())) {
             t.discard = false;
             t.closing = false;
@@ -201,6 +166,10 @@ impl App {
 
     /// Closes tab `i`, first asking to save it unless `force`. Returns true if it closed.
     pub(crate) fn close_tab(&mut self, i: usize, force: bool) -> bool {
+        if self.saving(self.win.tabs[i].id) {
+            self.win.status_msg = Some(format!("Wait for {} to finish saving", self.win.tabs[i].name()));
+            return false;
+        }
         if !force && self.win.tabs[i].is_dirty() {
             self.activate(i);
             self.ask_save(Pending::Close(self.win.tabs[i].id));
@@ -234,6 +203,9 @@ impl App {
     /// Quits once every modified tab in every window has been saved or
     /// discarded, asking about each in turn (switching windows as needed).
     pub(crate) fn request_exit(&mut self) {
+        if !self.saves_finished() {
+            return; // asked again when they have
+        }
         if self.win.tabs.iter().all(|t| !t.needs_save())
             && let Some(k) = self.others.iter().position(|w| w.tabs.iter().any(Tab::needs_save))
         {
@@ -254,6 +226,10 @@ impl App {
     /// Closes the current window once its modified tabs are saved or discarded.
     /// Closing the last window quits.
     pub(crate) fn request_close_window(&mut self) {
+        if let Some(t) = self.win.tabs.iter().find(|t| self.saving(t.id)) {
+            self.win.status_msg = Some(format!("Wait for {} to finish saving", t.name()));
+            return;
+        }
         match self.win.tabs.iter().position(Tab::needs_save) {
             Some(i) => {
                 self.activate(i);
@@ -284,6 +260,12 @@ impl App {
         if self.choose_disk(c, &pending) {
             return;
         }
+        if let Pending::OpenLarge(path) = pending {
+            if c == Choice::Open {
+                self.open_new(path, true);
+            }
+            return;
+        }
         if let Pending::OpenLink(url) = pending {
             if c == Choice::Open
                 && let Err(e) = launch::open_url(&url)
@@ -300,25 +282,33 @@ impl App {
         self.activate(i);
         match c {
             Choice::Open | Choice::Reload | Choice::Keep | Choice::Overwrite => {}
-            // A failed or cancelled save stops the close or exit, like Cancel.
-            Choice::Save if !self.save() => self.abandon_close(),
-            Choice::Save | Choice::Discard => {
-                if c == Choice::Discard {
-                    self.win.tabs[i].discard = true;
-                }
-                match pending {
-                    Pending::Close(id) => {
-                        if let Some(i) = self.win.tab_pos(id) {
-                            self.close_tab(i, true);
-                        }
-                    }
-                    Pending::CloseWindow => self.request_close_window(),
-                    Pending::Exit => self.request_exit(),
-                    Pending::CloseMarked => self.close_marked(),
-                    Pending::OpenLink(_) | Pending::Reload(_) | Pending::Overwrite(_) => {}
-                }
+            // A failed or cancelled save stops the close or exit, like Cancel. A save
+            // running in the background carries on with it once it's done.
+            Choice::Save => match self.save(Some(pending.clone())) {
+                jobs::Saving::Done => self.continue_pending(pending),
+                jobs::Saving::Failed => self.abandon_close(),
+                jobs::Saving::Started => {}
+            },
+            Choice::Discard => {
+                self.win.tabs[i].discard = true;
+                self.continue_pending(pending);
             }
             Choice::Cancel => self.abandon_close(),
+        }
+    }
+
+    /// Carries on with a close or exit after a tab was saved or discarded.
+    pub(crate) fn continue_pending(&mut self, pending: Pending) {
+        match pending {
+            Pending::Close(id) => {
+                if let Some(i) = self.win.tab_pos(id) {
+                    self.close_tab(i, true);
+                }
+            }
+            Pending::CloseWindow => self.request_close_window(),
+            Pending::Exit => self.request_exit(),
+            Pending::CloseMarked => self.close_marked(),
+            Pending::OpenLink(_) | Pending::Reload(_) | Pending::Overwrite(_) | Pending::OpenLarge(_) => {}
         }
     }
 

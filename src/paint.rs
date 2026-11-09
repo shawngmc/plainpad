@@ -38,7 +38,8 @@ impl App {
         let show_caret = self.win.focused
             && !(self.win.find.visible && self.win.find.focus)
             && self.win.prompt.is_none()
-            && self.win.font_dlg.is_none();
+            && self.win.font_dlg.is_none()
+            && self.opening(self.win.tabs[self.win.active].id).is_none();
         self.win.tabs[self.win.active].view.prepare(&mut self.gfx.fs);
         let caret = self.win.tabs[self.win.active].view.draw(
             &mut self.gfx.fs,
@@ -51,6 +52,14 @@ impl App {
             self.win.hover_url.as_ref(),
         );
         self.win.caret = caret.map(|(x, y, h)| (x, y + h));
+        // A file still being read: say so where its text will appear.
+        let tab = &self.win.tabs[self.win.active];
+        if let Some(p) = self.opening(tab.id) {
+            let msg = format!("Opening {}… {p}%", tab.name());
+            cv.set_clip(area);
+            self.gfx.text(cv, &msg, area.x + pad, area.y + pad, th.dim);
+            cv.reset_clip();
+        }
         if let Some((x, y, h)) = caret {
             cv.set_clip(area);
             if !self.win.preedit.is_empty() {
@@ -93,7 +102,9 @@ impl App {
         });
         let mut warn = false;
         let key = if MAC { "Cmd" } else { "Ctrl" };
+        let job = self.job_status(self.win.tabs[self.win.active].id);
         let left = match (&self.win.status_msg, hovered) {
+            _ if job.is_some() => job.unwrap_or_default(),
             (Some(m), _) => m.clone(),
             (None, _) if self.paste_pending_here() => "Pasting…".to_owned(),
             (None, Some(info)) if info.suspicious() => {

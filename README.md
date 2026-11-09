@@ -30,6 +30,10 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
   the command line; each opens in its own tab.
 - Saving writes a temporary file, flushes it to disk and renames it over the original, so a failed save (disk
   full, crash) never truncates your file. Symlinks, permissions and hard links are kept.
+- Big files never freeze the window. Opening, reloading, saving, Find and Replace All on a document of 4 MB or
+  more run in the background, with progress in the status bar, while you keep using other tabs and windows.
+  The document is read-only until it has loaded, and while it's being saved or replaced; quitting waits for
+  saves in progress. Opening a file of 1 GB or more asks first.
 - Closing a tab with unsaved changes asks whether to save it. Closing a window asks about each of its modified
   tabs, and Exit asks about every modified tab in every window, in turn. Cancel stops the close or exit. The window title shows `*`
   while the file is modified, and it clears if you undo back to the saved state.
@@ -270,7 +274,22 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
 - **Undo stores changes, not copies.** Each undo step records only what changed, never a snapshot of the
   document, and consecutive keystrokes are merged into one step per word. Replace All is a single step.
 - **Case-insensitive search doesn't copy the document.** Text is compared character by character in place,
-  instead of lowercasing a copy of each line.
+  instead of lowercasing a copy of each line. Only positions where the first character could match are
+  tried, which for an ASCII letter is a plain byte comparison.
+- **Big documents are handled in the background, in one pass.** On a 300 MB, 3.3-million-line file:
+
+  | | Before | Now |
+  |---|---|---|
+  | Open | 1.8 s before the window appeared | window in 0.04 s; text ready after 0.65 s, window usable throughout |
+  | Save | 0.8 s frozen, memory peak 930 MB | 0.4 s in the background, no extra memory |
+  | Find with no match | 4 s frozen | 0.3 s in the background |
+  | Replace All, 3.3M matches | ~8.5 s frozen | ~1 s in the background |
+  | Undo / redo of that | ~4 s / 1.3 s | 0.45 s / 0.58 s (still on the window thread) |
+
+  Saving streams the rope through the encoder into a buffered file instead of building the text and then
+  its encoded bytes. Search scans the rope in 1 MB windows instead of copying out each line. Replace All, and
+  undo and redo of a big one, rebuild the text in a single walk through the rope instead of editing it once
+  per match. Replace All briefly needs the old and new text at once (807 MB peak in that test).
 - **Small dependencies where possible.** Windows-1252 conversion uses a 32-entry table instead of
   `encoding_rs`, and settings are a plain `key=value` file instead of using serde.
 - **Release build settings.** The release build uses `opt-level = 3`, full LTO, `codegen-units = 1`,
@@ -285,6 +304,7 @@ Measured on Linux/X11 with a release build:
 | Binary size | ~5 MB |
 | Memory with a small file open | ~18 MB, of which ~14 MB is shared libraries and memory-mapped fonts and under 2 MB is the app's own heap |
 | 27 MB, 400k-line file | opens in ~0.08 s and uses ~48 MB, of which ~33 MB is the app's heap. Peak memory while loading is the same ~48 MB. (Before the rope and window change it used ~175 MB.) |
+| 300 MB, 3.3M-line file | window in 0.04 s, loaded in 0.65 s, ~350 MB; saving adds nothing to that |
 
 ## Known bugs
 
@@ -338,16 +358,30 @@ Recently fixed:
 - [ ] Repaint only the changed parts of the window, using softbuffer damage regions, instead of the whole window
 - [ ] Accessibility support for screen readers (AccessKit)
 - [ ] Detect BOM-less UTF-16 files
+- [ ] Shape and run the bidi algorithm across a whole long line, not per 2 KB display segment: today a
+      ligature or Arabic joining across a segment boundary, or right-to-left runs crossing one, may draw wrongly
+- [ ] Decide what the status bar's column means: it counts code points, so a decomposed accented letter counts
+      as 2, a tab as 1 (not to the next tab stop) and a wide CJK character as 1
+- [ ] Check what happens with a file that is valid UTF-8 for its first 64 KB and then isn't (it should be
+      re-read as Windows-1252, not left half-decoded)
 - [x] Notice when the open file changes on disk and offer to reload it
 - [ ] Optional blinking cursor, switched off by default
 - [ ] Test on real Windows and macOS hardware, especially the URL launcher (`ShellExecuteW`) and printing.
       So far Linux (X11 and Wayland) has been run; the other two have only been compile-checked and built in CI.
 
 **Performance**
-- [ ] Load, save and print very large files in the background with progress, instead of blocking the window
-      (a 1 GB file would freeze it for seconds); warn before opening something enormous (which also prevents
-      running out of memory)
+- [x] Load, save, search and Replace All on very large files in the background with progress, instead of
+      blocking the window; warn before opening something enormous
+- [ ] Print in the background too (layout needs the font system, which lives on the window thread)
+- [ ] Undo and redo of a huge Replace All in the background (0.5 s on the window thread for 3.3M matches in 300 MB)
 - [ ] Measure startup on systems with thousands of fonts; consider caching the font database if it's slow
+- [ ] Crash-recovery snapshots rewrite the whole document 2 s after each pause in typing. For a 500 MB file
+      that is 500 MB written per pause; back off as documents grow, or record the original plus the undo history
+- [ ] A benchmark job in CI that fails on regressions: startup time, idle memory, memory with a 30 MB file and
+      after closing it, keystroke time on a long line, binary size. Memory and size are reliable on shared
+      runners; timings only roughly
+- [ ] A long-session soak test: an hour of scripted random edits, undos, tab moves and pastes, then check
+      memory returns to its starting level
 
 **Security**
 - [ ] Coverage-guided fuzzing (`cargo-fuzz`) of the decoder, link checker, search, and document edit/undo code
@@ -359,6 +393,7 @@ Recently fixed:
       a virtual pointer
 - [ ] GUI tests for Windows and macOS (CI only builds and runs unit tests there)
 - [ ] Show an error dialog instead of crashing if a window or graphics surface can't be created
+- [ ] On a panic, write crash-recovery snapshots at once from a panic hook, instead of losing up to 2 s of typing
 - [ ] Packaging and releases: versioning, installers (MSI, DMG, AppImage/Flatpak), code signing
 
 ## Building
@@ -376,9 +411,10 @@ CI builds and tests on Windows, macOS and Linux, and uploads the binaries as art
 keyboard and mouse input, and checks real outcomes: file contents, the clipboard, window titles and exit
 codes. It covers typing and saving, the clipboard both ways, the unsaved-changes prompt, dragging tabs into
 new and existing windows, crash recovery after `kill -9`, reloading a file changed on disk, opening and
-editing a 5 MB single-line file, a paste from a clipboard owner that never answers, and a clean exit. Each
-test runs a fresh instance with its own settings folder. CI runs it on every push; on failure it keeps a
-screenshot and the app's log in `target/gui-test-output`.
+editing a 5 MB single-line file, opening, saving and searching a 60 MB file in the background, a paste from
+a clipboard owner that never answers, and a clean exit. Each test runs a fresh instance with its own
+settings folder. CI runs it on every push; on failure it keeps a screenshot and the app's log in
+`target/gui-test-output`.
 
 ```
 sudo apt-get install xvfb x11-utils xdotool xclip imagemagick sway wtype wl-clipboard grim

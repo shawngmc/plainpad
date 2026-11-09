@@ -162,15 +162,52 @@ x11_reload_changed_file() {
     wait_until 5 sh -c '[ "$(timeout 2 xclip -o -selection clipboard)" = "v2 from outside" ]'
 }
 
+# Types one character at the start of the document, retrying until it takes:
+# big files load in the background and stay read-only until then.
+x_mark_when_loaded() {
+    local name=$1 deadline=$((SECONDS + 15))
+    while [ $SECONDS -lt $deadline ]; do
+        xdotool key ctrl+Home; xdotool type "#"
+        wait_until 1 x_win "\\*$name" && return 0
+    done
+    return 1
+}
+
 x11_long_line() {
     python3 -c "print('abc def; ' * 600000, end='')" > long.txt
     local t0=$SECONDS
     start_app long.txt
     wait_until 5 x_win "long.txt"   # used to take 5+ s
     x_focus "long.txt"
+    x_mark_when_loaded long.txt
     xdotool key ctrl+Home; xdotool type "START"; xdotool key ctrl+s
-    wait_until 10 sh -c 'head -c 5 long.txt | grep -q START'
+    wait_until 10 sh -c 'head -c 6 long.txt | grep -q "START#"'
     [ $((SECONDS - t0)) -lt 15 ]
+}
+
+# A 60 MB file opens, saves and is searched in the background: the window
+# appears at once, keeps responding, and the results are right.
+x11_big_file() {
+    python3 -c "
+import sys
+w = sys.stdout.write
+for i in range(1_200_000): w(f'line {i:07d} brown fox\\n')
+w('needle at the end\\n')" > big.txt
+    local size; size=$(stat -c %s big.txt)
+    start_app big.txt
+    wait_until 2 x_win "big.txt"
+    x_focus "big.txt"
+    x_mark_when_loaded big.txt
+    # Save in the background; the file is complete and the title clean afterwards.
+    xdotool key ctrl+s
+    wait_until 10 x_win "^big.txt - Plainpad"
+    [ "$(stat -c %s big.txt)" = $((size + 1)) ]
+    [ "$(head -c 13 big.txt)" = "#line 0000000" ]
+    [ "$(tail -n 1 big.txt)" = "needle at the end" ]
+    # Find the last line from the top (a background search), then type over it.
+    xdotool key ctrl+f; sleep 0.2; xdotool type "NEEDLE AT"; xdotool key Return Escape; sleep 1
+    xdotool type "found"; xdotool key ctrl+s
+    wait_until 10 sh -c '[ "$(tail -n 1 big.txt)" = "found the end" ]'
 }
 
 # ---------------------------------------------------------------- Wayland
@@ -247,7 +284,7 @@ export DISPLAY=:91
 unset WAYLAND_DISPLAY
 wait_until 5 xdpyinfo >/dev/null 2>&1 || sleep 1
 for t in x11_type_and_save x11_clipboard x11_tabs_close_prompt x11_drag_tab_out x11_crash_recovery \
-         x11_reload_changed_file x11_long_line; do
+         x11_reload_changed_file x11_long_line x11_big_file; do
     run_test $t
 done
 kill $XVFB 2>/dev/null
