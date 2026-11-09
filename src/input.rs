@@ -80,11 +80,11 @@ impl App {
             match named {
                 Some(NamedKey::Escape) => self.choose(Choice::Cancel),
                 Some(NamedKey::Enter | NamedKey::Space) => {
-                    let c = ui::PROMPT_CHOICES[p.focus].1;
+                    let c = p.focused();
                     self.choose(c);
                 }
-                Some(NamedKey::Tab | NamedKey::ArrowRight) => p.focus = (p.focus + 1) % 3,
-                Some(NamedKey::ArrowLeft) => p.focus = (p.focus + 2) % 3,
+                Some(NamedKey::Tab | NamedKey::ArrowRight) => p.cycle(true),
+                Some(NamedKey::ArrowLeft) => p.cycle(false),
                 _ => {}
             }
             return;
@@ -498,9 +498,7 @@ impl App {
             if self.primary()
                 && let Some((_, _, url)) = self.url_at(p)
             {
-                if let Err(e) = launch::open_url(&search::url_target(&url)) {
-                    self.win.status_msg = Some(e);
-                }
+                self.open_link(&url);
                 return;
             }
             let (x, y) = self.text_point(p);

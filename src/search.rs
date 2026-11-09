@@ -109,7 +109,11 @@ pub fn find_urls(line: &str) -> Vec<Range<usize>> {
 
 /// Turns detected text into something the OS can open.
 pub fn url_target(text: &str) -> String {
-    if text.len() >= 4 && text[..4].eq_ignore_ascii_case("www.") { format!("http://{text}") } else { text.to_owned() }
+    if text.as_bytes().get(..4).is_some_and(|b| b.eq_ignore_ascii_case(b"www.")) {
+        format!("http://{text}")
+    } else {
+        text.to_owned()
+    }
 }
 
 #[cfg(test)]

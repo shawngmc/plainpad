@@ -40,6 +40,8 @@ pub struct Theme {
     pub sel: Color,
     pub sel_fg: Color,
     pub link: Color,
+    /// Suspicious links and warnings.
+    pub danger: Color,
     pub field: Color,
     pub shade: Color,
 }
@@ -58,6 +60,7 @@ impl Theme {
         sel: Color::rgb(0xB4, 0xD5, 0xFE),
         sel_fg: Color::rgb(0x00, 0x00, 0x00),
         link: Color::rgb(0x0B, 0x57, 0xD0),
+        danger: Color::rgb(0xC4, 0x2B, 0x1C),
         field: Color::rgb(0xFF, 0xFF, 0xFF),
         shade: Color::rgba(0, 0, 0, 0x50),
     };
@@ -74,6 +77,7 @@ impl Theme {
         sel: Color::rgb(0x26, 0x4F, 0x78),
         sel_fg: Color::rgb(0xFF, 0xFF, 0xFF),
         link: Color::rgb(0x6C, 0xB0, 0xFF),
+        danger: Color::rgb(0xFF, 0x7A, 0x6B),
         field: Color::rgb(0x1E, 0x1E, 0x1E),
         shade: Color::rgba(0, 0, 0, 0x80),
     };

@@ -6,6 +6,7 @@
 
 use crate::document::{Document, EditResult, order};
 use crate::gfx::{Canvas, Rect, Theme};
+use crate::linkcheck;
 use crate::search;
 use cosmic_text::{
     Attrs, AttrsList, Buffer, BufferLine, Cursor, Family, FontSystem, LineEnding, Metrics, Motion, Scroll, Shaping,
@@ -518,7 +519,7 @@ impl View {
         let oy = area.y;
         let px1 = s.max(1.0).round();
         let mut url_line = usize::MAX;
-        let mut urls = Vec::new();
+        let mut urls: Vec<(Range<usize>, bool)> = Vec::new();
         let mut caret = None;
         cv.set_clip(area);
         for run in self.buf.layout_runs() {
@@ -540,10 +541,19 @@ impl View {
             }
             if li != url_line {
                 url_line = li;
-                urls = search::find_urls(run.text);
+                // (range, suspicious) for each link on this line.
+                urls = search::find_urls(run.text)
+                    .into_iter()
+                    .map(|r| {
+                        let bad = linkcheck::analyze(&run.text[r.clone()]).suspicious();
+                        (r, bad)
+                    })
+                    .collect();
             }
             for g in run.glyphs {
-                let in_url = urls.iter().any(|r| g.start >= r.start && g.start < r.end);
+                let link = urls.iter().find(|(r, _)| g.start >= r.start && g.start < r.end).map(|(_, bad)| *bad);
+                let in_url = link.is_some();
+                let suspicious = link == Some(true);
                 let selected = sel.is_some_and(|(a, z)| {
                     li >= a.line
                         && li <= z.line
@@ -552,6 +562,8 @@ impl View {
                 });
                 let color = if selected {
                     th.sel_fg
+                } else if suspicious {
+                    th.danger
                 } else if in_url {
                     th.link
                 } else {
@@ -559,12 +571,14 @@ impl View {
                 };
                 let pg = g.physical((ox, oy + run.line_y), 1.0);
                 cache.with_pixels(fs, pg.cache_key, color, |x, y, c| cv.blend(pg.x + x, pg.y + y, c));
-                if let Some((hl, hr)) = hover
-                    && *hl == li + ws
-                    && g.start >= hr.start
-                    && g.start < hr.end
-                {
-                    cv.fill(Rect::new(ox + g.x, oy + run.line_y + 2.0 * s, g.w, px1), th.link);
+                let hovered = hover.is_some_and(|(hl, hr)| *hl == li + ws && g.start >= hr.start && g.start < hr.end);
+                // Suspicious links are always underlined (doubly when hovered), so they stand out unprompted.
+                if hovered || suspicious {
+                    let c = if suspicious { th.danger } else { th.link };
+                    cv.fill(Rect::new(ox + g.x, oy + run.line_y + 2.0 * s, g.w, px1), c);
+                    if suspicious && hovered {
+                        cv.fill(Rect::new(ox + g.x, oy + run.line_y + 2.0 * s + 2.0 * px1, g.w, px1), c);
+                    }
                 }
             }
             if let Some(wc) = wc.filter(|wc| wc.line == li)

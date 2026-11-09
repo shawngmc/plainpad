@@ -164,7 +164,7 @@ impl App {
     }
 
     pub(crate) fn ask_save(&mut self, then: Pending) {
-        self.win.prompt = Some(Prompt::new(format!("Do you want to save changes to {}?", self.doc_name())));
+        self.win.prompt = Some(Prompt::save(format!("Do you want to save changes to {}?", self.doc_name())));
         self.win.pending = Some(then);
     }
 
@@ -247,11 +247,34 @@ impl App {
         }
     }
 
+    /// Opens a Ctrl+clicked link, first warning about it if it may be disguised.
+    pub(crate) fn open_link(&mut self, text: &str) {
+        let info = linkcheck::analyze(text);
+        if info.suspicious() {
+            let mut lines = vec!["Warning: this link may be disguised as a different address.".to_string()];
+            lines.extend(info.warnings.iter().map(|w| format!("• {w}")));
+            lines.push(format!("It really goes to: {}", info.target));
+            self.win.prompt = Some(Prompt::link(lines));
+            self.win.pending = Some(Pending::OpenLink(info.target));
+        } else if let Err(e) = launch::open_url(&info.target) {
+            self.win.status_msg = Some(e);
+        }
+    }
+
     pub(crate) fn choose(&mut self, c: Choice) {
         self.win.prompt = None;
         let Some(pending) = self.win.pending.take() else { return };
+        if let Pending::OpenLink(url) = pending {
+            if c == Choice::Open
+                && let Err(e) = launch::open_url(&url)
+            {
+                self.win.status_msg = Some(e);
+            }
+            return;
+        }
         let i = self.win.active;
         match c {
+            Choice::Open => {}
             Choice::Save if !self.save() => {}
             Choice::Save | Choice::Discard => {
                 if c == Choice::Discard {
@@ -263,6 +286,7 @@ impl App {
                     }
                     Pending::CloseWindow => self.request_close_window(),
                     Pending::Exit => self.request_exit(),
+                    Pending::OpenLink(_) => {}
                 }
             }
             Choice::Cancel => {

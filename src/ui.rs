@@ -789,20 +789,60 @@ pub enum Choice {
     Save,
     Discard,
     Cancel,
+    /// Open a link despite the warning.
+    Open,
 }
 
+/// A modal question with a row of buttons.
 pub struct Prompt {
-    pub msg: String,
+    /// Lines of text; long lines are wrapped to fit.
+    pub lines: Vec<String>,
+    choices: &'static [(&'static str, Choice)],
     pub focus: usize,
+    /// Draw the first line as a warning.
+    warn: bool,
     buttons: Vec<(Rect, Choice)>,
 }
 
-pub const PROMPT_CHOICES: [(&str, Choice); 3] =
-    [("Save", Choice::Save), ("Don't Save", Choice::Discard), ("Cancel", Choice::Cancel)];
+const SAVE_CHOICES: &[(&str, Choice)] =
+    &[("Save", Choice::Save), ("Don't Save", Choice::Discard), ("Cancel", Choice::Cancel)];
+const LINK_CHOICES: &[(&str, Choice)] = &[("Open Anyway", Choice::Open), ("Cancel", Choice::Cancel)];
+
+/// Greedy word wrap of `text` to `max_w` pixels.
+fn wrap(g: &mut Gfx, text: &str, max_w: f32) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+        if !line.is_empty() && g.text_w(&candidate) > max_w {
+            out.push(std::mem::take(&mut line));
+            line = word.to_string();
+        } else {
+            line = candidate;
+        }
+    }
+    out.push(line);
+    out
+}
 
 impl Prompt {
-    pub fn new(msg: String) -> Self {
-        Self { msg, focus: 0, buttons: Vec::new() }
+    /// "Save changes?" with Save / Don't Save / Cancel; Save is the default.
+    pub fn save(msg: String) -> Self {
+        Self { lines: vec![msg], choices: SAVE_CHOICES, focus: 0, warn: false, buttons: Vec::new() }
+    }
+
+    /// A warning about a suspicious link, with Open Anyway / Cancel; Cancel is the default.
+    pub fn link(lines: Vec<String>) -> Self {
+        Self { lines, choices: LINK_CHOICES, focus: 1, warn: true, buttons: Vec::new() }
+    }
+
+    pub fn focused(&self) -> Choice {
+        self.choices[self.focus].1
+    }
+
+    pub fn cycle(&mut self, forward: bool) {
+        let n = self.choices.len();
+        self.focus = if forward { (self.focus + 1) % n } else { (self.focus + n - 1) % n };
     }
 
     pub fn draw(&mut self, g: &mut Gfx, cv: &mut Canvas, th: &Theme, s: f32) {
@@ -810,20 +850,31 @@ impl Prompt {
         let lh = g.ui_line_h();
         let pad = 18.0 * s;
         let fh = lh + 12.0 * s;
-        let bws: Vec<f32> = PROMPT_CHOICES.iter().map(|(t, _)| g.text_w(t).max(60.0 * s) + 24.0 * s).collect();
-        let btn_total: f32 = bws.iter().sum::<f32>() + 8.0 * s * 2.0;
-        let w = (g.text_w(&self.msg) + 2.0 * pad).max(btn_total + 2.0 * pad).min(cv.w as f32 - 20.0 * s);
-        let h = pad + lh + pad + fh + pad;
-        let r = Rect::new(((cv.w as f32 - w) / 2.0).round(), ((cv.h as f32 - h) / 2.5).round(), w, h);
+        let bws: Vec<f32> = self.choices.iter().map(|(t, _)| g.text_w(t).max(60.0 * s) + 24.0 * s).collect();
+        let btn_total: f32 = bws.iter().sum::<f32>() + 8.0 * s * (bws.len() as f32 - 1.0);
+        let max_text = (560.0 * s).min(cv.w as f32 - 40.0 * s - 2.0 * pad).max(100.0 * s);
+        let wrapped: Vec<(usize, String)> = self
+            .lines
+            .iter()
+            .enumerate()
+            .flat_map(|(i, l)| wrap(g, l, max_text).into_iter().map(move |w| (i, w)))
+            .collect();
+        let text_w = wrapped.iter().map(|(_, l)| g.text_w(l)).fold(0.0, f32::max);
+        let w = (text_w + 2.0 * pad).max(btn_total + 2.0 * pad).min(cv.w as f32 - 20.0 * s);
+        let h = pad + lh * wrapped.len() as f32 + pad + fh + pad;
+        let r = Rect::new(((cv.w as f32 - w) / 2.0).round(), ((cv.h as f32 - h) / 2.5).round().max(0.0), w, h);
         cv.fill(r, th.chrome);
-        cv.outline(r, s, th.border);
+        cv.outline(r, s, if self.warn { th.danger } else { th.border });
         cv.set_clip(r);
-        g.text(cv, &self.msg, r.x + pad, r.y + pad, th.chrome_fg);
+        for (k, (i, l)) in wrapped.iter().enumerate() {
+            let color = if self.warn && *i == 0 { th.danger } else { th.chrome_fg };
+            g.text(cv, l, r.x + pad, r.y + pad + k as f32 * lh, color);
+        }
         cv.reset_clip();
         self.buttons.clear();
         let mut x = r.right() - pad - btn_total;
         let y = r.bottom() - pad - fh;
-        for (i, ((t, c), bw)) in PROMPT_CHOICES.iter().zip(&bws).enumerate() {
+        for (i, ((t, c), bw)) in self.choices.iter().zip(&bws).enumerate() {
             let br = Rect::new(x, y, *bw, fh);
             let f = i == self.focus;
             cv.fill(br, if f { th.accent } else { th.bg });

@@ -57,7 +57,8 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
 - Light or dark theme, following the system
 - URL detection for `http(s)://`, `ftp://`, `mailto:` and `www.`. URLs are coloured and underlined on hover,
   the status bar shows where a link goes, and Ctrl+click (Cmd+click on macOS) opens it in the default browser or
-  mail app.
+  mail app. Links that may be disguised as another address are shown in red and need confirming before they
+  open (see Security).
 
 **Printing**
 - Pages are laid out with the same text engine as the editor, in your chosen font, with page numbers.
@@ -121,8 +122,28 @@ A text editor opens files from anywhere, so their contents are treated as untrus
 
 - **Links:** only `http`, `https`, `ftp` and `mailto` links can be opened, and only by an explicit Ctrl+click.
   `file://` and other schemes aren't treated as links, so a document can't make you open or run a local
-  program. Hovering shows a link's real target in the status bar. A link ends at any invisible formatting
-  character, such as a zero-width space or a bidi override, so text can't hide or reorder part of the target.
+  program. A link ends at any invisible formatting character, such as a zero-width space or a bidi override,
+  so text can't hide or reorder part of the target.
+- **Disguised links:** each link's host name is checked for tricks that make it look like a different site,
+  following the rules browsers use (Unicode UTS #39 "highly restrictive" profile, simplified, plus the IDNA
+  bidi rule). These are flagged:
+  - Letters from different alphabets mixed in one name, such as Cyrillic `а` in `аpple.com`. The
+    combinations used by Chinese, Japanese and Korean with Latin are allowed.
+  - Names written entirely in Cyrillic or Greek letters that look Latin (`аррӏе.com`), unless under a
+    Cyrillic or Greek domain such as `.ru` or `.gr`.
+  - Latin lookalikes (dotless `ı`, IPA `ɡ`, small capitals), combining accents, and fullwidth letters.
+  - Characters that imitate `/`, `.`, `:` or `@`, which make `paypal.com⁄signin.evil.example` one long
+    name on `evil.example`.
+  - A name before `@`, as in `https://google.com@evil.example/`, where the site is really `evil.example`.
+  - IP addresses written as a single number or in hex or octal, percent-encoded host names, and names mixing
+    right-to-left and left-to-right letters.
+  - The same checks on the domain of `mailto:` links.
+
+  A flagged link is drawn in red and always underlined. Hovering shows why it was flagged and its real
+  address in ASCII (punycode, such as `xn--pple-43d.com`), naming the impostor characters and their code
+  points. Ctrl+click asks for confirmation, with Cancel as the default. International names that pass are
+  shown as written, with their ASCII form alongside. Every link is handed to the browser in ASCII form, so
+  the browser receives exactly the address you were shown.
 - **Opening links:** links are handed to the OS directly (`ShellExecuteW` on Windows, `open` on macOS,
   `xdg-open` on Linux) as a single argument, never through a shell.
 - **Saving:** the temp file is created exclusively with an unpredictable name, so a symlink planted next to

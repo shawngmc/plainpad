@@ -6,6 +6,7 @@ mod document;
 mod gfx;
 mod input;
 mod launch;
+mod linkcheck;
 mod paint;
 mod print;
 mod search;
@@ -80,7 +81,7 @@ enum Drag {
 }
 
 /// What to do once the user answers a "save changes?" prompt.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 enum Pending {
     /// Close one tab.
     Close(usize),
@@ -88,6 +89,8 @@ enum Pending {
     CloseWindow,
     /// Quit the app.
     Exit,
+    /// Open this (suspicious) link if the user confirms.
+    OpenLink(String),
 }
 
 /// One open document.

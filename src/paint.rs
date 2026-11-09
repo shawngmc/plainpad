@@ -88,11 +88,20 @@ impl App {
         let selected = self.win.tabs[self.win.active].view.selection().map(|(a, z)| doc.chars_between(a, z));
         let hovered = self.win.hover_url.as_ref().and_then(|(l, r)| {
             let line = doc.line(*l);
-            line.get(r.clone()).map(search::url_target)
+            line.get(r.clone()).map(linkcheck::analyze)
         });
+        let mut warn = false;
+        let key = if MAC { "Cmd" } else { "Ctrl" };
         let left = match (&self.win.status_msg, hovered) {
             (Some(m), _) => m.clone(),
-            (None, Some(url)) => format!("{url}   ({}+click to open)", if MAC { "Cmd" } else { "Ctrl" }),
+            (None, Some(info)) if info.suspicious() => {
+                warn = true;
+                format!("⚠ Suspicious link: really goes to {}. {}", info.ascii_host, info.warnings[0])
+            }
+            (None, Some(info)) if info.host != info.ascii_host => {
+                format!("{}   [{}]   ({key}+click to open)", info.url, info.ascii_host)
+            }
+            (None, Some(info)) => format!("{}   ({key}+click to open)", info.url),
             (None, None) => match selected {
                 Some(n) => format!("Ln {}, Col {}   ({n} selected)", cur.line + 1, col),
                 None => format!("Ln {}, Col {}", cur.line + 1, col),
@@ -120,7 +129,7 @@ impl App {
             x -= 12.0 * s;
         }
         cv.set_clip(Rect::new(r.x, r.y, (x - r.x).max(0.0), r.h));
-        self.gfx.text_in(cv, &left, row, th.chrome_fg);
+        self.gfx.text_in(cv, &left, row, if warn { th.danger } else { th.chrome_fg });
         cv.reset_clip();
     }
 
