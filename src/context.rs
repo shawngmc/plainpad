@@ -34,14 +34,15 @@ impl App {
     pub(crate) fn open_tab_menu(&mut self, i: usize, at: (f32, f32)) {
         let n = self.win.tabs.len();
         let has_path = self.win.tabs[i].path.is_some();
+        let id = self.win.tabs[i].id;
         let items = vec![
-            CtxItem::new("Close Tab", "Ctrl+W", CtxAction::CloseTab(i), true),
-            CtxItem::new("Close Other Tabs", "", CtxAction::CloseOtherTabs(i), n > 1),
-            CtxItem::new("Close Tabs to the Right", "", CtxAction::CloseTabsRight(i), i + 1 < n),
+            CtxItem::new("Close Tab", "Ctrl+W", CtxAction::CloseTab(id), true),
+            CtxItem::new("Close Other Tabs", "", CtxAction::CloseOtherTabs(id), n > 1),
+            CtxItem::new("Close Tabs to the Right", "", CtxAction::CloseTabsRight(id), i + 1 < n),
             CtxItem::SEP,
-            CtxItem::new("Move to New Window", "", CtxAction::MoveToNewWindow(i), n > 1),
+            CtxItem::new("Move to New Window", "", CtxAction::MoveToNewWindow(id), n > 1),
             CtxItem::SEP,
-            CtxItem::new("Copy File Path", "", CtxAction::CopyPath(i), has_path),
+            CtxItem::new("Copy File Path", "", CtxAction::CopyPath(id), has_path),
         ];
         self.win.menu.close();
         self.win.ctx = Some(ContextMenu::new(items, at));
@@ -62,12 +63,23 @@ impl App {
             CtxAction::Cmd(cmd) => self.run(cmd),
             CtxAction::OpenLink(url) => self.open_link(&url),
             CtxAction::CopyLink(url) => self.set_clipboard(url),
-            CtxAction::CloseTab(i) => {
-                self.close_tab(i, false);
+            CtxAction::CloseTab(id) => {
+                if let Some(i) = self.win.tab_pos(id) {
+                    self.close_tab(i, false);
+                }
             }
-            CtxAction::CloseOtherTabs(i) => self.close_tabs_where(i, |j| j != i),
-            CtxAction::CloseTabsRight(i) => self.close_tabs_where(i, |j| j > i),
-            CtxAction::MoveToNewWindow(i) => {
+            CtxAction::CloseOtherTabs(id) => {
+                if let Some(i) = self.win.tab_pos(id) {
+                    self.close_tabs_where(i, |j| j != i);
+                }
+            }
+            CtxAction::CloseTabsRight(id) => {
+                if let Some(i) = self.win.tab_pos(id) {
+                    self.close_tabs_where(i, |j| j > i);
+                }
+            }
+            CtxAction::MoveToNewWindow(id) => {
+                let Some(i) = self.win.tab_pos(id) else { return };
                 if self.win.tabs.len() > 1 {
                     let size = self.win.window.as_ref().map(|w| w.inner_size()).unwrap_or_default();
                     // Offset from this window where the platform reports positions (not Wayland).
@@ -76,8 +88,8 @@ impl App {
                     self.spawn = Some(Spawn { tab, pos, size });
                 }
             }
-            CtxAction::CopyPath(i) => {
-                if let Some(p) = self.win.tabs.get(i).and_then(|t| t.path.as_ref()) {
+            CtxAction::CopyPath(id) => {
+                if let Some(p) = self.win.tab_pos(id).and_then(|i| self.win.tabs[i].path.as_ref()) {
                     self.set_clipboard(p.display().to_string());
                 }
             }

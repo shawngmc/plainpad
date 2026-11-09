@@ -163,6 +163,15 @@ A text editor opens files from anywhere, so their contents are treated as untrus
 - **Printing:** the PDF sent to the printer is created the same way, private and with an unpredictable name.
 - **Opening files:** only regular files are opened. A FIFO or a device such as `/dev/zero` is refused rather
   than hanging the app or filling memory.
+- **Clipboard (Wayland):** text pasted from another app is capped at 256 MB and the wait at 2 seconds, so an app
+  that never stops sending can't exhaust memory or freeze the editor. At most 8 transfers of our copied text
+  run at once, so an app that keeps asking and never reads can't pile up threads. All shared Wayland
+  objects are used under one lock, because libwayland forbids destroying an object on one thread while
+  another uses it.
+- **Closing tabs safely:** save prompts and tab menu actions refer to tabs by a stable id, not their
+  position. A tab arriving from another window, or a dropped file, can't redirect "Don't Save" or "Close" onto a
+  different tab. Tabs can't be dropped into a window while it shows a dialog, and a cancelled or failed save
+  abandons the whole close or exit, rather than leaving earlier "Don't Save" choices armed for later.
 - **Dependencies:** `cargo audit` reports no known vulnerabilities. CI uses read-only permissions and runs
   actions pinned to commit SHAs.
 

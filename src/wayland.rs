@@ -40,6 +40,15 @@ const TAB_MIME: &str = "application/x-plainpad-tab";
 const TEXT_MIMES: [&str; 5] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "TEXT", "STRING"];
 /// How long to wait for another app to hand over pasted text.
 const PASTE_TIMEOUT: Duration = Duration::from_secs(2);
+/// The most we'll read from another app's clipboard. Without a cap, an app
+/// that never stops writing would fill memory.
+const PASTE_MAX: u64 = 256 * 1024 * 1024;
+/// At most this many threads writing our clipboard text to other apps at once.
+/// An app that keeps requesting and never reads would otherwise pile up threads.
+const MAX_WRITERS: usize = 8;
+static WRITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Ignore offers that advertise absurd numbers of MIME types.
+const MAX_MIMES: usize = 64;
 
 /// How a drag ended.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -203,19 +212,23 @@ impl Wayland {
         {
             return Some(text.to_string());
         }
-        let offer = sh.selection.clone()?;
-        drop(sh);
+        // Keep holding the lock while using the offer: the dispatch thread destroys
+        // replaced offers under this lock, and libwayland doesn't allow destroying
+        // an object on one thread while another sends a request on it.
+        let offer = sh.selection.as_ref()?;
         let mimes = offer.data::<OfferMimes>()?.0.lock().ok()?.clone();
         let mime = TEXT_MIMES.iter().find(|m| mimes.iter().any(|x| x == *m))?;
-        let (mut reader, writer) = std::io::pipe().ok()?;
+        let (reader, writer) = std::io::pipe().ok()?;
         offer.receive(mime.to_string(), std::os::fd::AsFd::as_fd(&writer));
         let _ = self.conn.flush();
+        drop(sh);
         drop(writer); // our copy of the write end; the other app holds its own
-        // Read on a helper thread so a misbehaving app can't freeze the editor.
+        // Read on a helper thread so a misbehaving app can't freeze the editor, and
+        // stop at PASTE_MAX so it can't exhaust memory even after we've given up.
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let ok = reader.read_to_end(&mut buf).is_ok();
+            let ok = reader.take(PASTE_MAX + 1).read_to_end(&mut buf).is_ok() && buf.len() as u64 <= PASTE_MAX;
             let _ = tx.send(ok.then_some(buf));
         });
         let bytes = rx.recv_timeout(PASTE_TIMEOUT).ok().flatten()?;
@@ -430,7 +443,9 @@ impl Dispatch<WlDataOffer, OfferMimes> for State {
         let mut sh = state.lock();
         match event {
             wl_data_offer::Event::Offer { mime_type } => {
-                if let Ok(mut m) = mimes.0.lock() {
+                if let Ok(mut m) = mimes.0.lock()
+                    && m.len() < MAX_MIMES
+                {
                     m.push(mime_type);
                 }
             }
@@ -456,11 +471,20 @@ impl Dispatch<WlDataSource, SourceKind> for State {
             // Another app is pasting our text: write it on a thread so a slow reader
             // can't block the editor. Every offered type is UTF-8 compatible text.
             (SourceKind::Clipboard(text), wl_data_source::Event::Send { fd, .. }) => {
+                // Too many writes already in flight: refuse by closing the pipe.
+                if WRITERS.fetch_add(1, Ordering::AcqRel) >= MAX_WRITERS {
+                    WRITERS.fetch_sub(1, Ordering::AcqRel);
+                    return;
+                }
                 let text = Arc::clone(text);
-                std::thread::spawn(move || {
+                let spawned = std::thread::Builder::new().name("clipboard-write".into()).spawn(move || {
                     let mut f = std::fs::File::from(fd);
                     let _ = f.write_all(text.as_bytes());
+                    WRITERS.fetch_sub(1, Ordering::AcqRel);
                 });
+                if spawned.is_err() {
+                    WRITERS.fetch_sub(1, Ordering::AcqRel);
+                }
             }
             (SourceKind::Clipboard(_), wl_data_source::Event::Cancelled) => {
                 // Someone else took the clipboard.

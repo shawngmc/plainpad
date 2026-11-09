@@ -90,8 +90,8 @@ enum Drag {
 /// What to do once the user answers a "save changes?" prompt.
 #[derive(Clone, PartialEq, Debug)]
 enum Pending {
-    /// Close one tab.
-    Close(usize),
+    /// Close the tab with this id.
+    Close(u64),
     /// Close the current window.
     CloseWindow,
     /// Quit the app.
@@ -201,9 +201,23 @@ struct Win {
     caret: Option<(f32, f32)>,
     /// The tab to make active once a multi-tab close finishes.
     keep_tab: Option<u64>,
+    /// The tab the open save prompt is about. Tabs are identified by id, not
+    /// position: a tab dragged in from another window while the prompt is open
+    /// shifts positions and changes the active tab.
+    prompt_tab: Option<u64>,
 }
 
 impl Win {
+    /// Whether a modal dialog is open (tabs shouldn't move in or out meanwhile).
+    fn modal(&self) -> bool {
+        self.prompt.is_some() || self.font_dlg.is_some()
+    }
+
+    /// Position of the tab with this id.
+    fn tab_pos(&self, id: u64) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id == id)
+    }
+
     fn new(tabs: Vec<Tab>) -> Self {
         Win {
             tabs,
@@ -234,6 +248,7 @@ impl Win {
             ctx: None,
             caret: None,
             keep_tab: None,
+            prompt_tab: None,
         }
     }
 

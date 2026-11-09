@@ -436,11 +436,13 @@ pub enum CtxAction {
     Cmd(Cmd),
     OpenLink(String),
     CopyLink(String),
-    CloseTab(usize),
-    CloseOtherTabs(usize),
-    CloseTabsRight(usize),
-    MoveToNewWindow(usize),
-    CopyPath(usize),
+    // Tab actions name the tab by id: positions can change while the menu is open
+    // (a file dropped in, or a tab moved in from another window).
+    CloseTab(u64),
+    CloseOtherTabs(u64),
+    CloseTabsRight(u64),
+    MoveToNewWindow(u64),
+    CopyPath(u64),
 }
 
 pub struct CtxItem {
@@ -945,17 +947,27 @@ const SAVE_CHOICES: &[(&str, Choice)] =
     &[("Save", Choice::Save), ("Don't Save", Choice::Discard), ("Cancel", Choice::Cancel)];
 const LINK_CHOICES: &[(&str, Choice)] = &[("Open Anyway", Choice::Open), ("Cancel", Choice::Cancel)];
 
-/// Greedy word wrap of `text` to `max_w` pixels.
+/// Greedy word wrap of `text` to `max_w` pixels. A word too long for a line
+/// on its own (such as a long URL) is broken between characters, so nothing
+/// is cut off.
 fn wrap(g: &mut Gfx, text: &str, max_w: f32) -> Vec<String> {
     let mut out = Vec::new();
     let mut line = String::new();
     for word in text.split(' ') {
         let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-        if !line.is_empty() && g.text_w(&candidate) > max_w {
-            out.push(std::mem::take(&mut line));
-            line = word.to_string();
-        } else {
+        if g.text_w(&candidate) <= max_w {
             line = candidate;
+            continue;
+        }
+        if !line.is_empty() {
+            out.push(std::mem::take(&mut line));
+        }
+        for c in word.chars() {
+            line.push(c);
+            if g.text_w(&line) > max_w && line.chars().count() > 1 {
+                line.pop();
+                out.push(std::mem::replace(&mut line, c.to_string()));
+            }
         }
     }
     out.push(line);
@@ -1173,5 +1185,42 @@ impl TabBar {
 
     pub fn scroll(&mut self, d: f32) {
         self.offset = (self.offset + d).clamp(0.0, self.max_offset);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_breaks_long_words() {
+        let mut g = Gfx::new();
+        let url = format!("https://{}.example/path", "a".repeat(200));
+        let lines = wrap(&mut g, &format!("It really goes to: {url}"), 300.0);
+        assert!(lines.len() > 2);
+        for l in &lines {
+            assert!(g.text_w(l) <= 300.0, "{l:?} too wide");
+        }
+        // Nothing lost: the pieces reassemble into the original text.
+        assert_eq!(lines.concat().replace(' ', ""), format!("It really goes to: {url}").replace(' ', ""));
+    }
+
+    #[test]
+    fn context_menu_skips_disabled_items() {
+        let items = vec![
+            CtxItem::new("Undo", "", CtxAction::Cmd(Cmd::Undo), false),
+            CtxItem::SEP,
+            CtxItem::new("Cut", "", CtxAction::Cmd(Cmd::Cut), false),
+            CtxItem::new("Paste", "", CtxAction::Cmd(Cmd::Paste), true),
+            CtxItem::new("Select All", "", CtxAction::Cmd(Cmd::SelectAll), true),
+        ];
+        let mut m = ContextMenu::new(items, (0.0, 0.0));
+        m.key(NavKey::Down);
+        assert_eq!(m.key(NavKey::Enter), Some(CtxAction::Cmd(Cmd::Paste)));
+        m.key(NavKey::Down);
+        m.key(NavKey::Down); // wraps past the disabled items back to Paste
+        assert_eq!(m.key(NavKey::Enter), Some(CtxAction::Cmd(Cmd::Paste)));
+        m.key(NavKey::Up);
+        assert_eq!(m.key(NavKey::Enter), Some(CtxAction::Cmd(Cmd::SelectAll)));
     }
 }

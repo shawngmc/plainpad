@@ -163,9 +163,20 @@ impl App {
         self.win.status_msg = Some(r.unwrap_or_else(|e| e));
     }
 
+    /// Asks whether to save the active tab, then continues with `then`.
     pub(crate) fn ask_save(&mut self, then: Pending) {
         self.win.prompt = Some(Prompt::save(format!("Do you want to save changes to {}?", self.doc_name())));
         self.win.pending = Some(then);
+        self.win.prompt_tab = Some(self.win.tabs[self.win.active].id);
+    }
+
+    /// Clears every pending "Don't Save" and "closing" mark, abandoning a close or exit.
+    fn abandon_close(&mut self) {
+        for t in self.win.tabs.iter_mut().chain(self.others.iter_mut().flat_map(|w| w.tabs.iter_mut())) {
+            t.discard = false;
+            t.closing = false;
+        }
+        self.win.keep_tab = None;
     }
 
     /// Removes tab `i` from the current window and returns it. If that empties
@@ -187,7 +198,7 @@ impl App {
     pub(crate) fn close_tab(&mut self, i: usize, force: bool) -> bool {
         if !force && self.win.tabs[i].is_dirty() {
             self.activate(i);
-            self.ask_save(Pending::Close(i));
+            self.ask_save(Pending::Close(self.win.tabs[i].id));
             return false;
         }
         self.take_tab(i);
@@ -272,17 +283,25 @@ impl App {
             }
             return;
         }
-        let i = self.win.active;
+        // Act on the tab the prompt was about, wherever it is now. If it has gone
+        // (moved to another window), give up rather than act on a different tab.
+        let Some(i) = self.win.prompt_tab.take().and_then(|id| self.win.tab_pos(id)) else {
+            return self.abandon_close();
+        };
+        self.activate(i);
         match c {
             Choice::Open => {}
-            Choice::Save if !self.save() => {}
+            // A failed or cancelled save stops the close or exit, like Cancel.
+            Choice::Save if !self.save() => self.abandon_close(),
             Choice::Save | Choice::Discard => {
                 if c == Choice::Discard {
                     self.win.tabs[i].discard = true;
                 }
                 match pending {
-                    Pending::Close(i) => {
-                        self.close_tab(i, true);
+                    Pending::Close(id) => {
+                        if let Some(i) = self.win.tab_pos(id) {
+                            self.close_tab(i, true);
+                        }
                     }
                     Pending::CloseWindow => self.request_close_window(),
                     Pending::Exit => self.request_exit(),
@@ -290,13 +309,7 @@ impl App {
                     Pending::OpenLink(_) => {}
                 }
             }
-            Choice::Cancel => {
-                for t in self.win.tabs.iter_mut().chain(self.others.iter_mut().flat_map(|w| w.tabs.iter_mut())) {
-                    t.discard = false;
-                    t.closing = false;
-                }
-                self.win.keep_tab = None;
-            }
+            Choice::Cancel => self.abandon_close(),
         }
     }
 
@@ -335,7 +348,10 @@ impl App {
         let size = self.win.window.as_ref().map(|w| w.inner_size()).unwrap_or_default();
         let screen = self.win.screen_rect().map(|r| (r.x + p.0, r.y + p.1));
         let target = screen.and_then(|sp| {
-            self.others.iter().position(|w| w.screen_rect().is_some_and(|r| r.contains(sp))).map(|k| (k, sp))
+            self.others
+                .iter()
+                .position(|w| !w.modal() && w.screen_rect().is_some_and(|r| r.contains(sp)))
+                .map(|k| (k, sp))
         });
         if let Some((k, (sx, sy))) = target {
             let local = self.others[k].screen_rect().map(|r| (sx - r.x, sy - r.y));
@@ -370,7 +386,7 @@ impl App {
         self.win.needs_redraw = true;
         match outcome {
             wayland::Outcome::Dropped { surface, x, y } => {
-                if let Some(k) = self.others.iter().position(|w| w.wl_surface == surface) {
+                if let Some(k) = self.others.iter().position(|w| w.wl_surface == surface && !w.modal()) {
                     let sc = self.others[k].scale;
                     self.move_tab_to(i, k, Some((x as f32 * sc, y as f32 * sc)));
                     return;
