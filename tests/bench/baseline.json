@@ -1,0 +1,12 @@
+{
+  "binary_kb": 5533.0,
+  "startup_ms": 49.48,
+  "idle_rss_kb": 15392.0,
+  "idle_heap_kb": 1656.0,
+  "file30_load_ms": 383.0,
+  "file30_rss_kb": 49788.0,
+  "file30_heap_kb": 35804.0,
+  "closed_heap_kb": 2080.0,
+  "key_cpu_ms": 0.34,
+  "key_long_cpu_ms": 1.6
+}

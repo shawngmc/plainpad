@@ -388,9 +388,8 @@ Recently fixed:
 - [x] Crash-recovery snapshots rewrote the whole document 2 s after each pause in typing (290 MB per pause for
       a 300 MB file). Big documents now log their edits instead: under 1 KB per pause
 - [ ] Restore crash-recovered documents in the background too (a 300 MB one takes ~0.5 s at startup)
-- [ ] A benchmark job in CI that fails on regressions: startup time, idle memory, memory with a 30 MB file and
-      after closing it, keystroke time on a long line, binary size. Memory and size are reliable on shared
-      runners; timings only roughly
+- [x] A benchmark job in CI that fails on regressions: startup time, idle memory, memory with a 30 MB file and
+      after closing it, keystroke time on a long line, binary size
 - [ ] A long-session soak test: an hour of scripted random edits, undos, tab moves and pastes, then check
       memory returns to its starting level
 
@@ -433,6 +432,20 @@ cargo build --release
 cargo build --release --manifest-path tests/gui/testkit/Cargo.toml
 tests/gui/run.sh            # or: tests/gui/run.sh clipboard drag
 ```
+
+### Benchmarks
+
+`tests/bench/bench.py` measures the release build under Xvfb: binary size, startup time, memory (in total and
+the app's own heap) with an empty document, with a 30 MB file open and after closing it, how long that file
+takes to open, and CPU time per keystroke on a normal line and on a 5-million-character line. CI runs it after
+the GUI tests and puts the table in the job summary. It fails if memory or binary size is more than 20% worse
+than `tests/bench/baseline.json`, or a timing more than 3 times worse; timings on shared CI machines vary too
+much for anything tighter. Each metric also has a small absolute allowance, so tiny values don't fail on noise.
+
+The baseline holds numbers from the CI runner, not a developer machine (memory there depends on the fonts
+installed). After an intended change, copy the new numbers from the job summary into the baseline. Locally,
+`tests/bench/bench.py --update` writes your own machine's numbers as the baseline, for comparing before and
+after a change.
 
 `tests/gui/testkit` is a small helper for the Wayland tests: a virtual pointer (sway has no input devices
 when headless) and a clipboard owner that never sends its data.
