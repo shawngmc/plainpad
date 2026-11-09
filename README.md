@@ -298,8 +298,8 @@ Recently fixed:
       Vellum, Scrawl, Plume and Notary (each in hundreds to thousands of repository names).
 - [x] Reduce memory for large files: the document is now held in a rope and only a window of lines is laid out
 - [x] Lower the peak memory while loading: files are decoded 64 KB at a time straight into the rope
-- [ ] Handle very long single lines, such as minified files. cosmic-text shapes a whole line at once, so a
-      multi-megabyte line is slow to display.
+- [ ] Handle very long single lines, such as minified files. cosmic-text shapes a whole line at once: a
+      5-million-character line takes 5 s to open, and each keystroke on a 100k+ character line takes 100–200 ms.
 - [x] Open several documents at once, in tabs
 - [ ] Restore the open tabs when the app restarts
 - [ ] Autosave unsaved changes for crash recovery (the release build aborts on a panic, losing unsaved work)
@@ -321,8 +321,25 @@ Recently fixed:
 - [ ] Detect BOM-less UTF-16 files
 - [ ] Notice when the open file changes on disk and offer to reload it
 - [ ] Optional blinking cursor, switched off by default
-- [ ] Test on real Windows and macOS hardware. So far only Linux/X11 has been run; the other two have only
-      been compile-checked and built in CI.
+- [ ] Test on real Windows and macOS hardware, especially the URL launcher (`ShellExecuteW`) and printing.
+      So far Linux (X11 and Wayland) has been run; the other two have only been compile-checked and built in CI.
+
+**Performance**
+- [ ] Load, save and print very large files in the background with progress, instead of blocking the window
+      (a 1 GB file would freeze it for seconds); warn before opening something enormous (which also prevents
+      running out of memory)
+- [ ] Measure startup on systems with thousands of fonts; consider caching the font database if it's slow
+
+**Security**
+- [ ] Coverage-guided fuzzing (`cargo-fuzz`) of the decoder, link checker, search, and document edit/undo code
+- [ ] `cargo-deny` in CI (advisories, licences, duplicate or banned crates); pin the Rust toolchain
+- [ ] Sanitise file names shown in the title and tabs (bidi overrides and invisible characters could disguise them)
+
+**Quality**
+- [ ] Run the GUI smoke tests in CI: Xvfb for X11 and headless sway for Wayland, scripted with xdotool and
+      a virtual pointer
+- [ ] Show an error dialog instead of crashing if a window or graphics surface can't be created
+- [ ] Packaging and releases: versioning, installers (MSI, DMG, AppImage/Flatpak), code signing
 
 ## Building
 
