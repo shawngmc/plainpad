@@ -228,6 +228,7 @@ Recently fixed:
       multi-megabyte line is slow to display.
 - [x] Open several documents at once, in tabs
 - [ ] Restore the open tabs when the app restarts
+- [ ] Autosave unsaved changes for crash recovery (the release build aborts on a panic, losing unsaved work)
 - [x] Drag a tab out into its own window, or onto another window (including on Wayland)
 - [ ] On Wayland, make a dragged-out window follow the pointer while dragging, as Chrome does, using the
       `xdg-toplevel-drag` protocol where the compositor supports it (KDE, recent GNOME). Show a tab image while
