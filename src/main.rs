@@ -16,7 +16,10 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use ui::{Choice, Cmd, DialogAction, FieldKey, FindAction, FindBar, FontDialog, MenuHit, MenuState, NavKey, Prompt};
+use ui::{
+    Choice, Cmd, DialogAction, FieldKey, FindAction, FindBar, FontDialog, MenuHit, MenuState, NavKey, Prompt, TabBar,
+    TabHit,
+};
 use view::{font_attrs, View};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -32,6 +35,7 @@ const MAC: bool = cfg!(target_os = "macos");
 #[derive(Default, Clone, Copy)]
 struct Layout {
     menu: Rect,
+    tabs: Rect,
     text: Rect,
     vbar: Rect,
     find: Rect,
@@ -43,11 +47,57 @@ enum Drag {
     None,
     Text,
     Thumb(f32),
+    Tab,
+}
+
+/// What to do once the user answers a "save changes?" prompt.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Pending {
+    Close(usize),
+    Exit,
+}
+
+/// One open document.
+struct Tab {
+    view: View,
+    /// Shown as "Untitled N" until the tab has a path.
+    untitled: usize,
+    path: Option<PathBuf>,
+    encoding: Encoding,
+    eol: Eol,
+    mixed_eol: bool,
+    /// Encoding or line endings changed since the last save.
+    meta_dirty: bool,
+}
+
+impl Tab {
+    fn new(view: View, untitled: usize) -> Self {
+        Self { view, untitled, path: None, encoding: Encoding::Utf8, eol: Eol::platform(), mixed_eol: false, meta_dirty: false }
+    }
+
+    fn name(&self) -> String {
+        self.path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| if self.untitled <= 1 { "Untitled".into() } else { format!("Untitled {}", self.untitled) })
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.meta_dirty || self.view.doc.is_dirty()
+    }
+
+    /// An empty, unsaved, unmodified tab that opening a file may reuse.
+    fn is_pristine(&self) -> bool {
+        self.path.is_none() && !self.is_dirty() && self.view.doc.len_lines() == 1 && self.view.doc.line_len(0) == 0
+    }
 }
 
 struct App {
     gfx: Gfx,
-    view: View,
+    tabs: Vec<Tab>,
+    active: usize,
+    tabbar: TabBar,
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     settings: Settings,
@@ -56,19 +106,14 @@ struct App {
     zoom: f32,
     mods: ModifiersState,
     mouse: (f32, f32),
+    mouse_prev: (f32, f32),
     drag: Drag,
     clicks: (Instant, (f32, f32), u8),
-    path: Option<PathBuf>,
-    dropped: Option<PathBuf>,
-    encoding: Encoding,
-    eol: Eol,
-    mixed_eol: bool,
-    meta_dirty: bool,
     menu: MenuState,
     find: FindBar,
     font_dlg: Option<FontDialog>,
     prompt: Option<Prompt>,
-    pending: Option<Cmd>,
+    pending: Option<Pending>,
     status_msg: Option<String>,
     hover_url: Option<(usize, Range<usize>)>,
     preedit: String,
@@ -83,12 +128,14 @@ struct App {
 }
 
 impl App {
-    fn new(settings: Settings, file: Option<PathBuf>) -> Self {
+    fn new(settings: Settings, files: Vec<PathBuf>) -> Self {
         let mut gfx = Gfx::new();
         let view = View::new(&mut gfx.fs, &settings.font_family, settings.wrap);
         let mut app = App {
             gfx,
-            view,
+            tabs: vec![Tab::new(view, 1)],
+            active: 0,
+            tabbar: TabBar::default(),
             window: None,
             surface: None,
             settings,
@@ -97,14 +144,9 @@ impl App {
             zoom: 1.0,
             mods: ModifiersState::empty(),
             mouse: (0.0, 0.0),
+            mouse_prev: (0.0, 0.0),
             drag: Drag::None,
             clicks: (Instant::now(), (0.0, 0.0), 0),
-            path: None,
-            dropped: None,
-            encoding: Encoding::Utf8,
-            eol: Eol::platform(),
-            mixed_eol: false,
-            meta_dirty: false,
             menu: MenuState::default(),
             find: FindBar::default(),
             font_dlg: None,
@@ -122,11 +164,13 @@ impl App {
             needs_redraw: true,
             exit: false,
         };
-        if let Some(p) = file {
+        for p in files {
             if p.exists() {
                 app.open_path(p);
             } else {
-                app.path = Some(p);
+                // A new file to be created on first save, as Notepad does.
+                let i = if app.tabs[app.active].is_pristine() { app.active } else { app.new_tab() };
+                app.tabs[i].path = Some(p);
             }
         }
         app
@@ -136,43 +180,65 @@ impl App {
         if MAC { self.mods.super_key() } else { self.mods.control_key() }
     }
 
-    // ---------------------------------------------------------------- document
+    // ---------------------------------------------------------------- tabs & documents
+
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
 
     fn doc_name(&self) -> String {
-        self.path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Untitled".into())
+        self.tab().name()
     }
 
-    fn is_dirty(&self) -> bool {
-        self.meta_dirty || self.view.doc.is_dirty()
-    }
-
-    fn set_doc(&mut self, doc: document::Document) {
-        self.view.set_document(doc);
-        self.meta_dirty = false;
+    fn activate(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        if i != self.active {
+            self.status_msg = None;
+        }
+        self.active = i;
+        self.applied = Default::default(); // re-apply geometry to this tab's view
         self.hover_url = None;
+        self.drag = if self.drag == Drag::Tab { Drag::Tab } else { Drag::None };
+        self.tabbar.reveal = true;
     }
 
-    fn new_doc(&mut self) {
-        self.set_doc(document::Document::new(""));
-        self.path = None;
-        self.encoding = Encoding::Utf8;
-        self.eol = Eol::platform();
-        self.mixed_eol = false;
-        self.status_msg = None;
+    /// Opens an empty tab after the current one and switches to it.
+    /// Lowest "Untitled N" number not used by an open untitled tab.
+    fn next_untitled(&self) -> usize {
+        (1..).find(|n| !self.tabs.iter().any(|t| t.path.is_none() && t.untitled == *n)).unwrap()
     }
 
+    fn new_tab(&mut self) -> usize {
+        let view = View::new(&mut self.gfx.fs, &self.settings.font_family, self.settings.wrap);
+        let i = (self.active + 1).min(self.tabs.len());
+        let n = self.next_untitled();
+        self.tabs.insert(i, Tab::new(view, n));
+        self.activate(i);
+        i
+    }
+
+    /// Opens `path` in a tab: switches to it if already open, reuses an
+    /// untouched empty tab, or opens a new one.
     fn open_path(&mut self, path: PathBuf) {
+        let canon = std::fs::canonicalize(&path).ok();
+        let same = |p: &PathBuf| *p == path || (canon.is_some() && std::fs::canonicalize(p).ok() == canon);
+        if let Some(i) = self.tabs.iter().position(|t| t.path.as_ref().is_some_and(same)) {
+            self.activate(i);
+            return;
+        }
         match doc::load(&path) {
             Ok(l) => {
-                self.set_doc(document::Document::from_rope(l.rope));
-                self.encoding = l.encoding;
-                self.eol = l.eol;
-                self.mixed_eol = l.mixed_eol;
-                self.path = Some(path);
+                let i = if self.tab().is_pristine() { self.active } else { self.new_tab() };
+                let t = &mut self.tabs[i];
+                t.view.set_document(document::Document::from_rope(l.rope));
+                t.encoding = l.encoding;
+                t.eol = l.eol;
+                t.mixed_eol = l.mixed_eol;
+                t.meta_dirty = false;
+                t.path = Some(path);
+                self.activate(i);
                 self.status_msg = l
                     .mixed_eol
                     .then(|| format!("Mixed line endings; will be saved as {}", l.eol.label()));
@@ -183,7 +249,7 @@ impl App {
 
     fn dialog(&self) -> rfd::FileDialog {
         let mut d = rfd::FileDialog::new();
-        if let Some(dir) = self.path.as_ref().and_then(|p| p.parent()).filter(|d| !d.as_os_str().is_empty()) {
+        if let Some(dir) = self.tab().path.as_ref().and_then(|p| p.parent()).filter(|d| !d.as_os_str().is_empty()) {
             d = d.set_directory(dir);
         }
         if let Some(w) = &self.window {
@@ -193,20 +259,20 @@ impl App {
     }
 
     fn open_dialog(&mut self) {
-        if let Some(p) = self.dialog().set_title("Open").pick_file() {
+        for p in self.dialog().set_title("Open").pick_files().unwrap_or_default() {
             self.open_path(p);
         }
     }
 
     fn save(&mut self) -> bool {
-        match self.path.clone() {
+        match self.tab().path.clone() {
             Some(p) => self.save_to(p),
             None => self.save_as(),
         }
     }
 
     fn save_as(&mut self) -> bool {
-        let name = self.path.as_ref().map_or("Untitled.txt".into(), |_| self.doc_name());
+        let name = self.tab().path.as_ref().map_or("Untitled.txt".into(), |_| self.doc_name());
         match self.dialog().set_title("Save As").set_file_name(name).save_file() {
             Some(p) => self.save_to(p),
             None => false,
@@ -214,22 +280,23 @@ impl App {
     }
 
     fn save_to(&mut self, path: PathBuf) -> bool {
-        let text = self.view.doc.to_string_eol(self.eol.as_str());
-        let bytes = match doc::encode(&text, self.encoding) {
+        let t = &mut self.tabs[self.active];
+        let text = t.view.doc.to_string_eol(t.eol.as_str());
+        let bytes = match doc::encode(&text, t.encoding) {
             Ok(b) => b,
             Err(c) => {
                 self.status_msg =
-                    Some(format!("'{c}' can't be stored as {}; saved as UTF-8 instead", self.encoding.label()));
-                self.encoding = Encoding::Utf8;
+                    Some(format!("'{c}' can't be stored as {}; saved as UTF-8 instead", t.encoding.label()));
+                t.encoding = Encoding::Utf8;
                 text.into_bytes()
             }
         };
         match doc::save(&path, &bytes) {
             Ok(()) => {
-                self.path = Some(path);
-                self.view.doc.mark_saved();
-                self.meta_dirty = false;
-                self.mixed_eol = false;
+                t.path = Some(path);
+                t.view.doc.mark_saved();
+                t.meta_dirty = false;
+                t.mixed_eol = false;
                 true
             }
             Err(e) => {
@@ -240,7 +307,7 @@ impl App {
     }
 
     fn rename(&mut self) {
-        let Some(old) = self.path.clone().filter(|p| p.exists()) else {
+        let Some(old) = self.tab().path.clone().filter(|p| p.exists()) else {
             self.save_as();
             return;
         };
@@ -252,7 +319,7 @@ impl App {
         }
         match std::fs::rename(&old, &new) {
             Ok(()) => {
-                self.path = Some(new);
+                self.tabs[self.active].path = Some(new);
                 self.status_msg = Some(format!("Renamed to {}", self.doc_name()));
             }
             Err(e) => self.status_msg = Some(format!("Could not rename: {e}")),
@@ -261,7 +328,7 @@ impl App {
 
     fn print(&mut self) {
         let title = self.doc_name();
-        let doc = &self.view.doc;
+        let doc = &self.tabs[self.active].view.doc;
         let line = |i: usize| doc.line(i).into_owned();
         let job = print::Job {
             lines: doc.len_lines(),
@@ -275,45 +342,62 @@ impl App {
         self.status_msg = Some(r.unwrap_or_else(|e| e));
     }
 
-    /// Returns true if `cmd` may proceed now; otherwise asks to save first.
-    fn guard(&mut self, cmd: Cmd) -> bool {
-        if !self.is_dirty() {
-            return true;
-        }
+    fn ask_save(&mut self, then: Pending) {
         self.prompt = Some(Prompt::new(format!("Do you want to save changes to {}?", self.doc_name())));
-        self.pending = Some(cmd);
-        false
+        self.pending = Some(then);
     }
 
-    fn run_unguarded(&mut self, cmd: Cmd) {
-        match cmd {
-            Cmd::New => self.new_doc(),
-            Cmd::Open => match self.dropped.take() {
-                Some(p) => self.open_path(p),
-                None => self.open_dialog(),
-            },
-            Cmd::Exit => self.exit = true,
-            _ => self.run(cmd),
+    /// Closes tab `i`, first asking to save it unless `force`. Returns true if it closed.
+    fn close_tab(&mut self, i: usize, force: bool) -> bool {
+        if !force && self.tabs[i].is_dirty() {
+            self.activate(i);
+            self.ask_save(Pending::Close(i));
+            return false;
+        }
+        self.tabs.remove(i);
+        if self.tabs.is_empty() {
+            let view = View::new(&mut self.gfx.fs, &self.settings.font_family, self.settings.wrap);
+            self.tabs.push(Tab::new(view, 1));
+        }
+        let a = if i < self.active { self.active - 1 } else { self.active.min(self.tabs.len() - 1) };
+        self.active = usize::MAX; // force activate() to treat this as a switch
+        self.activate(a);
+        true
+    }
+
+    /// Exits once every modified tab has been saved or discarded, asking about each in turn.
+    fn request_exit(&mut self) {
+        match self.tabs.iter().position(Tab::is_dirty) {
+            Some(i) => {
+                self.activate(i);
+                self.ask_save(Pending::Exit);
+            }
+            None => self.exit = true,
         }
     }
 
     fn choose(&mut self, c: Choice) {
         self.prompt = None;
-        let pending = self.pending.take();
-        match c {
-            Choice::Save => {
-                if self.save()
-                    && let Some(p) = pending
-                {
-                    self.run_unguarded(p);
+        let Some(pending) = self.pending.take() else { return };
+        match (c, pending) {
+            (Choice::Save, p) => {
+                if self.save() {
+                    match p {
+                        Pending::Close(i) => {
+                            self.close_tab(i, true);
+                        }
+                        Pending::Exit => self.request_exit(),
+                    }
                 }
             }
-            Choice::Discard => {
-                if let Some(p) = pending {
-                    self.run_unguarded(p);
-                }
+            (Choice::Discard, Pending::Close(i)) => {
+                self.close_tab(i, true);
             }
-            Choice::Cancel => self.dropped = None,
+            (Choice::Discard, Pending::Exit) => {
+                self.close_tab(self.active, true);
+                self.request_exit();
+            }
+            (Choice::Cancel, _) => {}
         }
     }
 
@@ -343,7 +427,7 @@ impl App {
     }
 
     fn copy(&mut self) {
-        if let Some(t) = self.view.selected_text() {
+        if let Some(t) = self.tabs[self.active].view.selected_text() {
             self.set_clipboard(t);
         }
     }
@@ -355,8 +439,8 @@ impl App {
         self.find.replace |= replace;
         self.find.focus = true;
         self.find.field = 0;
-        let sel = self.view.selection().filter(|(a, z)| a.line == z.line);
-        if let Some(sel) = sel.and_then(|_| self.view.selected_text()) {
+        let sel = self.tabs[self.active].view.selection().filter(|(a, z)| a.line == z.line);
+        if let Some(sel) = sel.and_then(|_| self.tabs[self.active].view.selected_text()) {
             self.find.find.set(&sel);
         } else {
             self.find.find.all = true;
@@ -370,9 +454,9 @@ impl App {
             return false;
         }
         let case = self.find.case;
-        let cur = self.view.cursor;
-        let (start, end) = self.view.selection().unwrap_or((cur, cur));
-        let doc = &self.view.doc;
+        let cur = self.tabs[self.active].view.cursor;
+        let (start, end) = self.tabs[self.active].view.selection().unwrap_or((cur, cur));
+        let doc = &self.tabs[self.active].view.doc;
         let n = doc.len_lines();
         let mut found = None;
         for k in 0..=n {
@@ -395,7 +479,7 @@ impl App {
         }
         match found {
             Some((li, r)) => {
-                self.view.set_selection(Cursor::new(li, r.start), Cursor::new(li, r.end));
+                self.tabs[self.active].view.set_selection(Cursor::new(li, r.start), Cursor::new(li, r.end));
                 self.status_msg = None;
                 true
             }
@@ -409,9 +493,9 @@ impl App {
     fn replace_one(&mut self) {
         let needle = self.find.find.text.clone();
         let repl = self.find.repl.text.clone();
-        let sel = self.view.selected_text().unwrap_or_default();
+        let sel = self.tabs[self.active].view.selected_text().unwrap_or_default();
         if !sel.is_empty() && search::find(&sel, &needle, self.find.case, 0) == Some(0..sel.len()) {
-            self.view.replace_selection(&repl, false);
+            self.tabs[self.active].view.replace_selection(&repl, false);
             self.edited();
         }
         self.find_next(true);
@@ -424,7 +508,7 @@ impl App {
             return;
         }
         let case = self.find.case;
-        let doc = &self.view.doc;
+        let doc = &self.tabs[self.active].view.doc;
         let mut ranges = Vec::new();
         for li in 0..doc.len_lines() {
             let line = doc.line(li);
@@ -438,7 +522,7 @@ impl App {
             self.status_msg = Some(format!("Cannot find \"{needle}\""));
             return;
         }
-        self.view.replace_many(&ranges, &repl);
+        self.tabs[self.active].view.replace_many(&ranges, &repl);
         self.edited();
         self.status_msg = Some(format!("Replaced {} occurrence(s)", ranges.len()));
     }
@@ -474,10 +558,19 @@ impl App {
     fn run(&mut self, cmd: Cmd) {
         self.menu.close();
         match cmd {
-            Cmd::New | Cmd::Open | Cmd::Exit => {
-                if self.guard(cmd) {
-                    self.run_unguarded(cmd);
-                }
+            Cmd::New => {
+                self.new_tab();
+            }
+            Cmd::Open => self.open_dialog(),
+            Cmd::Exit => self.request_exit(),
+            Cmd::CloseTab => {
+                self.close_tab(self.active, false);
+            }
+            Cmd::NextTab => self.activate((self.active + 1) % self.tabs.len()),
+            Cmd::PrevTab => self.activate((self.active + self.tabs.len() - 1) % self.tabs.len()),
+            Cmd::SelectTab(n) => {
+                let i = if n >= 9 { self.tabs.len() - 1 } else { n as usize - 1 };
+                self.activate(i);
             }
             Cmd::Save => {
                 self.save();
@@ -488,30 +581,30 @@ impl App {
             Cmd::Rename => self.rename(),
             Cmd::Print => self.print(),
             Cmd::Undo => {
-                self.view.undo();
+                self.tabs[self.active].view.undo();
                 self.edited();
             }
             Cmd::Redo => {
-                self.view.redo();
+                self.tabs[self.active].view.redo();
                 self.edited();
             }
             Cmd::Cut => {
                 self.copy();
-                self.view.delete_selection();
+                self.tabs[self.active].view.delete_selection();
                 self.edited();
             }
             Cmd::Copy => self.copy(),
             Cmd::Paste => {
                 if let Some(t) = self.get_clipboard() {
-                    self.view.replace_selection(&t, false);
+                    self.tabs[self.active].view.replace_selection(&t, false);
                     self.edited();
                 }
             }
             Cmd::Delete => {
-                self.view.delete();
+                self.tabs[self.active].view.delete();
                 self.edited();
             }
-            Cmd::SelectAll => self.view.select_all(),
+            Cmd::SelectAll => self.tabs[self.active].view.select_all(),
             Cmd::Find => self.open_find(false),
             Cmd::Replace => self.open_find(true),
             Cmd::FindNext => {
@@ -539,16 +632,16 @@ impl App {
                 self.settings.save();
             }
             Cmd::SetEol(e) => {
-                if e != self.eol || self.mixed_eol {
-                    self.eol = e;
-                    self.mixed_eol = false;
-                    self.meta_dirty = true;
+                if e != self.tabs[self.active].eol || self.tabs[self.active].mixed_eol {
+                    self.tabs[self.active].eol = e;
+                    self.tabs[self.active].mixed_eol = false;
+                    self.tabs[self.active].meta_dirty = true;
                 }
             }
             Cmd::SetEncoding(e) => {
-                if e != self.encoding {
-                    self.encoding = e;
-                    self.meta_dirty = true;
+                if e != self.tabs[self.active].encoding {
+                    self.tabs[self.active].encoding = e;
+                    self.tabs[self.active].meta_dirty = true;
                 }
             }
         }
@@ -558,8 +651,8 @@ impl App {
         match cmd {
             Cmd::WordWrap => self.settings.wrap,
             Cmd::StatusBar => self.settings.status_bar,
-            Cmd::SetEol(e) => e == self.eol,
-            Cmd::SetEncoding(e) => e == self.encoding,
+            Cmd::SetEol(e) => e == self.tabs[self.active].eol,
+            Cmd::SetEncoding(e) => e == self.tabs[self.active].encoding,
             _ => false,
         }
     }
@@ -573,7 +666,9 @@ impl App {
             self.settings.font_pt = pt.clamp(4.0, 200.0);
         }
         self.settings.save();
-        self.view.set_font(&self.settings.font_family);
+        for t in &mut self.tabs {
+            t.view.set_font(&self.settings.font_family);
+        }
         self.applied.2 = 0.0; // force metrics refresh
     }
 
@@ -583,9 +678,22 @@ impl App {
         if ev.logical_key == Key::Named(NamedKey::F3) {
             return Some(if shift { Cmd::FindPrev } else { Cmd::FindNext });
         }
+        // Ctrl+Tab uses the Control key on every platform, including macOS.
+        if self.mods.control_key() && ev.logical_key == Key::Named(NamedKey::Tab) {
+            return Some(if shift { Cmd::PrevTab } else { Cmd::NextTab });
+        }
+        if primary && !shift && !alt {
+            match ev.logical_key {
+                Key::Named(NamedKey::PageDown) => return Some(Cmd::NextTab),
+                Key::Named(NamedKey::PageUp) => return Some(Cmd::PrevTab),
+                _ => {}
+            }
+        }
         if primary && !alt {
             return Some(match c? {
-                'n' => Cmd::New,
+                'n' | 't' => Cmd::New,
+                'w' => Cmd::CloseTab,
+                d @ '1'..='9' => Cmd::SelectTab(d as u8 - b'0'),
                 'o' => Cmd::Open,
                 's' if shift => Cmd::SaveAs,
                 's' => Cmd::Save,
@@ -779,33 +887,33 @@ impl App {
             _ => None,
         };
         if let Some(m) = motion {
-            self.view.motion(&mut self.gfx.fs, m, shift);
+            self.tabs[self.active].view.motion(&mut self.gfx.fs, m, shift);
             return;
         }
         let edited = match named {
             Some(NamedKey::Backspace) if word => {
-                self.view.delete_word(&mut self.gfx.fs, false);
+                self.tabs[self.active].view.delete_word(&mut self.gfx.fs, false);
                 true
             }
             Some(NamedKey::Backspace) => {
-                self.view.backspace();
+                self.tabs[self.active].view.backspace();
                 true
             }
             Some(NamedKey::Delete) if word => {
-                self.view.delete_word(&mut self.gfx.fs, true);
+                self.tabs[self.active].view.delete_word(&mut self.gfx.fs, true);
                 true
             }
             Some(NamedKey::Delete) => {
-                self.view.delete();
+                self.tabs[self.active].view.delete();
                 true
             }
             Some(NamedKey::Enter) => {
-                self.view.replace_selection("\n", false);
+                self.tabs[self.active].view.replace_selection("\n", false);
                 true
             }
             Some(NamedKey::Tab) => {
                 if !primary {
-                    self.view.type_text("\t");
+                    self.tabs[self.active].view.type_text("\t");
                 }
                 true
             }
@@ -813,13 +921,13 @@ impl App {
                 if self.find.visible {
                     self.find_action(FindAction::Close);
                 } else {
-                    self.view.clear_selection();
+                    self.tabs[self.active].view.clear_selection();
                 }
                 false
             }
             _ => match text {
                 Some(t) if typing => {
-                    self.view.type_text(t);
+                    self.tabs[self.active].view.type_text(t);
                     true
                 }
                 _ => false,
@@ -835,7 +943,7 @@ impl App {
     /// Converts a window point to coordinates relative to the text origin.
     fn text_point(&self, p: (f32, f32)) -> (f32, f32) {
         let pad = (6.0 * self.scale).round();
-        (p.0 - self.layout.text.x - pad + self.view.h_scroll(), p.1 - self.layout.text.y)
+        (p.0 - self.layout.text.x - pad + self.tabs[self.active].view.h_scroll(), p.1 - self.layout.text.y)
     }
 
     fn url_at(&self, p: (f32, f32)) -> Option<(usize, Range<usize>, String)> {
@@ -843,13 +951,13 @@ impl App {
             return None;
         }
         let (x, y) = self.text_point(p);
-        self.view.url_at(x, y)
+        self.tabs[self.active].view.url_at(x, y)
     }
 
     /// (thumb rect, track travel, total lines)
     fn scrollbar(&self) -> Option<(Rect, f32, usize)> {
-        let (total, line) = self.view.scroll_info();
-        let lh = self.view.line_h();
+        let (total, line) = self.tabs[self.active].view.scroll_info();
+        let lh = self.tabs[self.active].view.line_h();
         let track = self.layout.vbar;
         let vis = (track.h / lh).max(1.0);
         if total as f32 <= vis && line == 0 {
@@ -882,6 +990,7 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, p: (f32, f32)) {
+        self.mouse_prev = self.mouse;
         self.mouse = p;
         if self.menu.open.is_some() && self.menu.hover_at(p) {
             self.needs_redraw = true;
@@ -890,23 +999,37 @@ impl App {
             Drag::Text => {
                 let t = self.layout.text;
                 if p.1 < t.y {
-                    self.view.scroll_px(-(t.y - p.1));
+                    self.tabs[self.active].view.scroll_px(-(t.y - p.1));
                 } else if p.1 > t.bottom() {
-                    self.view.scroll_px(p.1 - t.bottom());
+                    self.tabs[self.active].view.scroll_px(p.1 - t.bottom());
                 }
-                self.view.prepare(&mut self.gfx.fs);
+                self.tabs[self.active].view.prepare(&mut self.gfx.fs);
                 let (x, y) = self.text_point(p);
-                self.view.drag(x, y.clamp(0.0, t.h - 1.0));
+                self.tabs[self.active].view.drag(x, y.clamp(0.0, t.h - 1.0));
                 self.needs_redraw = true;
             }
             Drag::Thumb(grab) => {
                 if let Some((_, range, total)) = self.scrollbar() {
                     let frac = ((p.1 - grab - self.layout.vbar.y) / range.max(1.0)).clamp(0.0, 1.0);
-                    self.view.scroll_to_line((frac * (total - 1) as f32).round() as usize);
+                    self.tabs[self.active].view.scroll_to_line((frac * (total - 1) as f32).round() as usize);
                     self.needs_redraw = true;
                 }
             }
+            Drag::Tab => {
+                if let Some(TabHit::Tab(j) | TabHit::Close(j)) = self.tabbar.hit(p)
+                    && j != self.active
+                {
+                    let t = self.tabs.remove(self.active);
+                    self.tabs.insert(j, t);
+                    self.active = j;
+                    self.tabbar.reveal = true;
+                }
+                self.needs_redraw = true;
+            }
             Drag::None => {
+                if self.layout.tabs.contains(p) || self.layout.tabs.contains(self.mouse_prev) {
+                    self.needs_redraw = true; // tab hover highlight
+                }
                 let hover = self.url_at(p).map(|(l, r, _)| (l, r));
                 if hover != self.hover_url {
                     self.hover_url = hover;
@@ -951,6 +1074,13 @@ impl App {
             }
             return;
         }
+        if button == MouseButton::Middle
+            && self.menu.open.is_none()
+            && let Some(TabHit::Tab(i) | TabHit::Close(i)) = self.tabbar.hit(p)
+        {
+            self.close_tab(i, false);
+            return;
+        }
         if button != MouseButton::Left {
             if self.menu.open.is_some() {
                 self.menu.close();
@@ -968,6 +1098,25 @@ impl App {
             MenuHit::Outside if self.menu.open.is_some() => return self.menu.close(),
             MenuHit::Outside => {}
         }
+        if self.layout.tabs.contains(p) {
+            match self.tabbar.hit(p) {
+                Some(TabHit::Close(i)) => {
+                    self.close_tab(i, false);
+                }
+                Some(TabHit::Tab(i)) => {
+                    self.activate(i);
+                    self.drag = Drag::Tab;
+                }
+                Some(TabHit::New) => {
+                    self.new_tab();
+                }
+                Some(TabHit::Strip) if n == 2 => {
+                    self.new_tab();
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.find.visible && self.layout.find.contains(p) {
             if let Some(a) = self.find.hit(p) {
                 self.find_action(a);
@@ -980,7 +1129,7 @@ impl App {
                     self.drag = Drag::Thumb(p.1 - thumb.y);
                 } else {
                     let page = self.layout.text.h * 0.9;
-                    self.view.scroll_px(if p.1 < thumb.y { -page } else { page });
+                    self.tabs[self.active].view.scroll_px(if p.1 < thumb.y { -page } else { page });
                 }
             }
             return;
@@ -997,13 +1146,13 @@ impl App {
                 return;
             }
             let (x, y) = self.text_point(p);
-            self.view.click(x, y, n, self.mods.shift_key());
+            self.tabs[self.active].view.click(x, y, n, self.mods.shift_key());
             self.drag = Drag::Text;
         }
     }
 
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
-        let lh = self.view.line_h();
+        let lh = self.tabs[self.active].view.line_h();
         let (mut dx, mut dy) = match delta {
             MouseScrollDelta::LineDelta(x, y) => (x * 3.0 * lh, y * 3.0 * lh),
             MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
@@ -1014,6 +1163,11 @@ impl App {
             return;
         }
         if self.prompt.is_some() {
+            return;
+        }
+        if self.layout.tabs.contains(self.mouse) {
+            self.tabbar.scroll(-(if dx != 0.0 { dx } else { dy }));
+            self.needs_redraw = true;
             return;
         }
         if self.primary() {
@@ -1027,10 +1181,10 @@ impl App {
             (dx, dy) = (dy, 0.0);
         }
         if dy != 0.0 {
-            self.view.scroll_px(-dy);
+            self.tabs[self.active].view.scroll_px(-dy);
         }
         if dx != 0.0 && !self.settings.wrap {
-            self.view.scroll_h(-dx);
+            self.tabs[self.active].view.scroll_h(-dx);
         }
         self.hover_url = None;
         self.needs_redraw = true;
@@ -1042,15 +1196,18 @@ impl App {
         let s = self.scale;
         let lh = self.gfx.ui_line_h();
         let menu_h = (lh + 8.0 * s).round();
+        let tabs_h = TabBar::height(&self.gfx, s);
         let status_h = if self.settings.status_bar { (lh + 6.0 * s).round() } else { 0.0 };
         let find_h = self.find.height(&self.gfx, s).round();
         let vbar_w = (12.0 * s).round();
-        let text_h = (h - menu_h - find_h - status_h).max(1.0);
+        let text_h = (h - menu_h - tabs_h - find_h - status_h).max(1.0);
+        let top = menu_h + tabs_h;
         self.layout = Layout {
             menu: Rect::new(0.0, 0.0, w, menu_h),
-            text: Rect::new(0.0, menu_h, (w - vbar_w).max(1.0), text_h),
-            vbar: Rect::new(w - vbar_w, menu_h, vbar_w, text_h),
-            find: Rect::new(0.0, menu_h + text_h, w, find_h),
+            tabs: Rect::new(0.0, menu_h, w, tabs_h),
+            text: Rect::new(0.0, top, (w - vbar_w).max(1.0), text_h),
+            vbar: Rect::new(w - vbar_w, top, vbar_w, text_h),
+            find: Rect::new(0.0, top + text_h, w, find_h),
             status: Rect::new(0.0, h - status_h, w, status_h),
         };
         let pad = (6.0 * s).round();
@@ -1059,7 +1216,7 @@ impl App {
         let want = ((self.layout.text.w - 2.0 * pad).max(1.0), text_h, font_px, line_h, self.settings.wrap);
         if want != self.applied {
             self.applied = want;
-            self.view.set_geometry(font_px, line_h, want.0, want.1, want.4);
+            self.tabs[self.active].view.set_geometry(font_px, line_h, want.0, want.1, want.4);
         }
     }
 
@@ -1070,9 +1227,9 @@ impl App {
         let pad = (6.0 * s).round();
         let show_caret =
             self.focused && !(self.find.visible && self.find.focus) && self.prompt.is_none() && self.font_dlg.is_none();
-        self.view.prepare(&mut self.gfx.fs);
+        self.tabs[self.active].view.prepare(&mut self.gfx.fs);
         let caret =
-            self.view.draw(&mut self.gfx.fs, &mut self.gfx.cache, cv, area, pad, &th, s, self.hover_url.as_ref());
+            self.tabs[self.active].view.draw(&mut self.gfx.fs, &mut self.gfx.cache, cv, area, pad, &th, s, self.hover_url.as_ref());
         if let Some((x, y, h)) = caret {
             cv.set_clip(area);
             if !self.preedit.is_empty() {
@@ -1105,10 +1262,10 @@ impl App {
         let (th, s) = (self.theme, self.scale);
         cv.fill(r, th.chrome);
         cv.fill(Rect::new(r.x, r.y, r.w, s.max(1.0)), th.border);
-        let cur = self.view.cursor;
-        let doc = &self.view.doc;
+        let cur = self.tabs[self.active].view.cursor;
+        let doc = &self.tabs[self.active].view.doc;
         let col = doc.line(cur.line)[..cur.index].chars().count() + 1;
-        let selected = self.view.selection().map(|(a, z)| doc.chars_between(a, z));
+        let selected = self.tabs[self.active].view.selection().map(|(a, z)| doc.chars_between(a, z));
         let left = match &self.status_msg {
             Some(m) => m.clone(),
             None => match selected {
@@ -1118,8 +1275,8 @@ impl App {
         };
         let row = Rect::new(r.x + 10.0 * s, r.y, r.w, r.h);
         cv.set_clip(r);
-        let eol = if self.mixed_eol { format!("{} (mixed)", self.eol.label()) } else { self.eol.label().to_owned() };
-        let segs = [format!("{}%", (self.zoom * 100.0).round()), eol, self.encoding.label().to_owned()];
+        let eol = if self.tabs[self.active].mixed_eol { format!("{} (mixed)", self.tabs[self.active].eol.label()) } else { self.tabs[self.active].eol.label().to_owned() };
+        let segs = [format!("{}%", (self.zoom * 100.0).round()), eol, self.tabs[self.active].encoding.label().to_owned()];
         let mut x = r.right() - 10.0 * s;
         for seg in segs.iter().rev() {
             let w = self.gfx.text_w(seg);
@@ -1149,7 +1306,7 @@ impl App {
             }
         }
         self.surface = Some(surface);
-        let title = format!("{}{} - {APP}", if self.is_dirty() { "*" } else { "" }, self.doc_name());
+        let title = format!("{}{} - {APP}", if self.tab().is_dirty() { "*" } else { "" }, self.doc_name());
         if title != self.title {
             win.set_title(&title);
             self.title = title;
@@ -1164,6 +1321,8 @@ impl App {
             self.find.draw(&mut self.gfx, cv, &th, self.layout.find, s);
         }
         self.draw_status(cv);
+        let items: Vec<(String, bool)> = self.tabs.iter().map(|t| (t.name(), t.is_dirty())).collect();
+        self.tabbar.draw(&mut self.gfx, cv, &th, self.layout.tabs, s, &items, self.active, self.mouse);
         self.menu.draw_bar(&mut self.gfx, cv, &th, self.layout.menu, s);
         if self.menu.open.is_some() {
             let states: Vec<(Cmd, bool)> = ui::MENUS
@@ -1235,6 +1394,8 @@ fn shortcut_char(ev: &KeyEvent) -> Option<char> {
         KeyCode::KeyP => 'p',
         KeyCode::KeyQ => 'q',
         KeyCode::KeyS => 's',
+        KeyCode::KeyT => 't',
+        KeyCode::KeyW => 'w',
         KeyCode::KeyV => 'v',
         KeyCode::KeyX => 'x',
         KeyCode::KeyY => 'y',
@@ -1242,6 +1403,15 @@ fn shortcut_char(ev: &KeyEvent) -> Option<char> {
         KeyCode::Equal | KeyCode::NumpadAdd => '=',
         KeyCode::Minus | KeyCode::NumpadSubtract => '-',
         KeyCode::Digit0 | KeyCode::Numpad0 => '0',
+        KeyCode::Digit1 => '1',
+        KeyCode::Digit2 => '2',
+        KeyCode::Digit3 => '3',
+        KeyCode::Digit4 => '4',
+        KeyCode::Digit5 => '5',
+        KeyCode::Digit6 => '6',
+        KeyCode::Digit7 => '7',
+        KeyCode::Digit8 => '8',
+        KeyCode::Digit9 => '9',
         _ => return None,
     })
 }
@@ -1307,7 +1477,7 @@ impl ApplicationHandler for App {
                             if self.find.visible && self.find.focus {
                                 self.find.field_mut().key(FieldKey::Insert(&text));
                             } else {
-                                self.view.type_text(&text);
+                                self.tabs[self.active].view.type_text(&text);
                                 self.edited();
                             }
                         }
@@ -1325,8 +1495,7 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => self.on_mouse_button(state, button),
             WindowEvent::MouseWheel { delta, .. } => self.on_wheel(delta),
             WindowEvent::DroppedFile(path) => {
-                self.dropped = Some(path);
-                self.run(Cmd::Open);
+                self.open_path(path);
                 self.needs_redraw = true;
             }
             _ => {}
@@ -1346,9 +1515,9 @@ impl ApplicationHandler for App {
 
 fn main() {
     let settings = Settings::load();
-    let file = std::env::args_os().nth(1).map(PathBuf::from);
+    let files = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let el = EventLoop::new().expect("failed to create event loop");
     el.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(settings, file);
+    let mut app = App::new(settings, files);
     el.run_app(&mut app).expect("event loop error");
 }

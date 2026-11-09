@@ -31,6 +31,11 @@ pub enum Cmd {
     StatusBar,
     SetEol(Eol),
     SetEncoding(Encoding),
+    CloseTab,
+    NextTab,
+    PrevTab,
+    /// 1-8 select that tab, 9 the last one.
+    SelectTab(u8),
 }
 
 pub struct Item {
@@ -48,11 +53,12 @@ pub const MENUS: &[(&str, &[Item])] = &[
     (
         "File",
         &[
-            it("New", "Ctrl+N", Cmd::New),
+            it("New Tab", "Ctrl+N", Cmd::New),
             it("Open…", "Ctrl+O", Cmd::Open),
             it("Save", "Ctrl+S", Cmd::Save),
             it("Save As…", "Ctrl+Shift+S", Cmd::SaveAs),
             it("Rename…", "", Cmd::Rename),
+            it("Close Tab", "Ctrl+W", Cmd::CloseTab),
             SEP,
             it("Print…", "Ctrl+P", Cmd::Print),
             SEP,
@@ -103,13 +109,19 @@ pub const MENUS: &[(&str, &[Item])] = &[
             it("Restore Default Zoom", "Ctrl+0", Cmd::ZoomReset),
             SEP,
             it("Status Bar", "", Cmd::StatusBar),
+            SEP,
+            it("Next Tab", "Ctrl+Tab", Cmd::NextTab),
+            it("Previous Tab", "Ctrl+Shift+Tab", Cmd::PrevTab),
         ],
     ),
 ];
 
 /// Shortcut text as shown on this platform.
 pub fn key_label(k: &str) -> String {
-    if cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") && k.ends_with("Tab") {
+        // Tab switching uses the Control key on macOS too.
+        k.replace("Ctrl+Shift+", "⌃⇧").replace("Ctrl+", "⌃")
+    } else if cfg!(target_os = "macos") {
         k.replace("Ctrl+Shift+", "⇧⌘").replace("Ctrl+", "⌘").replace("Shift+", "⇧").replace("Alt+", "⌥")
     } else {
         k.to_owned()
@@ -668,5 +680,153 @@ impl Prompt {
 
     pub fn hit(&self, p: (f32, f32)) -> Option<Choice> {
         self.buttons.iter().find(|(r, _)| r.contains(p)).map(|(_, c)| *c)
+    }
+}
+
+pub enum TabHit {
+    Tab(usize),
+    Close(usize),
+    New,
+    Strip,
+}
+
+/// The strip of document tabs under the menu bar.
+#[derive(Default)]
+pub struct TabBar {
+    /// (tab rect, close-button rect) for each tab, in screen coordinates.
+    rects: Vec<(Rect, Rect)>,
+    new_btn: Rect,
+    strip: Rect,
+    /// Horizontal scroll of the strip when tabs overflow.
+    offset: f32,
+    max_offset: f32,
+    /// Scroll the active tab into view on the next draw.
+    pub reveal: bool,
+}
+
+impl TabBar {
+    pub fn height(g: &Gfx, s: f32) -> f32 {
+        (g.ui_line_h() + 14.0 * s).round()
+    }
+
+    /// `items` holds (name, modified) for each tab.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw(
+        &mut self,
+        g: &mut Gfx,
+        cv: &mut Canvas,
+        th: &Theme,
+        r: Rect,
+        s: f32,
+        items: &[(String, bool)],
+        active: usize,
+        mouse: (f32, f32),
+    ) {
+        cv.fill(r, th.chrome);
+        cv.fill(Rect::new(r.x, r.bottom() - s, r.w, s), th.border);
+        self.strip = r;
+        let btn = r.h - 6.0 * s;
+        let avail = (r.w - btn - 12.0 * s).max(0.0);
+        let close_w = 26.0 * s;
+        let (min_w, max_w) = (90.0 * s, 220.0 * s);
+        let mut widths: Vec<f32> =
+            items.iter().map(|(n, _)| (g.text_w(n) + 14.0 * s + close_w).clamp(min_w, max_w)).collect();
+        let total: f32 = widths.iter().sum();
+        if total > avail && !items.is_empty() {
+            let w = (avail / items.len() as f32).max(min_w);
+            for x in &mut widths {
+                *x = x.min(w);
+            }
+        }
+        let total: f32 = widths.iter().sum();
+        self.max_offset = (total - avail).max(0.0);
+        if std::mem::take(&mut self.reveal) && active < widths.len() {
+            let x0: f32 = widths[..active].iter().sum();
+            let x1 = x0 + widths[active];
+            if x0 < self.offset {
+                self.offset = x0;
+            } else if x1 > self.offset + avail {
+                self.offset = x1 - avail;
+            }
+        }
+        self.offset = self.offset.clamp(0.0, self.max_offset);
+
+        self.rects.clear();
+        let strip = Rect::new(r.x, r.y, avail + 4.0 * s, r.h - s);
+        let top = r.y + 4.0 * s;
+        let h = r.bottom() - s - top;
+        let mut x = r.x + 4.0 * s - self.offset;
+        for (i, ((name, dirty), w)) in items.iter().zip(&widths).enumerate() {
+            let tr = Rect::new(x, top, *w, h);
+            let cr = Rect::new(tr.right() - close_w + 4.0 * s, top + (h - 18.0 * s) / 2.0, 18.0 * s, 18.0 * s);
+            x += w;
+            self.rects.push((tr, cr));
+            let hovered = tr.contains(mouse) && strip.contains(mouse);
+            cv.set_clip(strip);
+            if i == active {
+                cv.fill(Rect::new(tr.x, tr.y, tr.w, tr.h + s), th.bg);
+                cv.fill(Rect::new(tr.x, tr.y, tr.w, (2.0 * s).round()), th.accent);
+            } else {
+                if hovered {
+                    cv.fill(tr, th.hover);
+                }
+                if i + 1 != active {
+                    cv.fill(Rect::new(tr.right() - s, tr.y + h * 0.25, s.max(1.0), h * 0.5), th.border);
+                }
+            }
+            let color = if i == active { th.fg } else { th.dim };
+            cv.set_clip(Rect::new(tr.x, tr.y, (tr.w - close_w).max(0.0), tr.h));
+            g.text_in(cv, name, Rect::new(tr.x + 10.0 * s, tr.y, tr.w, tr.h), color);
+            cv.set_clip(strip);
+            let over_close = cr.contains(mouse);
+            let glyph = if *dirty && !over_close {
+                Some("●")
+            } else if i == active || hovered {
+                Some("×")
+            } else {
+                None
+            };
+            if over_close {
+                cv.fill(cr, th.hover);
+            }
+            if let Some(gl) = glyph {
+                let gw = g.text_w(gl);
+                g.text_in(cv, gl, Rect::new(cr.x + (cr.w - gw) / 2.0, cr.y, gw, cr.h), color);
+            }
+            cv.reset_clip();
+        }
+        let bx = (r.x + 4.0 * s + total - self.offset).min(r.x + avail + 4.0 * s) + 4.0 * s;
+        self.new_btn = Rect::new(bx, r.y + 3.0 * s, btn, btn);
+        if self.new_btn.contains(mouse) {
+            cv.fill(self.new_btn, th.hover);
+        }
+        let pw = g.text_w("+");
+        g.text_in(cv, "+", Rect::new(bx + (btn - pw) / 2.0, self.new_btn.y, pw, btn), th.chrome_fg);
+        // Keep hit-testing to the visible part of the strip.
+        for (tr, cr) in &mut self.rects {
+            let x0 = tr.x.max(strip.x);
+            let x1 = tr.right().min(strip.right());
+            *tr = Rect::new(x0, tr.y, (x1 - x0).max(0.0), tr.h);
+            if !strip.contains((cr.x + cr.w / 2.0, cr.y)) {
+                *cr = Rect::default();
+            }
+        }
+    }
+
+    pub fn hit(&self, p: (f32, f32)) -> Option<TabHit> {
+        if let Some(i) = self.rects.iter().position(|(_, c)| c.contains(p)) {
+            return Some(TabHit::Close(i));
+        }
+        if let Some(i) = self.rects.iter().position(|(t, _)| t.contains(p)) {
+            return Some(TabHit::Tab(i));
+        }
+        if self.new_btn.contains(p) {
+            return Some(TabHit::New);
+        }
+        self.strip.contains(p).then_some(TabHit::Strip)
+    }
+
+    pub fn scroll(&mut self, d: f32) {
+        self.offset = (self.offset + d).clamp(0.0, self.max_offset);
     }
 }

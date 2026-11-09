@@ -8,12 +8,23 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
 
 ## Features
 
+**Tabs**
+- Each open document has its own tab, with its own undo history, encoding and line-ending settings.
+- A ● on a tab means it has unsaved changes. Click × or middle-click a tab to close it, click + or
+  double-click the empty part of the tab bar for a new tab, and drag tabs to reorder them.
+- When there are too many tabs to fit, the tab bar scrolls (mouse wheel) and keeps the active tab visible.
+- New documents are named Untitled, Untitled 2, and so on.
+- Opening a file that's already open switches to its tab. An empty, untouched Untitled tab is reused
+  rather than left behind.
+- Closing the last tab leaves a fresh empty one instead of quitting.
+
 **Files**
-- New, Open, Save, Save As, Rename, Print
-- You can also drag a file onto the window or pass a path on the command line
+- New Tab, Open, Save, Save As, Rename, Close Tab, Print
+- The Open dialog can select several files. You can also drag files onto the window or pass several paths on
+  the command line; each opens in its own tab.
 - Saving writes a temporary file and renames it over the original, so a failed save never truncates your file.
   Symlinks and file permissions are kept.
-- A save prompt appears before New, Open or Exit if there are unsaved changes. The window title shows `*`
+- Closing a tab with unsaved changes asks whether to save it. Exit asks about each modified tab in turn. The window title shows `*`
   while the file is modified, and it clears if you undo back to the saved state.
 
 **Text and Unicode**
@@ -51,12 +62,15 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
 
 ## Keyboard shortcuts
 
-On macOS, use **Cmd** wherever this table says **Ctrl**. macOS also follows its own conventions for moving the cursor; see the notes below the table.
+On macOS, use **Cmd** wherever this table says **Ctrl**, except for Ctrl+Tab and Ctrl+Shift+Tab, which use Control there too. macOS also follows its own conventions for moving the cursor; see the notes below the table.
 
 | Action | Shortcut |
 |---|---|
-| New | Ctrl+N |
+| New tab | Ctrl+N or Ctrl+T |
 | Open | Ctrl+O |
+| Close tab | Ctrl+W |
+| Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab, or Ctrl+PageDown / Ctrl+PageUp |
+| Go to tab 1–8 / last tab | Ctrl+1 … Ctrl+8 / Ctrl+9 |
 | Save | Ctrl+S |
 | Save As | Ctrl+Shift+S |
 | Print | Ctrl+P |
@@ -180,7 +194,9 @@ Recently fixed:
 - [x] Lower the peak memory while loading: files are decoded 64 KB at a time straight into the rope
 - [ ] Handle very long single lines, such as minified files. cosmic-text shapes a whole line at once, so a
       multi-megabyte line is slow to display.
-- [ ] Open several documents at once, in tabs
+- [x] Open several documents at once, in tabs
+- [ ] Restore the open tabs when the app restarts
+- [ ] Drag a tab out into its own window
 - [ ] Use the native macOS menu bar at the top of the screen instead of the in-window menu bar
 - [ ] Add a print dialog on macOS and Linux (page setup, choice of printer, copies)
 - [ ] Add a horizontal scrollbar when word wrap is off
