@@ -85,7 +85,7 @@ impl App {
         cv.fill(Rect::new(r.x, r.y, r.w, s.max(1.0)), th.border);
         let cur = self.win.tabs[self.win.active].view.cursor;
         let doc = &self.win.tabs[self.win.active].view.doc;
-        let col = doc.line(cur.line).get(..cur.index).map_or(0, |s| s.chars().count()) + 1;
+        let col = doc.column(cur); // no copy of the (possibly huge) line
         let selected = self.win.tabs[self.win.active].view.selection().map(|(a, z)| doc.chars_between(a, z));
         let hovered = self.win.hover_url.as_ref().and_then(|(l, r)| {
             let line = doc.line(*l);

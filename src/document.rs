@@ -63,6 +63,9 @@ impl Group {
 /// Which document lines an edit touched, for updating the layout window.
 #[derive(Clone, Copy, Debug)]
 pub struct EditResult {
+    /// Start of the edit, and the end of the replaced text (before the edit).
+    pub start: Cursor,
+    pub old_end: Cursor,
     pub first: usize,
     /// Last line of the edited range before the edit.
     pub old_last: usize,
@@ -202,7 +205,7 @@ impl Document {
         self.rope.remove(ca..cb);
         self.rope.insert(ca, text);
         let end = end_of(a, text);
-        (removed, EditResult { first: a.line, old_last: b.line, new_last: end.line, end })
+        (removed, EditResult { start: a, old_end: b, first: a.line, old_last: b.line, new_last: end.line, end })
     }
 
     fn record(&mut self, ops: Vec<Op>, merge: bool) {
@@ -391,18 +394,38 @@ impl Document {
         if c.index == 0 {
             return if c.line == 0 { c } else { Cursor::new(c.line - 1, self.line_len(c.line - 1)) };
         }
-        let line = self.line(c.line);
-        Cursor::new(c.line, line[..c.index].char_indices().next_back().map_or(0, |(i, _)| i))
+        // Straight from the rope: no copy of the (possibly huge) line.
+        let ci = self.char_idx(c);
+        let prev = self.rope.char_to_byte(ci - 1) - self.rope.line_to_byte(c.line);
+        Cursor::new(c.line, prev)
     }
 
     /// Next grapheme cluster boundary (Delete removes a whole cluster).
     pub fn next_grapheme(&self, c: Cursor) -> Cursor {
-        let line = self.line(c.line);
-        if c.index >= line.len() {
+        let len = self.line_len(c.line);
+        if c.index >= len {
             return if c.line + 1 < self.len_lines() { Cursor::new(c.line + 1, 0) } else { c };
         }
-        let len = line[c.index..].graphemes(true).next().map_or(0, str::len);
-        Cursor::new(c.line, c.index + len)
+        // Look at a small window after the cursor rather than copying the whole line.
+        // A cluster longer than the window is cut at the window's end, which still
+        // deletes valid characters.
+        let ci = self.char_idx(c);
+        let line_end = self.char_idx(Cursor::new(c.line, len));
+        let ahead: String = self.rope.slice(ci..line_end.min(ci + 64)).to_string();
+        let g = ahead.graphemes(true).next().map_or(0, str::len);
+        Cursor::new(c.line, c.index + g)
+    }
+
+    /// Text of line `line` between byte offsets `a` and `b` (char boundaries).
+    pub fn line_slice(&self, line: usize, a: usize, b: usize) -> String {
+        let base = self.rope.line_to_byte(line);
+        let (ca, cb) = (self.rope.byte_to_char(base + a), self.rope.byte_to_char(base + b));
+        self.rope.slice(ca..cb).to_string()
+    }
+
+    /// 1-based column (in characters) of a position, without copying the line.
+    pub fn column(&self, c: Cursor) -> usize {
+        self.chars_between(Cursor::new(c.line, 0), c) + 1
     }
 
     /// The word (or run of whitespace/punctuation) containing `c`.
@@ -523,6 +546,17 @@ mod tests {
         assert_eq!(d.to_string_eol("\n"), "xyz b xyz\nxyz");
         d.undo();
         assert_eq!(d.to_string_eol("\n"), "a b a\na");
+    }
+
+    #[test]
+    fn navigation_on_long_lines() {
+        let text = format!("{}é\u{301}x", "a".repeat(100_000));
+        let d = Document::new(&text);
+        let at = c(0, 100_000);
+        assert_eq!(d.next_grapheme(at), c(0, 100_004)); // é + combining accent
+        assert_eq!(d.prev_char(c(0, 100_004)), c(0, 100_002));
+        assert_eq!(d.line_slice(0, 99_998, 100_004), "aaé\u{301}");
+        assert_eq!(d.column(c(0, 100_004)), 100_003);
     }
 
     #[test]

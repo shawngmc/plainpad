@@ -3,6 +3,12 @@
 //! [`Buffer`] for shaping and layout, so memory for layout is bounded by the
 //! window size rather than the document size. Cursor, selection and undo are
 //! kept in document coordinates.
+//!
+//! Very long lines (minified files, logs) are split into display segments of
+//! at most [`SEG`] bytes, each its own layout line. cosmic-text shapes a line as
+//! a whole, so without this a multi-megabyte line took seconds to show and every
+//! keystroke re-shaped all of it. `segs` maps each layout line back to its
+//! document line and starting byte.
 
 use crate::document::{Document, EditResult, order};
 use crate::gfx::{Canvas, Rect, Theme};
@@ -13,6 +19,46 @@ use cosmic_text::{
     SwashCache, Wrap,
 };
 use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
+
+/// Lines longer than this many bytes are split into display segments.
+const SEG: usize = 2048;
+
+/// Byte offsets where a line's display segments start (always begins with 0).
+/// Splits after a space or punctuation in the last quarter of a segment where
+/// possible, otherwise at a grapheme boundary, so no character is broken.
+fn split_line(text: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    let mut s = 0;
+    while text.len() - s > SEG {
+        let limit = s + SEG;
+        let soft = text.as_bytes()[s + SEG * 3 / 4..limit]
+            .iter()
+            .rposition(|b| b" ,;})]>".contains(b))
+            .map(|p| s + SEG * 3 / 4 + p + 1);
+        let cut = soft.unwrap_or_else(|| {
+            let window_end = (limit + 64).min(text.len());
+            let mut end = window_end;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text[s..end].grapheme_indices(true).map(|(i, _)| s + i).take_while(|&i| i <= limit).last().unwrap_or(s)
+        });
+        // Always make progress, even through one enormous grapheme cluster.
+        let cut = if cut > s {
+            cut
+        } else {
+            let mut c = limit;
+            while !text.is_char_boundary(c) {
+                c += 1;
+            }
+            c
+        };
+        starts.push(cut);
+        s = cut;
+    }
+    starts
+}
 
 pub fn font_attrs(family: &str) -> Attrs<'_> {
     if family.is_empty() { Attrs::new().family(Family::Monospace) } else { Attrs::new().family(Family::Name(family)) }
@@ -23,6 +69,8 @@ pub struct View {
     buf: Buffer,
     /// Document line held in `buf.lines[0]`.
     win: usize,
+    /// For each line in `buf.lines`: (document line, byte offset where it starts).
+    segs: Vec<(usize, usize)>,
     pub cursor: Cursor,
     pub anchor: Option<Cursor>,
     cursor_x: Option<i32>,
@@ -40,6 +88,7 @@ impl View {
             doc: Document::new(""),
             buf,
             win: 0,
+            segs: Vec::new(),
             cursor: Cursor::default(),
             anchor: None,
             cursor_x: None,
@@ -48,7 +97,7 @@ impl View {
             vis_rows: 40,
             geom: None,
         };
-        v.load_window(0, 0.0, false);
+        v.load_window((0, 0), 0.0, false);
         v
     }
 
@@ -63,7 +112,7 @@ impl View {
         self.anchor = None;
         self.cursor_x = None;
         self.buf.set_scroll(Scroll::default());
-        self.load_window(0, 0.0, false);
+        self.load_window((0, 0), 0.0, false);
     }
 
     pub fn set_font(&mut self, family: &str) {
@@ -109,24 +158,54 @@ impl View {
         (self.vis_rows * 2).max(64)
     }
 
+    /// One past the last document line in the window.
     fn win_end(&self) -> usize {
-        self.win + self.buf.lines.len()
+        self.segs.last().map_or(self.win, |s| s.0 + 1)
+    }
+
+    /// The first visible segment: (document line, byte offset).
+    fn top_pos(&self) -> (usize, usize) {
+        self.segs.get(self.buf.scroll().line).copied().unwrap_or((self.win, 0))
     }
 
     fn top_line(&self) -> usize {
-        self.win + self.buf.scroll().line
+        self.top_pos().0
     }
 
     fn in_window(&self, c: Cursor) -> bool {
         c.line >= self.win && c.line < self.win_end()
     }
 
+    /// Whether the whole document is loaded (no window shifting needed).
+    fn whole_doc(&self) -> bool {
+        self.win == 0 && self.win_end() == self.doc.len_lines()
+    }
+
+    /// Index of the segment containing a document position. A position exactly
+    /// on a boundary belongs to the segment that starts there.
+    fn seg_of(&self, line: usize, index: usize) -> usize {
+        self.segs.partition_point(|&s| s <= (line, index)).saturating_sub(1)
+    }
+
     fn doc_to_win(&self, c: Cursor) -> Cursor {
-        Cursor { line: c.line - self.win, ..c }
+        let k = self.seg_of(c.line, c.index);
+        Cursor { line: k, index: c.index.saturating_sub(self.segs[k].1), ..c }
     }
 
     fn win_to_doc(&self, c: Cursor) -> Cursor {
-        Cursor { line: c.line + self.win, ..c }
+        let (line, start) = self.segs[c.line];
+        Cursor { line, index: start + c.index, ..c }
+    }
+
+    /// Layout lines (and their `segs` entries) for document line `i`.
+    fn make_lines(&self, i: usize, out: &mut Vec<BufferLine>, segs: &mut Vec<(usize, usize)>) {
+        let text = self.doc.line(i);
+        let starts = split_line(&text);
+        for (k, &a) in starts.iter().enumerate() {
+            let b = starts.get(k + 1).copied().unwrap_or(text.len());
+            out.push(BufferLine::new(&text[a..b], LineEnding::Lf, self.attrs.clone(), Shaping::Advanced));
+            segs.push((i, a));
+        }
     }
 
     /// Forces the buffer to re-run layout. cosmic-text only notices freshly
@@ -138,31 +217,39 @@ impl View {
         self.buf.set_scroll(s);
     }
 
-    fn new_line(&self, i: usize) -> BufferLine {
-        BufferLine::new(self.doc.line(i), LineEnding::Lf, self.attrs.clone(), Shaping::Advanced)
-    }
-
-    /// Loads doc lines around `top` into the layout buffer, scrolled so that
-    /// `top` is the first visible line. With `reuse`, lines already loaded
-    /// (and their shaping) are kept; only valid if the window mirrors the doc.
-    fn load_window(&mut self, top: usize, vert: f32, reuse: bool) {
+    /// Loads doc lines around `top` (document line, byte offset) into the layout
+    /// buffer, scrolled so that the segment containing `top` is the first visible
+    /// line. With `reuse`, lines already loaded (and their shaping) are kept; only
+    /// valid if the window mirrors the doc.
+    fn load_window(&mut self, top: (usize, usize), vert: f32, reuse: bool) {
         let n = self.doc.len_lines();
         let m = self.margin();
-        let top = top.min(n - 1);
-        let start = top.saturating_sub(m);
-        let end = (top + self.vis_rows + m).min(n).max(start + 1);
+        let top = if top.0 >= n { (n - 1, 0) } else { top };
+        let start = top.0.saturating_sub(m);
+        let end = (top.0 + self.vis_rows + m).min(n).max(start + 1);
+        let old_segs = std::mem::take(&mut self.segs);
         let mut old: Vec<Option<BufferLine>> =
             if reuse { std::mem::take(&mut self.buf.lines).into_iter().map(Some).collect() } else { Vec::new() };
-        let os = self.win;
         let mut lines = Vec::with_capacity(end - start);
+        let mut segs = Vec::with_capacity(end - start);
         for i in start..end {
-            let reused = if i >= os { old.get_mut(i - os).and_then(Option::take) } else { None };
-            lines.push(reused.unwrap_or_else(|| self.new_line(i)));
+            let a = old_segs.partition_point(|s| s.0 < i);
+            let b = old_segs.partition_point(|s| s.0 <= i);
+            if reuse && a < b && old[a..b].iter().all(Option::is_some) {
+                for k in a..b {
+                    lines.push(old[k].take().expect("checked"));
+                    segs.push(old_segs[k]);
+                }
+            } else {
+                self.make_lines(i, &mut lines, &mut segs);
+            }
         }
         self.buf.lines = lines;
+        self.segs = segs;
         self.win = start;
         let h = self.buf.scroll().horizontal;
-        self.buf.set_scroll(Scroll::new(top - start, vert, h));
+        let k = self.seg_of(top.0, top.1);
+        self.buf.set_scroll(Scroll::new(k, vert, h));
         self.touch();
     }
 
@@ -173,7 +260,7 @@ impl View {
         let near_top = self.win > 0 && s.line < m / 2;
         let near_bottom = self.win_end() < n && s.line + self.vis_rows + m / 2 > len;
         if near_top || near_bottom {
-            self.load_window(self.top_line(), s.vertical, true);
+            self.load_window(self.top_pos(), s.vertical, true);
             return true;
         }
         false
@@ -190,9 +277,9 @@ impl View {
         let top = self.top_line();
         let s = self.buf.scroll();
         if c + m / 2 >= top && c < top + self.vis_rows + m / 2 {
-            self.load_window(top, s.vertical, true);
+            self.load_window(self.top_pos(), s.vertical, true);
         } else {
-            self.load_window(c.saturating_sub(self.vis_rows / 2), 0.0, true);
+            self.load_window((c.saturating_sub(self.vis_rows / 2), 0), 0.0, true);
         }
     }
 
@@ -237,9 +324,9 @@ impl View {
     pub fn scroll_px(&mut self, px: f32) {
         let lh = self.line_h();
         let lines = (px / lh) as isize;
-        if lines.unsigned_abs() > self.margin() / 2 {
+        if lines.unsigned_abs() > self.margin() / 2 && !self.whole_doc() {
             let top = (self.top_line() as isize + lines).max(0) as usize;
-            self.load_window(top, 0.0, true);
+            self.load_window((top, 0), 0.0, true);
             return;
         }
         let mut s = self.buf.scroll();
@@ -253,13 +340,25 @@ impl View {
         self.buf.set_scroll(s);
     }
 
-    /// (total doc lines, first visible doc line)
+    /// (total, first visible) in scroll units: document lines, or segments when
+    /// the whole document is loaded (so one huge line still scrolls smoothly).
     pub fn scroll_info(&self) -> (usize, usize) {
-        (self.doc.len_lines(), self.top_line())
+        if self.whole_doc() {
+            (self.segs.len(), self.buf.scroll().line)
+        } else {
+            (self.doc.len_lines(), self.top_line())
+        }
     }
 
-    pub fn scroll_to_line(&mut self, line: usize) {
-        self.load_window(line, 0.0, true);
+    /// Scrolls to a position in the units of [`View::scroll_info`].
+    pub fn scroll_to_line(&mut self, unit: usize) {
+        if self.whole_doc() {
+            let h = self.buf.scroll().horizontal;
+            self.buf.set_scroll(Scroll::new(unit.min(self.segs.len() - 1), 0.0, h));
+            self.touch();
+        } else {
+            self.load_window((unit, 0), 0.0, true);
+        }
     }
 
     // ------------------------------------------------------------ selection
@@ -291,12 +390,56 @@ impl View {
 
     // ------------------------------------------------------------ editing
 
+    /// Fast path for an edit within one segment of one line (typing, Backspace,
+    /// Delete): re-lay out just that segment and shift the later segments' offsets.
+    fn edit_segment(&mut self, r: &EditResult) -> bool {
+        let line = r.first;
+        if r.old_last != line || r.new_last != line || !self.in_window(r.start) {
+            return false;
+        }
+        let k = self.seg_of(line, r.start.index);
+        let delta = r.end.index as isize - r.old_end.index as isize;
+        let seg_start = self.segs[k].1;
+        let next = self.segs.get(k + 1).filter(|s| s.0 == line).map(|s| s.1);
+        let old_line_len = (self.doc.line_len(line) as isize - delta) as usize;
+        let old_seg_end = next.unwrap_or(old_line_len);
+        if r.old_end.index > old_seg_end {
+            return false; // the edit spans a segment boundary
+        }
+        let new_end = (old_seg_end as isize + delta) as usize;
+        let len = new_end - seg_start;
+        // Re-split once a segment grows well past the limit, or empties out.
+        if len > 2 * SEG || (len == 0 && (k > 0 && self.segs[k - 1].0 == line || next.is_some())) {
+            return false;
+        }
+        let text = self.doc.line_slice(line, seg_start, new_end);
+        self.buf.lines[k].set_text(text, LineEnding::Lf, self.attrs.clone());
+        for s in self.segs[k + 1..].iter_mut().take_while(|s| s.0 == line) {
+            s.1 = (s.1 as isize + delta) as usize;
+        }
+        self.touch();
+        true
+    }
+
     fn after_edit(&mut self, r: EditResult) {
         let (ws, we) = (self.win, self.win_end());
-        let grown = self.buf.lines.len() + r.new_last.saturating_sub(r.old_last);
-        if r.first >= ws && r.old_last < we && grown <= self.vis_rows + 4 * self.margin() {
-            let new: Vec<BufferLine> = (r.first..=r.new_last).map(|i| self.new_line(i)).collect();
-            self.buf.lines.splice(r.first - ws..=r.old_last - ws, new);
+        if self.edit_segment(&r) {
+            // done
+        } else if r.first >= ws && r.old_last < we && r.new_last - r.first <= 4 * self.margin() {
+            // Rebuild the edited lines' segments in place.
+            let a = self.segs.partition_point(|s| s.0 < r.first);
+            let b = self.segs.partition_point(|s| s.0 <= r.old_last);
+            let (mut lines, mut segs) = (Vec::new(), Vec::new());
+            for i in r.first..=r.new_last {
+                self.make_lines(i, &mut lines, &mut segs);
+            }
+            self.buf.lines.splice(a..b, lines);
+            let shift = r.new_last as isize - r.old_last as isize;
+            let added = segs.len();
+            self.segs.splice(a..b, segs);
+            for s in &mut self.segs[a + added..] {
+                s.0 = (s.0 as isize + shift) as usize;
+            }
             self.touch();
         } else {
             self.reload();
@@ -309,7 +452,7 @@ impl View {
 
     /// Rebuilds the window from the document, keeping the scroll position.
     fn reload(&mut self) {
-        let top = self.top_line().min(self.doc.len_lines() - 1);
+        let top = self.top_pos();
         let vert = self.buf.scroll().vertical;
         self.load_window(top, vert, false);
     }
@@ -368,10 +511,8 @@ impl View {
         }
         self.ensure_cursor_window();
         let m = if forward { Motion::NextWord } else { Motion::PreviousWord };
-        let wc = self.doc_to_win(self.cursor);
-        if let Some((t, _)) = self.buf.cursor_motion(fs, wc, None, m) {
-            let t = self.win_to_doc(t);
-            if t != self.cursor {
+        if let Some((t, _)) = self.seg_motion(fs, m, None) {
+            if (t.line, t.index) != (self.cursor.line, self.cursor.index) {
                 let r = self.doc.replace(self.cursor, t, "", false);
                 self.after_edit(r);
             }
@@ -427,16 +568,30 @@ impl View {
             Motion::BufferEnd => (self.doc.end(), None),
             _ => {
                 self.ensure_cursor_window();
-                let wc = self.doc_to_win(self.cursor);
-                match self.buf.cursor_motion(fs, wc, self.cursor_x, m) {
-                    Some((c, x)) => (self.win_to_doc(c), x),
-                    None => (self.cursor, self.cursor_x),
-                }
+                self.seg_motion(fs, m, self.cursor_x).unwrap_or((self.cursor, self.cursor_x))
             }
         };
         self.cursor = new;
         self.cursor_x = x;
         self.reveal = true;
+    }
+
+    /// Applies a cosmic-text motion to the cursor, in document coordinates. The
+    /// end of one segment and the start of the next are the same document
+    /// position, so a motion that lands on that boundary is applied again.
+    fn seg_motion(&mut self, fs: &mut FontSystem, m: Motion, x: Option<i32>) -> Option<(Cursor, Option<i32>)> {
+        let from = (self.cursor.line, self.cursor.index);
+        let mut wc = self.doc_to_win(self.cursor);
+        let mut x = x;
+        for _ in 0..2 {
+            let (c, nx) = self.buf.cursor_motion(fs, wc, x, m)?;
+            let d = self.win_to_doc(c);
+            if (d.line, d.index) != from || c == wc {
+                return Some((d, nx));
+            }
+            (wc, x) = (c, nx);
+        }
+        Some((self.win_to_doc(wc), x))
     }
 
     /// `x`/`y` are relative to the text origin (horizontal scroll already added).
@@ -490,7 +645,8 @@ impl View {
         let run = self.buf.layout_runs().find(|r| y >= r.line_top && y < r.line_top + r.line_height)?;
         let g = run.glyphs.iter().find(|g| x >= g.x && x < g.x + g.w)?;
         let r = search::find_urls(run.text).into_iter().find(|r| g.start >= r.start && g.start < r.end)?;
-        Some((run.line_i + self.win, r.clone(), run.text[r].to_owned()))
+        let (line, off) = self.segs[run.line_i];
+        Some((line, r.start + off..r.end + off, run.text[r].to_owned()))
     }
 
     // ------------------------------------------------------------ drawing
@@ -577,7 +733,9 @@ impl View {
                 };
                 let pg = g.physical((ox, oy + run.line_y), 1.0);
                 cache.with_pixels(fs, pg.cache_key, color, |x, y, c| cv.blend(pg.x + x, pg.y + y, c));
-                let hovered = hover.is_some_and(|(hl, hr)| *hl == li + ws && g.start >= hr.start && g.start < hr.end);
+                let (dl, off) = self.segs[li];
+                let gs = g.start + off;
+                let hovered = hover.is_some_and(|(hl, hr)| *hl == dl && gs >= hr.start && gs < hr.end);
                 // Suspicious links are always underlined (doubly when hovered), so they stand out unprompted.
                 if hovered || suspicious {
                     let c = if suspicious { th.danger } else { th.link };
@@ -658,16 +816,12 @@ mod tests {
             ("X", "new", "line 10")
         );
         // Window lines must match the document exactly.
-        for (k, l) in v.buf.lines.iter().enumerate() {
-            assert_eq!(l.text(), v.doc.line(v.win + k), "window line {k}");
-        }
+        assert_mirrors(&v);
         v.undo();
         v.undo();
         v.prepare(&mut fs);
         assert_eq!(v.doc.line(10), "line 10");
-        for (k, l) in v.buf.lines.iter().enumerate() {
-            assert_eq!(l.text(), v.doc.line(v.win + k));
-        }
+        assert_mirrors(&v);
     }
 
     #[test]
@@ -679,9 +833,7 @@ mod tests {
         }
         let (_, top) = v.scroll_info();
         assert!((850..=950).contains(&top), "top = {top}");
-        for (k, l) in v.buf.lines.iter().enumerate() {
-            assert_eq!(l.text(), v.doc.line(v.win + k));
-        }
+        assert_mirrors(&v);
         assert!(v.window_len() < 200);
     }
 
@@ -760,5 +912,109 @@ mod tests {
         v.set_geometry(14.0, 18.0, 300.0, 18.0 * 15.0, true);
         v.prepare(&mut fs);
         assert_eq!(v.scroll_info().1, top);
+    }
+
+    /// The layout window must mirror the document exactly: each segment's text
+    /// matches its slice of the document line, and segments cover whole lines.
+    fn assert_mirrors(v: &View) {
+        for (k, l) in v.buf.lines.iter().enumerate() {
+            let (line, start) = v.segs[k];
+            let end = match v.segs.get(k + 1) {
+                Some(&(nl, ns)) if nl == line => ns,
+                _ => v.doc.line_len(line),
+            };
+            if k == 0 || v.segs[k - 1].0 != line {
+                assert_eq!(start, 0, "segment {k} should start its line");
+            }
+            assert_eq!(l.text(), v.doc.line_slice(line, start, end), "segment {k} of line {line}");
+        }
+    }
+
+    #[test]
+    fn split_line_respects_limits_and_characters() {
+        assert_eq!(split_line("short"), vec![0]);
+        let text = "aé😀 ".repeat(5000); // multi-byte characters throughout
+        let starts = split_line(&text);
+        assert!(starts.len() > 1);
+        for w in starts.windows(2) {
+            assert!(w[1] > w[0] && w[1] - w[0] <= SEG + 64);
+            assert!(text.is_char_boundary(w[1]));
+        }
+        // One enormous grapheme cluster still makes progress.
+        let mut combining = String::from("a");
+        combining.push_str(&"\u{301}".repeat(3000));
+        let starts = split_line(&combining);
+        assert!(starts.len() > 1 && starts.iter().all(|&i| combining.is_char_boundary(i)));
+    }
+
+    #[test]
+    fn long_line_is_segmented_and_lazy() {
+        let text = "abc def; ".repeat(600_000); // one 5.4 MB line
+        let t = std::time::Instant::now();
+        let (_fs, v) = view(&text);
+        let elapsed = t.elapsed();
+        assert!(v.window_len() > 2000, "{} segments", v.window_len());
+        assert_mirrors(&v);
+        // Only the visible segments are shaped.
+        let shaped = v.buf.lines.iter().filter(|l| l.shape_opt().is_some()).count();
+        assert!(shaped < 50, "{shaped} segments shaped");
+        assert!(elapsed < std::time::Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn editing_a_long_line() {
+        let text = format!("{}\nnext", "word ".repeat(2000)); // 10 KB line + a short one
+        let (mut fs, mut v) = view(&text);
+        let segs_before = v.window_len();
+        // Type in the middle of a segment: only that segment changes.
+        v.cursor = Cursor::new(0, 3000);
+        v.type_text("X");
+        v.prepare(&mut fs);
+        assert_eq!(v.window_len(), segs_before);
+        assert_mirrors(&v);
+        // Backspace and Delete across a segment boundary.
+        let boundary = v.segs[1].1;
+        v.cursor = Cursor::new(0, boundary);
+        v.backspace();
+        v.prepare(&mut fs);
+        assert_mirrors(&v);
+        v.cursor = Cursor::new(0, v.segs[1].1);
+        v.delete();
+        v.prepare(&mut fs);
+        assert_mirrors(&v);
+        // A newline in the middle re-splits the line and shifts later lines.
+        v.cursor = Cursor::new(0, 5000);
+        v.replace_selection("\n", false);
+        v.prepare(&mut fs);
+        assert_mirrors(&v);
+        assert_eq!(v.doc.line(2), "next");
+        // Undo everything: back to the original text.
+        while v.doc.can_undo() {
+            v.undo();
+        }
+        v.prepare(&mut fs);
+        assert_mirrors(&v);
+        assert_eq!(v.doc.to_string_eol("\n"), text);
+    }
+
+    #[test]
+    fn motion_crosses_segment_boundaries() {
+        let text = "x".repeat(5000);
+        let (mut fs, mut v) = view(&text);
+        let boundary = v.segs[1].1;
+        v.cursor = Cursor::new(0, boundary + 1);
+        v.motion(&mut fs, Motion::Left, false);
+        v.prepare(&mut fs);
+        assert_eq!(v.cursor.index, boundary);
+        v.motion(&mut fs, Motion::Left, false); // must not get stuck on the boundary
+        v.prepare(&mut fs);
+        assert_eq!(v.cursor.index, boundary - 1);
+        v.motion(&mut fs, Motion::Right, false);
+        v.motion(&mut fs, Motion::Right, false);
+        v.prepare(&mut fs);
+        assert_eq!(v.cursor.index, boundary + 1);
+        // Scrolling a single huge line works in segment units.
+        let (total, _) = v.scroll_info();
+        assert_eq!(total, v.window_len());
     }
 }

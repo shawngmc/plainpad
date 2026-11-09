@@ -225,6 +225,13 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
   34 MB, and undo/redo of it allocates nothing extra. Undo and redo history together are capped at 64 MB. Past
   that, the oldest undo steps are dropped (the latest is always kept), and a document whose saved state falls
   out of history correctly stays marked as modified.
+- **Long lines are split for display.** cosmic-text lays out a line as a whole, so a minified file with a
+  5-million-character line took 5 s to open, and each keystroke on a 100k+ character line took 100–200 ms.
+  Lines over 2,048 bytes are now shown as display segments, broken after a space or punctuation where
+  possible and never inside a character. Only the segments on screen are laid out, and typing re-lays out
+  just the segment being edited. A 5-million-character line now opens in ~55 ms, and a keystroke costs ~3 ms.
+  Like classic Notepad (which did this at 1,024 characters), such lines wrap at a segment boundary even with
+  word wrap off. A link that straddles a segment boundary isn't recognised as one.
 - **Repaints only when something changes.** Moving the mouse repaints only if the hovered URL, the menu
   highlight or a drag actually changes.
 - **The document is stored in a rope (`ropey`), outside the layout engine.** The whole text lives in a
@@ -298,8 +305,7 @@ Recently fixed:
       Vellum, Scrawl, Plume and Notary (each in hundreds to thousands of repository names).
 - [x] Reduce memory for large files: the document is now held in a rope and only a window of lines is laid out
 - [x] Lower the peak memory while loading: files are decoded 64 KB at a time straight into the rope
-- [ ] Handle very long single lines, such as minified files. cosmic-text shapes a whole line at once: a
-      5-million-character line takes 5 s to open, and each keystroke on a 100k+ character line takes 100–200 ms.
+- [x] Handle very long single lines, such as minified files (see "Long lines" under optimizations)
 - [x] Open several documents at once, in tabs
 - [ ] Restore the open tabs when the app restarts
 - [ ] Autosave unsaved changes for crash recovery (the release build aborts on a panic, losing unsaved work)
