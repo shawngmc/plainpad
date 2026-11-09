@@ -138,6 +138,7 @@ impl App {
     pub(crate) fn redraw(&mut self) {
         let Some(win) = self.win.window.clone() else { return };
         self.gfx.set_ui_scale(self.win.scale);
+        self.gfx.bound_glyphs();
         let size = win.inner_size();
         if size.width == 0 || size.height == 0 {
             return;

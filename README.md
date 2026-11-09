@@ -213,6 +213,18 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
   An idle window therefore keeps a single frame's worth of memory: typing no longer leaves a second buffer
   behind, and shrinking the window frees memory. The release runs on a thread that sleeps until there's been
   activity, so an idle editor still never wakes up. X11, Windows and macOS still use softbuffer.
+- **Freed memory goes back to the OS.** glibc's allocator keeps freed memory for reuse, so after closing a large
+  document the process would otherwise stay at its peak size. The app calls `malloc_trim` after closing tabs or
+  windows, printing, Replace All, large undo/redo steps, and clearing caches. Closing a 27 MB file now drops
+  the app's own memory from 33 MB to 1.8 MB.
+- **Bounded glyph cache.** Rendered glyph images are cached, but the cache is cleared when the zoom or font
+  changes (old sizes are never drawn again), and whenever it passes 8,192 glyphs. Zooming through 30 sizes
+  on CJK text now uses 4.5 MB instead of 13.5 MB.
+- **Compact, bounded undo.** Replace All is stored as one record: match positions, the removed text, and one
+  copy of the replacement, about 25 bytes per match instead of ~140. 246,706 replacements cost 10 MB instead of
+  34 MB, and undo/redo of it allocates nothing extra. Undo and redo history together are capped at 64 MB. Past
+  that, the oldest undo steps are dropped (the latest is always kept), and a document whose saved state falls
+  out of history correctly stays marked as modified.
 - **Repaints only when something changes.** Moving the mouse repaints only if the hovered URL, the menu
   highlight or a drag actually changes.
 - **The document is stored in a rope (`ropey`), outside the layout engine.** The whole text lives in a

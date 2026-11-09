@@ -116,9 +116,10 @@ impl App {
         }
         for i in (0..self.win.tabs.len()).rev() {
             if self.win.tabs[i].closing {
-                self.take_tab(i);
+                drop(self.take_tab(i));
             }
         }
+        crate::mem::trim();
         if let Some(id) = self.win.keep_tab.take()
             && let Some(i) = self.win.tabs.iter().position(|t| t.id == id)
         {

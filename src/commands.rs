@@ -241,6 +241,7 @@ impl App {
             return;
         }
         self.win.tabs[self.win.active].view.replace_many(&ranges, &repl);
+        crate::mem::trim(); // the match list and removed text were temporary
         self.edited();
         self.win.status_msg = Some(format!("Replaced {} occurrence(s)", ranges.len()));
     }
@@ -346,9 +347,17 @@ impl App {
                 fams.dedup();
                 self.win.font_dlg = Some(FontDialog::new(fams, &self.settings.font_family, self.settings.font_pt));
             }
-            Cmd::ZoomIn => self.zoom = (self.zoom + 0.1).min(5.0),
-            Cmd::ZoomOut => self.zoom = (self.zoom - 0.1).max(0.3),
-            Cmd::ZoomReset => self.zoom = 1.0,
+            Cmd::ZoomIn | Cmd::ZoomOut | Cmd::ZoomReset => {
+                let z = match cmd {
+                    Cmd::ZoomIn => (self.zoom + 0.1).min(5.0),
+                    Cmd::ZoomOut => (self.zoom - 0.1).max(0.3),
+                    _ => 1.0,
+                };
+                if z != self.zoom {
+                    self.zoom = z;
+                    self.gfx.clear_glyphs(); // glyphs at the old size won't be drawn again
+                }
+            }
             Cmd::StatusBar => {
                 self.settings.status_bar = !self.settings.status_bar;
                 self.settings.save();
@@ -394,5 +403,6 @@ impl App {
             }
             w.redraw_later();
         }
+        self.gfx.clear_glyphs();
     }
 }

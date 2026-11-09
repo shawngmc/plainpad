@@ -168,6 +168,9 @@ fn mix(dst: u32, src: u32, a: u32) -> u32 {
     rb | g
 }
 
+/// Glyph images kept before the cache is cleared.
+const MAX_GLYPHS: usize = 8192;
+
 /// Font system, glyph cache, and a small cache of shaped UI labels.
 pub struct Gfx {
     pub fs: FontSystem,
@@ -183,6 +186,22 @@ impl Gfx {
             cache: SwashCache::new(),
             ui: HashMap::new(),
             ui_metrics: Metrics::new(13.0, 18.0),
+        }
+    }
+
+    /// Drops every cached glyph image. After a zoom or font change the old sizes
+    /// are never drawn again, so keeping them would only hold memory.
+    pub fn clear_glyphs(&mut self) {
+        self.cache = SwashCache::new();
+        crate::mem::trim();
+    }
+
+    /// Keeps the glyph cache bounded (called before each frame). The limit is
+    /// well above a full screen of distinct CJK characters, so normal drawing
+    /// never thrashes it; a long session through varied text can't grow it forever.
+    pub fn bound_glyphs(&mut self) {
+        if self.cache.image_cache.len() > MAX_GLYPHS {
+            self.clear_glyphs();
         }
     }
 

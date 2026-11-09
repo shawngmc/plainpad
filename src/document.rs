@@ -5,13 +5,59 @@
 use cosmic_text::Cursor;
 use ropey::Rope;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// One reversible replacement: `removed` was replaced by `inserted` at `start`.
-struct Op {
-    start: Cursor,
+/// Undo and redo history may use about this much memory together; beyond it the
+/// oldest undo steps are dropped (the most recent step is always kept).
+const UNDO_BUDGET: usize = 64 * 1024 * 1024;
+
+/// One reversible change.
+enum Op {
+    /// `removed` was replaced by `inserted` at `start`.
+    Edit { start: Cursor, removed: String, inserted: String },
+    /// Replace All: many single-line matches replaced by the same text.
+    Many(Many),
+}
+
+/// Replace All, stored compactly: a few bytes per match instead of two strings
+/// each. Neither the matches nor the replacement contain line breaks.
+struct Many {
+    /// Match positions (line, byte index) before the edit, ascending.
+    starts: Vec<(usize, usize)>,
+    /// Each match's original text, concatenated (they can differ in case).
     removed: String,
+    removed_lens: Vec<u32>,
     inserted: String,
+}
+
+impl Op {
+    /// Approximate memory use, for the undo budget.
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Op>()
+            + match self {
+                Op::Edit { removed, inserted, .. } => removed.capacity() + inserted.capacity(),
+                Op::Many(m) => {
+                    m.starts.capacity() * std::mem::size_of::<(usize, usize)>()
+                        + m.removed.capacity()
+                        + m.removed_lens.capacity() * 4
+                        + m.inserted.capacity()
+                }
+            }
+    }
+}
+
+/// One undo step: the changes it made, in the order they were made.
+struct Group {
+    ops: Vec<Op>,
+    bytes: usize,
+}
+
+impl Group {
+    fn new(ops: Vec<Op>) -> Self {
+        let bytes = ops.iter().map(Op::bytes).sum();
+        Self { ops, bytes }
+    }
 }
 
 /// Which document lines an edit touched, for updating the layout window.
@@ -44,27 +90,38 @@ fn normalize(text: &str) -> Cow<'_, str> {
 
 pub struct Document {
     rope: Rope,
-    undo: Vec<Vec<Op>>,
-    redo: Vec<Vec<Op>>,
-    /// Undo depth at the last save; `None` if that state is unreachable.
+    undo: VecDeque<Group>,
+    redo: Vec<Group>,
+    /// Memory used by `undo` and `redo` together (approximate).
+    history_bytes: usize,
+    /// Undo steps dropped from the front to stay within the budget.
+    evicted: usize,
+    /// History depth (`evicted + undo.len()`) at the last save; `None` if that
+    /// state is unreachable.
     saved: Option<usize>,
     can_merge: bool,
 }
 
 impl Document {
     pub fn new(text: &str) -> Self {
+        Self::from_rope(Rope::from_str(&normalize(text)))
+    }
+
+    /// Takes an already-normalised (`\n`-only) rope, e.g. from the streaming loader.
+    pub fn from_rope(rope: Rope) -> Self {
         Self {
-            rope: Rope::from_str(&normalize(text)),
-            undo: Vec::new(),
+            rope,
+            undo: VecDeque::new(),
             redo: Vec::new(),
+            history_bytes: 0,
+            evicted: 0,
             saved: Some(0),
             can_merge: false,
         }
     }
 
-    /// Takes an already-normalised (`\n`-only) rope, e.g. from the streaming loader.
-    pub fn from_rope(rope: Rope) -> Self {
-        Self { rope, undo: Vec::new(), redo: Vec::new(), saved: Some(0), can_merge: false }
+    fn depth(&self) -> usize {
+        self.evicted + self.undo.len()
     }
 
     pub fn len_lines(&self) -> usize {
@@ -149,16 +206,44 @@ impl Document {
     }
 
     fn record(&mut self, ops: Vec<Op>, merge: bool) {
-        if self.saved.is_some_and(|s| s > self.undo.len()) {
+        if self.saved.is_some_and(|s| s > self.depth()) {
             self.saved = None;
         }
-        self.redo.clear();
-        let at_save = self.saved == Some(self.undo.len());
-        match self.undo.last_mut() {
-            Some(g) if merge && self.can_merge && !at_save => g.extend(ops),
-            _ => self.undo.push(ops),
+        for g in self.redo.drain(..) {
+            self.history_bytes -= g.bytes;
+        }
+        let at_save = self.saved == Some(self.depth());
+        let group = Group::new(ops);
+        self.history_bytes += group.bytes;
+        match self.undo.back_mut() {
+            Some(g) if merge && self.can_merge && !at_save => {
+                g.bytes += group.bytes;
+                g.ops.extend(group.ops);
+            }
+            _ => self.undo.push_back(group),
         }
         self.can_merge = merge;
+        self.enforce_budget();
+    }
+
+    /// Drops the oldest undo steps while history exceeds the budget.
+    fn enforce_budget(&mut self) {
+        let mut dropped = false;
+        while self.history_bytes > UNDO_BUDGET && self.undo.len() > 1 {
+            let g = self.undo.pop_front().expect("len > 1");
+            self.history_bytes -= g.bytes;
+            self.evicted += 1;
+            dropped = true;
+        }
+        if dropped {
+            crate::mem::trim();
+        }
+    }
+
+    /// Memory used by undo/redo history (approximate).
+    #[cfg(test)]
+    fn history_bytes(&self) -> usize {
+        self.history_bytes
     }
 
     /// Replaces the range `a..b` with `text`, recording it for undo. With
@@ -168,21 +253,84 @@ impl Document {
         let text = normalize(text);
         let (removed, res) = self.replace_raw(a, b, &text);
         if !(removed.is_empty() && text.is_empty()) {
-            self.record(vec![Op { start: a, removed, inserted: text.into_owned() }], merge);
+            self.record(vec![Op::Edit { start: a, removed, inserted: text.into_owned() }], merge);
         }
         res
     }
 
-    /// Replaces many non-overlapping ranges (sorted ascending) as one undo step.
+    /// Replaces many non-overlapping single-line ranges (sorted ascending) as one
+    /// undo step, stored compactly.
     pub fn replace_many(&mut self, ranges: &[(Cursor, Cursor)], text: &str) {
+        if ranges.is_empty() {
+            return;
+        }
         let text = normalize(text);
-        let mut ops = Vec::with_capacity(ranges.len());
+        let single_line = !text.contains('\n') && ranges.iter().all(|(a, b)| a.line == b.line);
+        if !single_line {
+            // Not expected from Replace All, but keep it correct: one plain op per range.
+            let mut ops = Vec::with_capacity(ranges.len());
+            for &(a, b) in ranges.iter().rev() {
+                let (removed, _) = self.replace_raw(a, b, &text);
+                ops.push(Op::Edit { start: a, removed, inserted: text.to_string() });
+            }
+            self.record(ops, false);
+            return;
+        }
+        let mut lens = Vec::with_capacity(ranges.len());
+        let mut parts = Vec::with_capacity(ranges.len());
         for &(a, b) in ranges.iter().rev() {
             let (removed, _) = self.replace_raw(a, b, &text);
-            ops.push(Op { start: a, removed, inserted: text.to_string() });
+            lens.push(removed.len() as u32);
+            parts.push(removed);
         }
-        if !ops.is_empty() {
-            self.record(ops, false);
+        lens.reverse();
+        parts.reverse();
+        let many = Many {
+            starts: ranges.iter().map(|(a, _)| (a.line, a.index)).collect(),
+            removed: parts.concat(),
+            removed_lens: lens,
+            inserted: text.into_owned(),
+        };
+        self.record(vec![Op::Many(many)], false);
+    }
+
+    /// Reverts one op, returning where the cursor should go.
+    fn revert(&mut self, op: &Op) -> Cursor {
+        match op {
+            Op::Edit { start, removed, inserted } => {
+                self.replace_raw(*start, end_of(*start, inserted), removed);
+                end_of(*start, removed)
+            }
+            Op::Many(m) => {
+                // Restore left to right: everything before each match is then back to
+                // its original text, so the match sits at its original position.
+                let mut off = 0;
+                for (&(l, i), &rl) in m.starts.iter().zip(&m.removed_lens) {
+                    let rl = rl as usize;
+                    let a = Cursor::new(l, i);
+                    self.replace_raw(a, Cursor::new(l, i + m.inserted.len()), &m.removed[off..off + rl]);
+                    off += rl;
+                }
+                let (l, i) = m.starts[0];
+                Cursor::new(l, i + m.removed_lens[0] as usize)
+            }
+        }
+    }
+
+    /// Re-applies one op, returning where the cursor should go.
+    fn reapply(&mut self, op: &Op) -> Cursor {
+        match op {
+            Op::Edit { start, removed, inserted } => {
+                self.replace_raw(*start, end_of(*start, removed), inserted);
+                end_of(*start, inserted)
+            }
+            Op::Many(m) => {
+                for (&(l, i), &rl) in m.starts.iter().zip(&m.removed_lens).rev() {
+                    self.replace_raw(Cursor::new(l, i), Cursor::new(l, i + rl as usize), &m.inserted);
+                }
+                let (l, i) = m.starts[0];
+                Cursor::new(l, i + m.inserted.len())
+            }
         }
     }
 
@@ -192,28 +340,32 @@ impl Document {
     }
 
     pub fn undo(&mut self) -> Option<Cursor> {
-        let group = self.undo.pop()?;
+        let group = self.undo.pop_back()?;
         let mut cursor = Cursor::default();
-        for op in group.iter().rev() {
-            let end = end_of(op.start, &op.inserted);
-            self.replace_raw(op.start, end, &op.removed);
-            cursor = end_of(op.start, &op.removed);
+        for op in group.ops.iter().rev() {
+            cursor = self.revert(op);
         }
+        let big = group.bytes > 1024 * 1024;
         self.redo.push(group);
         self.can_merge = false;
+        if big {
+            crate::mem::trim(); // a large step allocated and freed temporary text
+        }
         Some(cursor)
     }
 
     pub fn redo(&mut self) -> Option<Cursor> {
         let group = self.redo.pop()?;
         let mut cursor = Cursor::default();
-        for op in &group {
-            let end = end_of(op.start, &op.removed);
-            self.replace_raw(op.start, end, &op.inserted);
-            cursor = end_of(op.start, &op.inserted);
+        for op in &group.ops {
+            cursor = self.reapply(op);
         }
-        self.undo.push(group);
+        let big = group.bytes > 1024 * 1024;
+        self.undo.push_back(group);
         self.can_merge = false;
+        if big {
+            crate::mem::trim();
+        }
         Some(cursor)
     }
 
@@ -226,11 +378,11 @@ impl Document {
     }
 
     pub fn is_dirty(&self) -> bool {
-        Some(self.undo.len()) != self.saved
+        Some(self.depth()) != self.saved
     }
 
     pub fn mark_saved(&mut self) {
-        self.saved = Some(self.undo.len());
+        self.saved = Some(self.depth());
         self.can_merge = false;
     }
 
@@ -296,6 +448,72 @@ mod tests {
         d.redo();
         d.redo();
         assert_eq!(d.to_string_eol("\n"), "heXX\nYYrld");
+    }
+
+    #[test]
+    fn replace_many_compact_undo_redo() {
+        // Several matches per line, removed texts differing in case and length
+        // from the replacement, and an untouched line in between.
+        let text = "Ab ab AB\nnone here\nab-ab\nlast AB";
+        let mut d = Document::new(text);
+        let ranges = [
+            (c(0, 0), c(0, 2)),
+            (c(0, 3), c(0, 5)),
+            (c(0, 6), c(0, 8)),
+            (c(2, 0), c(2, 2)),
+            (c(2, 3), c(2, 5)),
+            (c(3, 5), c(3, 7)),
+        ];
+        d.replace_many(&ranges, "xyz");
+        let after = "xyz xyz xyz\nnone here\nxyz-xyz\nlast xyz";
+        assert_eq!(d.to_string_eol("\n"), after);
+        d.undo();
+        assert_eq!(d.to_string_eol("\n"), text);
+        assert!(!d.is_dirty());
+        d.redo();
+        assert_eq!(d.to_string_eol("\n"), after);
+        // Shorter replacement too.
+        let mut d = Document::new("aaa aaa\naaa");
+        d.replace_many(&[(c(0, 0), c(0, 3)), (c(0, 4), c(0, 7)), (c(1, 0), c(1, 3))], "b");
+        assert_eq!(d.to_string_eol("\n"), "b b\nb");
+        d.undo();
+        assert_eq!(d.to_string_eol("\n"), "aaa aaa\naaa");
+    }
+
+    #[test]
+    fn replace_many_is_compact() {
+        let line = "lorem ipsum ".repeat(10);
+        let text = vec![line.as_str(); 10_000].join("\n");
+        let mut d = Document::new(&text);
+        let mut ranges = Vec::new();
+        for l in 0..10_000 {
+            for k in 0..10 {
+                ranges.push((c(l, k * 12), c(l, k * 12 + 5)));
+            }
+        }
+        d.replace_many(&ranges, "LOREM");
+        // About 30 bytes per match (it used to be ~140).
+        assert!(d.history_bytes() < ranges.len() * 40, "{} bytes", d.history_bytes());
+    }
+
+    #[test]
+    fn history_budget_drops_oldest_steps() {
+        let mut d = Document::new("");
+        let chunk = "x".repeat(4 * 1024 * 1024);
+        for _ in 0..40 {
+            d.replace(d.end(), d.end(), &chunk, false);
+        }
+        assert!(d.history_bytes() <= UNDO_BUDGET + chunk.len() * 2);
+        // Undo works for the steps that remain, then stops; the saved (empty)
+        // state is no longer reachable, so the document stays modified.
+        let mut steps = 0;
+        while d.undo().is_some() {
+            steps += 1;
+        }
+        assert!((10..40).contains(&steps), "{steps} steps kept");
+        assert!(d.is_dirty());
+        assert_eq!(d.len_lines(), 1);
+        assert_eq!(d.line_len(0), (40 - steps) * chunk.len());
     }
 
     #[test]

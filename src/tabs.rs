@@ -161,6 +161,7 @@ impl App {
         let mut cache = cosmic_text::SwashCache::new();
         let r = print::print(&mut self.gfx.fs, &mut cache, &job, &title);
         self.win.status_msg = Some(r.unwrap_or_else(|e| e));
+        crate::mem::trim(); // page rasters and PDF buffers
     }
 
     /// Asks whether to save the active tab, then continues with `then`.
@@ -201,7 +202,8 @@ impl App {
             self.ask_save(Pending::Close(self.win.tabs[i].id));
             return false;
         }
-        self.take_tab(i);
+        drop(self.take_tab(i));
+        crate::mem::trim();
         true
     }
 

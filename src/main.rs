@@ -8,6 +8,7 @@ mod gfx;
 mod input;
 mod launch;
 mod linkcheck;
+mod mem;
 mod paint;
 mod print;
 mod search;
@@ -408,7 +409,11 @@ impl App {
             self.win.redraw_later();
         }
         // Drop closed windows; if the current one closed, another becomes current.
+        let before = self.others.len();
         self.others.retain(|w| !w.close);
+        if self.others.len() != before || self.win.close {
+            crate::mem::trim();
+        }
         if self.win.close {
             match self.others.pop() {
                 Some(w) => {
