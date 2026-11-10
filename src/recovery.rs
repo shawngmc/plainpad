@@ -188,6 +188,37 @@ fn create_dir_private(dir: &Path) -> io::Result<()> {
     b.create(dir)
 }
 
+/// Whether `path` is a real directory private to the effective user: owned by
+/// it, with no group or other write access, and not a symlink. The recovery
+/// code trusts a directory only when this holds, so a snapshot planted by a
+/// *different* user (a world-writable config dir, or a root process that
+/// inherited another user's `$HOME`) is never adopted. A peer with the *same*
+/// uid still passes — that case is handled by recovery being low-capability
+/// (untitled tabs, consent-gated reads), not by ownership.
+#[cfg(unix)]
+fn is_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid only reads the process's effective uid; always sound.
+    let euid = unsafe { libc::geteuid() };
+    // symlink_metadata (lstat) so a symlink in place of the directory fails here.
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && m.uid() == euid && m.mode() & 0o022 == 0)
+}
+
+#[cfg(not(unix))]
+fn is_private_dir(path: &Path) -> bool {
+    path.is_dir()
+}
+
+/// Opens a file without following a final symlink, so a planted link can't
+/// redirect a read (or the lock) out of the recovery directory.
+fn open_nofollow(path: &Path, write: bool) -> io::Result<fs::File> {
+    let mut o = fs::OpenOptions::new();
+    o.read(!write).write(write);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW);
+    o.open(path)
+}
+
 impl Recovery {
     /// Creates this instance's snapshot folder and locks it.
     pub fn start() -> Option<Self> {
@@ -196,6 +227,12 @@ impl Recovery {
 
     fn start_in(root: &Path) -> Option<Self> {
         create_dir_private(root).ok()?;
+        // Fail closed: if the recovery directory isn't private to us (e.g. it
+        // already existed owned by someone else, or is group/other-writable),
+        // don't adopt from it or write snapshots into it.
+        if !is_private_dir(root) {
+            return None;
+        }
         let (dir, _) = doc::create_private(root, &format!("{}-", std::process::id()), ".d").ok()?;
         // create_private made a file; we want a folder by that unique name.
         fs::remove_file(&dir).ok()?;
@@ -266,14 +303,20 @@ impl Drop for Recovery {
 
 fn take_orphans_in(root: &Path, mine: &Path) -> (Vec<Recovered>, Vec<String>) {
     let (mut out, mut lost) = (Vec::new(), Vec::new());
+    // Only adopt from a recovery tree that's private to us (see is_private_dir).
+    if !is_private_dir(root) {
+        return (out, lost);
+    }
     let Ok(entries) = fs::read_dir(root) else { return (out, lost) };
     for e in entries.flatten() {
         let dir = e.path();
-        if dir == mine || !dir.is_dir() {
+        // Skip our own folder, and anything that isn't a directory private to us
+        // (a symlink, or a folder owned by another user, is never trusted).
+        if dir == mine || !is_private_dir(&dir) {
             continue;
         }
         // Still locked: another running instance's live folder.
-        let Ok(lock) = fs::OpenOptions::new().write(true).open(dir.join("lock")) else { continue };
+        let Ok(lock) = open_nofollow(&dir.join("lock"), true) else { continue };
         if lock.try_lock().is_err() {
             continue;
         }
@@ -528,7 +571,7 @@ fn write_header(dir: &Path, id: u64, meta: &Meta, generation: u64, base: &Base, 
 /// Reads a snapshot and replays its log. `Ok(None)` for something that isn't
 /// a snapshot; `Err` describes a document that couldn't be restored.
 fn read_snapshot(p: &Path) -> Result<Option<Recovered>, String> {
-    let Ok(f) = fs::File::open(p) else { return Ok(None) };
+    let Ok(f) = open_nofollow(p, false) else { return Ok(None) };
     let mut r = io::BufReader::new(f);
     let mut line = || {
         let mut l = String::new();
@@ -561,7 +604,13 @@ fn read_snapshot(p: &Path) -> Result<Option<Recovered>, String> {
         Vec::new()
     } else {
         let lp = p.with_file_name(format!("{}-{generation}.log", p.file_stem().unwrap_or_default().to_string_lossy()));
-        fs::read(&lp).unwrap_or_default()
+        // O_NOFOLLOW: a symlink planted at the log name can't redirect the read.
+        let mut buf = Vec::new();
+        if let Ok(mut f) = open_nofollow(&lp, false) {
+            use std::io::Read;
+            let _ = f.read_to_end(&mut buf);
+        }
+        buf
     };
     if base == "text" {
         // The text is in the snapshot itself: reconstruct it now, nothing external to read.
@@ -713,6 +762,33 @@ mod tests {
         assert_eq!(texts[&Some(file.clone())], format!("EDIT {original}"));
         assert_eq!(texts[&Some(root.join("note.txt"))], "just a note");
         drop(b);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_private_recovery_dirs_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp_root();
+        // A crashed instance leaves an orphan folder with a snapshot.
+        let a = Recovery::start_in(&root).unwrap();
+        let meta = Meta { path: None, encoding: Encoding::Utf8, eol: Eol::Lf };
+        a.save(1, meta, Rope::from_str("secret"), Document::new("").take_journal(), None);
+        wait_for(&snapshot_path(&a.dir, 1), true);
+        let a_dir = a.dir.clone();
+        a.crash();
+
+        // Made group/other-writable (as a planted folder would be): not adopted.
+        fs::set_permissions(&a_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let b = Recovery::start_in(&root).unwrap();
+        let (rec, lost) = b.take_orphans();
+        assert!(rec.is_empty() && lost.is_empty(), "a group/other-writable folder must be skipped");
+        drop(b);
+
+        // A recovery root that isn't private to us: recovery refuses to start.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(Recovery::start_in(&root).is_none(), "a world-writable recovery root must be refused");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 
