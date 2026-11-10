@@ -96,6 +96,7 @@ impl App {
         let doc = &self.win.tabs[self.win.active].view.doc;
         let col = doc.column(cur); // no copy of the (possibly huge) line
         let selected = self.win.tabs[self.win.active].view.selection().map(|(a, z)| doc.chars_between(a, z));
+        let recovered = self.win.tabs[self.win.active].recovered_from.clone();
         // Just the link's bytes: copying its line cost 5 MB a frame on a 5 MB line.
         let link = self.win.hover_url.as_ref().and_then(|(l, r)| doc.line_get(*l, r.clone()));
         let hovered = link.map(|u| linkcheck::analyze(&u));
@@ -114,9 +115,10 @@ impl App {
                 format!("{}   [{}]   ({key}+click to open)", info.url, info.ascii_host)
             }
             (None, Some(info)) => format!("{}   ({key}+click to open)", info.url),
-            (None, None) => match selected {
-                Some(n) => format!("Ln {}, Col {}   ({n} selected)", cur.line + 1, col),
-                None => format!("Ln {}, Col {}", cur.line + 1, col),
+            (None, None) => match (selected, &recovered) {
+                (Some(n), _) => format!("Ln {}, Col {}   ({n} selected)", cur.line + 1, col),
+                (None, Some(p)) => format!("Recovered — was {p}; use Save As to write it back"),
+                (None, None) => format!("Ln {}, Col {}", cur.line + 1, col),
             },
         };
         let row = Rect::new(r.x + 10.0 * s, r.y, r.w, r.h);

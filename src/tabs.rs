@@ -256,6 +256,12 @@ impl App {
 
     pub(crate) fn choose(&mut self, c: Choice) {
         self.win.prompt = None;
+        // The crash-recovery summary: any dismissal restores the work (so Escape
+        // can't drop it); "Open List as a Tab" also adds the reference list.
+        if !self.recovery_items.is_empty() {
+            self.finish_recovery(c == Choice::RecoverList);
+            return;
+        }
         let Some(pending) = self.win.pending.take() else { return };
         if self.choose_disk(c, &pending) {
             return;
@@ -281,7 +287,13 @@ impl App {
         };
         self.activate(i);
         match c {
-            Choice::Open | Choice::Reload | Choice::Keep | Choice::Overwrite => {}
+            // Recovery choices are handled above, before any pending close/exit.
+            Choice::Open
+            | Choice::Reload
+            | Choice::Keep
+            | Choice::Overwrite
+            | Choice::RecoverOk
+            | Choice::RecoverList => {}
             // A failed or cancelled save stops the close or exit, like Cancel. A save
             // running in the background carries on with it once it's done.
             Choice::Save => match self.save(Some(pending.clone())) {

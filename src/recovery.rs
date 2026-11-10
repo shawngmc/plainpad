@@ -47,10 +47,88 @@ pub struct Meta {
     pub eol: Eol,
 }
 
-/// A recovered document.
+/// A document left unsaved by a crashed instance, ready to restore.
+///
+/// The text is not materialised up front: a snapshot that records only a log
+/// on top of a file on disk (`Source::FromFile`) is read only when the caller
+/// asks, via [`Recovered::restore`], so the user can be shown which path will
+/// be read before any external file is touched. A planted snapshot therefore
+/// can't make the editor silently read an arbitrary path at startup.
 pub struct Recovered {
     pub meta: Meta,
-    pub text: Rope,
+    src: Source,
+    /// The edit log replayed on top of the base (empty for a v1 snapshot).
+    log: Vec<u8>,
+    v1: bool,
+}
+
+/// How a recovered document's text is obtained.
+enum Source {
+    /// Fully reconstructed from the snapshot's own data: nothing external to read.
+    Ready(Rope),
+    /// The text is this file (unchanged since the snapshot) with the log on top.
+    /// The read is deferred until the user has been shown the path.
+    FromFile { path: PathBuf, stamp: Stamp },
+}
+
+/// A human name for a recovered document, for messages.
+fn recovered_name(meta: &Meta) -> String {
+    meta.path
+        .as_deref()
+        .and_then(Path::file_name)
+        .map_or("An untitled document".into(), |n| n.to_string_lossy().into_owned())
+}
+
+impl Recovered {
+    /// The path this document had before the crash, if any. Shown to the user
+    /// before restoring (so they know what each untitled tab was, and — for a
+    /// file-based snapshot — which file will be read).
+    pub fn origin(&self) -> Option<&Path> {
+        self.meta.path.as_deref()
+    }
+
+    /// Whether restoring it reads an external file (its path is shown first).
+    pub fn reads_file(&self) -> bool {
+        matches!(self.src, Source::FromFile { .. })
+    }
+
+    /// If this is a file-based snapshot whose file is gone or changed, the
+    /// message to show instead of restoring it (its edits can't be rebuilt).
+    fn unrecoverable(&self) -> Option<String> {
+        match &self.src {
+            Source::FromFile { path, stamp } if doc::stamp(path) != Some(*stamp) => Some(format!(
+                "{} was changed by another program, so its unsaved edits can't be rebuilt",
+                recovered_name(&self.meta)
+            )),
+            _ => None,
+        }
+    }
+
+    /// Reconstructs the text, reading the base file now if the snapshot needs
+    /// it. The caller must already have shown the user the path (see
+    /// [`Recovered::origin`]). Returns the final metadata and text.
+    pub fn restore(self) -> Result<(Meta, Rope), String> {
+        let Recovered { mut meta, src, log, v1 } = self;
+        let text = match src {
+            Source::Ready(r) => r,
+            Source::FromFile { path, stamp } => {
+                if doc::stamp(&path) != Some(stamp) {
+                    return Err(format!(
+                        "{} was changed by another program, so its unsaved edits can't be rebuilt",
+                        recovered_name(&meta)
+                    ));
+                }
+                let mut t =
+                    doc::load(&path).map_err(|e| format!("{} could not be read: {e}", recovered_name(&meta)))?.rope;
+                if !v1 {
+                    replay_log(&log, &mut t, &mut meta)
+                        .map_err(|e| format!("{}: its edit log is damaged ({e})", recovered_name(&meta)))?;
+                }
+                t
+            }
+        };
+        Ok((meta, text))
+    }
 }
 
 enum Job {
@@ -204,7 +282,12 @@ fn take_orphans_in(root: &Path, mine: &Path) -> (Vec<Recovered>, Vec<String>) {
             let p = f.path();
             if p.extension().is_some_and(|x| x == "snap") {
                 match read_snapshot(&p) {
-                    Ok(Some(r)) => out.push(r),
+                    // A file-based snapshot whose file is gone or changed can't be
+                    // rebuilt; report it rather than offering an empty recovery.
+                    Ok(Some(r)) => match r.unrecoverable() {
+                        Some(msg) => lost.push(msg),
+                        None => out.push(r),
+                    },
                     Ok(None) => {}
                     Err(e) => lost.push(e),
                 }
@@ -472,30 +555,31 @@ fn read_snapshot(p: &Path) -> Result<Option<Recovered>, String> {
         line()?.is_empty().then_some((Meta { path, encoding, eol }, generation, base))
     })();
     let Some((mut meta, generation, base)) = header else { return Ok(None) };
-    let name = meta
-        .path
-        .as_deref()
-        .and_then(Path::file_name)
-        .map_or("An untitled document".into(), |n| n.to_string_lossy().into_owned());
-    let mut text = if base == "text" {
-        Rope::from_reader(r).map_err(|_| format!("{name}: its snapshot is damaged"))?
+    let name = recovered_name(&meta);
+    // The edit log (our own file, not an external path) is safe to read now.
+    let log = if v1 {
+        Vec::new()
     } else {
-        // "file <secs> <nanos> <size> <path>"
+        let lp = p.with_file_name(format!("{}-{generation}.log", p.file_stem().unwrap_or_default().to_string_lossy()));
+        fs::read(&lp).unwrap_or_default()
+    };
+    if base == "text" {
+        // The text is in the snapshot itself: reconstruct it now, nothing external to read.
+        let mut text = Rope::from_reader(r).map_err(|_| format!("{name}: its snapshot is damaged"))?;
+        if !v1 {
+            replay_log(&log, &mut text, &mut meta).map_err(|e| format!("{name}: its edit log is damaged ({e})"))?;
+        }
+        Ok(Some(Recovered { meta, src: Source::Ready(text), log: Vec::new(), v1 }))
+    } else {
+        // "file <secs> <nanos> <size> <path>": record the path and stamp, but
+        // defer reading the file until the user has been shown that path.
         let (st, file) = base
             .strip_prefix("file ")
             .and_then(|b| b.rsplit_once(' '))
             .and_then(|(st, p)| Some((parse_stamp(st)?, decode_path(p)?)))
             .ok_or_else(|| format!("{name}: its snapshot is damaged"))?;
-        if doc::stamp(&file) != Some(st) {
-            return Err(format!("{name} was changed by another program, so its unsaved edits can't be rebuilt"));
-        }
-        doc::load(&file).map_err(|e| format!("{name} could not be read: {e}"))?.rope
-    };
-    let log = p.with_file_name(format!("{}-{generation}.log", p.file_stem().unwrap_or_default().to_string_lossy()));
-    if !v1 && let Ok(data) = fs::read(&log) {
-        replay_log(&data, &mut text, &mut meta).map_err(|e| format!("{name}: its edit log is damaged ({e})"))?;
+        Ok(Some(Recovered { meta, src: Source::FromFile { path: file, stamp: st }, log, v1 }))
     }
-    Ok(Some(Recovered { meta, text }))
 }
 
 /// Applies a log's records. A record cut short (a crash while writing it) ends the log.
@@ -576,13 +660,59 @@ mod tests {
         a.crash();
         let (rec, lost) = b.take_orphans();
         assert_eq!((rec.len(), lost.len()), (1, 0));
-        assert_eq!(rec[0].meta, meta);
-        assert_eq!(rec[0].text, "unsaved text\nline 2");
+        let (m, text) = rec.into_iter().next().unwrap().restore().unwrap();
+        assert_eq!(m, meta);
+        assert_eq!(text, "unsaved text\nline 2");
         assert!(!a_dir.exists(), "orphan folder is removed once recovered");
         // A clean exit removes the instance's folder.
         let b_dir = b.dir.clone();
         drop(b);
         assert!(!b_dir.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovered_items_expose_origin_and_defer_file_reads() {
+        let root = tmp_root();
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("doc.txt");
+        let original = "saved line\n".repeat(200_000); // >1 MB: logs on top of the file
+        fs::write(&file, &original).unwrap();
+        let meta = Meta { path: Some(file.clone()), encoding: Encoding::Utf8, eol: Eol::Lf };
+        let base = Some((file.clone(), doc::stamp(&file).unwrap()));
+        let c = |l, i| Cursor::new(l, i);
+
+        let a = Recovery::start_in(&root).unwrap();
+        // A file-based snapshot (big doc, unchanged file) and a text-based one.
+        let mut big = Document::from_rope(doc::load(&file).unwrap().rope);
+        big.replace(c(0, 0), c(0, 0), "EDIT ", false);
+        a.save(1, meta.clone(), big.snapshot(), big.take_journal(), base);
+        let note = Meta { path: Some(root.join("note.txt")), encoding: Encoding::Utf8, eol: Eol::Lf };
+        let mut small = Document::new("just a note");
+        a.save(2, note.clone(), small.snapshot(), small.take_journal(), None);
+        flush(&a);
+        a.crash();
+
+        let b = Recovery::start_in(&root).unwrap();
+        let (mut rec, lost) = b.take_orphans();
+        assert!(lost.is_empty(), "{lost:?}");
+        rec.sort_by_key(|r| r.origin().map(|p| p.to_path_buf()));
+        // One reads an external file (the big doc); the other is self-contained.
+        let big_item = rec.iter().find(|r| r.origin() == Some(file.as_path())).unwrap();
+        assert!(big_item.reads_file(), "big doc rebuilds from its file");
+        let note_item = rec.iter().find(|r| r.origin() == Some(root.join("note.txt").as_path())).unwrap();
+        assert!(!note_item.reads_file(), "text-based snapshot needs no external read");
+        // restore() yields the expected text for both.
+        let texts: std::collections::HashMap<_, _> = rec
+            .into_iter()
+            .map(|r| {
+                let origin = r.origin().map(Path::to_path_buf);
+                (origin, r.restore().unwrap().1.to_string())
+            })
+            .collect();
+        assert_eq!(texts[&Some(file.clone())], format!("EDIT {original}"));
+        assert_eq!(texts[&Some(root.join("note.txt"))], "just a note");
+        drop(b);
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -637,8 +767,9 @@ mod tests {
         let b = Recovery::start_in(&root).unwrap();
         let (rec, lost) = b.take_orphans();
         assert!(lost.is_empty(), "{lost:?}");
-        assert_eq!(rec[0].text, want);
-        assert_eq!(rec[0].meta, changed);
+        let (m, text) = rec.into_iter().next().unwrap().restore().unwrap();
+        assert_eq!(text, want);
+        assert_eq!(m, changed);
         assert!(!a_dir.exists());
 
         // Replace All can't be logged: the text is written whole, then logging resumes on top.
@@ -669,7 +800,8 @@ mod tests {
         let c3 = Recovery::start_in(&root).unwrap();
         let (rec, lost) = c3.take_orphans();
         assert_eq!(rec.len(), 1);
-        assert_eq!(rec[0].text, want);
+        let (_m, text) = rec.into_iter().next().unwrap().restore().unwrap();
+        assert_eq!(text, want);
         assert_eq!(lost.len(), 1);
         assert!(lost[0].contains("big.txt was changed by another program"), "{}", lost[0]);
         drop(c3);

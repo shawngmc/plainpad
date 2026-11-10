@@ -158,6 +158,10 @@ struct Tab {
     /// The file (as of `disk`) holds the document's saved text, so crash
     /// recovery can log edits on top of it instead of copying the text.
     file_base: bool,
+    /// For a crash-recovered tab: the (sanitized) path it had before the crash.
+    /// Shown as a hint until the tab is saved; the tab itself is untitled, so a
+    /// planted recovery snapshot can't arm a silent write to this path.
+    recovered_from: Option<String>,
 }
 
 impl Tab {
@@ -176,6 +180,7 @@ impl Tab {
             disk: None,
             snap: None,
             file_base: false,
+            recovered_from: None,
         }
     }
 
@@ -365,6 +370,11 @@ struct App {
     recovery: Option<recovery::Recovery>,
     /// Ids of tabs that have a snapshot on disk.
     snapshots: std::collections::HashSet<u64>,
+    /// Documents recovered from a crashed session, waiting for the user to
+    /// dismiss the summary dialog before they're materialised into tabs. Held
+    /// (not yet opened) so a file-based snapshot isn't read until its path has
+    /// been shown.
+    recovery_items: Vec<recovery::Recovered>,
     /// When the next autosave snapshot is due (the event loop sleeps until then).
     autosave_at: Option<Instant>,
     /// Loading, saving and searching big documents in the background.
@@ -395,6 +405,7 @@ impl App {
             clipboard: None,
             recovery: recovery::Recovery::start(),
             snapshots: Default::default(),
+            recovery_items: Vec::new(),
             autosave_at: None,
             jobs: Default::default(),
             pastes: Vec::new(),
