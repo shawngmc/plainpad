@@ -342,6 +342,8 @@ enum PasteTarget {
 struct PendingPaste {
     token: u64,
     target: PasteTarget,
+    /// When to give up waiting.
+    deadline: Instant,
 }
 
 /// Finished paste reads, by token, filled in from background threads.
@@ -449,7 +451,8 @@ impl App {
             self.jobs.tick_at = Some(Instant::now() + jobs::TICK);
         }
         // Sleep until the next timer, or indefinitely if nothing is pending.
-        el.set_control_flow(match self.autosave_at.into_iter().chain(self.jobs.tick_at).min() {
+        let next = self.autosave_at.into_iter().chain(self.jobs.tick_at).chain(self.paste_deadline()).min();
+        el.set_control_flow(match next {
             Some(t) => ControlFlow::WaitUntil(t),
             None => ControlFlow::Wait,
         });
@@ -507,7 +510,11 @@ impl ApplicationHandler<UserEvent> for App {
             if tick {
                 self.tick();
             }
-            if autosave || tick {
+            let pastes_due = self.paste_deadline().is_some_and(|t| now >= t);
+            if pastes_due {
+                self.expire_pastes(now);
+            }
+            if autosave || tick || pastes_due {
                 self.after_event(el);
             }
         }

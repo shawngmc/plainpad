@@ -57,16 +57,16 @@ impl App {
         if let Some(p) = self.opening(tab.id) {
             let msg = format!("Opening {}… {p}%", tab.name());
             cv.set_clip(area);
-            self.gfx.text(cv, &msg, area.x + pad, area.y + pad, th.dim);
+            self.gfx.text_once(cv, &msg, area.x + pad, area.y + pad, th.dim);
             cv.reset_clip();
         }
         if let Some((x, y, h)) = caret {
             cv.set_clip(area);
             if !self.win.preedit.is_empty() {
-                let w = self.gfx.text_w(&self.win.preedit);
+                let w = self.gfx.text_w_once(&self.win.preedit);
                 let r = Rect::new(x, y, w + 4.0 * s, h);
                 cv.fill(r, th.field);
-                self.gfx.text_in(cv, &self.win.preedit, Rect::new(x + 2.0 * s, y, w, h), th.fg);
+                self.gfx.text_in_once(cv, &self.win.preedit, Rect::new(x + 2.0 * s, y, w, h), th.fg);
                 cv.fill(Rect::new(x, r.bottom() - 2.0 * s, r.w, s.max(1.0)), th.fg);
             } else if show_caret {
                 cv.fill(Rect::new(x, y, s.max(1.0).round(), h), th.fg);
@@ -141,7 +141,7 @@ impl App {
             x -= 12.0 * s;
         }
         cv.set_clip(Rect::new(r.x, r.y, (x - r.x).max(0.0), r.h));
-        self.gfx.text_in(cv, &left, row, if warn { th.danger } else { th.chrome_fg });
+        self.gfx.text_in_once(cv, &left, row, if warn { th.danger } else { th.chrome_fg });
         cv.reset_clip();
     }
 

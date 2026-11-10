@@ -185,7 +185,8 @@ A text editor opens files from anywhere, so their contents are treated as untrus
 - **Opening files:** only regular files are opened. A FIFO or a device such as `/dev/zero` is refused rather
   than hanging the app or filling memory.
 - **Clipboard:** pasting never blocks the editor (see "Pasting never freezes" below). On Wayland, text pasted
-  from another app is capped at 256 MB, so an app that never stops sending can't exhaust memory. At most 8
+  from another app is capped at 256 MB, so an app that never stops sending can't exhaust memory, and reading
+  it gives up after 10 seconds, so an app that never finishes can't keep a thread and its buffer waiting. At most 8
   transfers of our copied text
   run at once, so an app that keeps asking and never reads can't pile up threads. All shared Wayland
   objects are used under one lock, because libwayland forbids destroying an object on one thread while
@@ -419,22 +420,28 @@ From a code review (November 2026), memory:
       folder couldn't be created, nothing ever collected the log. Now the size is checked first, and there's
       no log without crash recovery. Documents under 1 MB still keep one, which the writer ignores; it's taken
       at every autosave, so it only ever holds about 2 seconds of typing.
-- [ ] **M5.** The UI label cache fills with one-off strings: every new "Ln X, Col Y", progress percentage and
-      IME composition gets a shaped buffer. At 512 entries the whole cache is cleared, menu labels included,
-      and they're reshaped. Draw changing text without caching it.
-- [ ] **M6.** `word_at`, `clamp` and `make_lines` copy the whole line: double-clicking in a 5 MB line copies it
-      and segments words from its start. Work on a small window around the cursor, as `next_grapheme` does.
+- [x] **M5.** The UI label cache filled with one-off strings: every new "Ln X, Col Y", progress percentage and
+      IME composition got a shaped buffer. At 512 entries the whole cache was cleared, menu labels included,
+      and they were reshaped. Now text that keeps changing (the status message, progress, IME composition, a
+      field's width up to the caret) is drawn without the cache. The cache keeps two generations of 256, so
+      labels drawn every frame are never reshaped and unused ones age out. It's still capped at 512 entries:
+      fewer would make a window with a few hundred tabs reshape every tab name on every frame.
+- [x] **M6.** `word_at`, `clamp` and `make_lines` copied the whole line: double-clicking in a 5 MB line copied
+      it and segmented words from its start. `clamp` now works on the rope directly, `word_at` looks 256 bytes
+      either side of the cursor (a longer word is cut at that edge), and `make_lines` copies a long line from
+      the rope one segment at a time.
 
 From the same review, CPU:
 - [x] **C1.** Skip glyphs entirely outside the text area. With word wrap off, every glyph of a 2 KB segment
       goes through the glyph cache, and each pixel is then rejected by the clip test.
-- [ ] **C2.** Cache URL detection and link checking per segment. Today both run, punycode and script checks
-      included, on every visible line every frame.
+- [x] **C2.** Link checking, punycode and script checks included, ran on every visible link every frame. Its
+      answers are now remembered per link (up to 256 links of up to 512 bytes, about 128 KB at most). Finding
+      the links still runs per frame: it's a single pass over the line since S1.
 - [ ] **C3.** Repaint only the changed parts of the window (see the damage-regions item above). At 2560×1600,
       each keystroke clears and redraws 16 MB of pixels. A first step: repaint only the text area and status
       bar while typing.
-- [ ] **C4.** Time out pastes with the event loop's timer (`WaitUntil`, as autosave does) instead of a thread
-      per paste that only sleeps for 10 s.
+- [x] **C4.** Pastes are timed out by the event loop's timer (`WaitUntil`, as autosave does) instead of a
+      thread per paste that only slept for 10 s.
 
 **Security**
 - [ ] Coverage-guided fuzzing (`cargo-fuzz`) of the decoder, link checker, search, and document edit/undo code
@@ -446,15 +453,16 @@ From the code review (November 2026):
       recounts every bracket in the link for each character removed, so the cost grows with the square of
       its length. A file of `http://a)))))…` lines costs millions of comparisons per visible line, on every
       frame and mouse move. Count the brackets once and adjust the count while trimming.
-- [ ] **S2.** Cap Wayland paste readers. If the app that owns the clipboard never closes the pipe, the reader
-      thread blocks forever with a buffer of up to 256 MB. The 10 s timeout only gives up in the UI, so each
-      further paste leaks another thread. Allow one reader at a time, or poll the pipe with a deadline.
+- [x] **S2.** If the app that owns the clipboard never closed the pipe, the Wayland paste reader thread blocked
+      forever with a buffer of up to 256 MB. The 10 s timeout only gave up in the UI, so each further paste
+      leaked another thread. The reader now polls the pipe with the same 10 s deadline and then gives up,
+      freeing what it read.
 - [x] **S3.** Saving a new file follows a symlink planted at its path between the check and the open
       (`write_in_place` uses `create` + `truncate`), for example in `/tmp`. Use `create_new` when the file
       didn't exist.
-- [ ] **S4.** `open_regular` checks the path's type, then opens the path. A file swapped for a FIFO in between
-      freezes the window, since files under 4 MB are read on the window thread. Open with `O_NONBLOCK` and
-      check the type of the open handle.
+- [x] **S4.** `open_regular` checked the path's type, then opened the path. A file swapped for a FIFO in between
+      froze the window, since files under 4 MB are read on the window thread. On Unix it now opens with
+      `O_NONBLOCK`, and on every platform it checks the type of what it actually opened.
 - [x] **S5.** `tests/bench/__pycache__/bench.cpython-313.pyc` is committed. Remove it and add `__pycache__/`
       to `.gitignore`.
 

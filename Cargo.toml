@@ -17,13 +17,17 @@ winit = "0.30.13"
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_Controls_Dialogs", "Win32_Storage_Xps", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
+[target.'cfg(unix)'.dependencies]
+# O_NONBLOCK, so opening a file swapped for a FIFO can't hang (already used by winit and others).
+libc = "0.2"
+
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 # Wayland tab drag-and-drop, on the same libwayland connection winit uses.
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 # Frame buffers for the Wayland presenter (both already used by winit/softbuffer).
 memmap2 = "0.9"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "event"] }
 
 [profile.release]
 opt-level = 3

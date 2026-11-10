@@ -56,11 +56,72 @@ fn text_lossy(buf: Vec<u8>) -> String {
     String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
+/// Reads pasted text from another app's pipe until it closes. Gives up past
+/// `max` bytes, or at `deadline`: an app that never closes the pipe would
+/// otherwise keep this thread, and everything read so far, forever.
+fn read_paste(reader: &mut std::io::PipeReader, max: u64, deadline: std::time::Instant) -> Result<Vec<u8>, String> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(crate::commands::PASTE_TIMED_OUT.to_string());
+        }
+        let timeout = Timespec::try_from(left).ok();
+        match poll(&mut [PollFd::new(&*reader, PollFlags::IN)], timeout.as_ref()) {
+            Ok(0) | Err(rustix::io::Errno::INTR) => continue, // the loop checks the deadline
+            Ok(_) => {}
+            Err(e) => return Err(format!("Couldn't read the clipboard: {e}")),
+        }
+        // Readable, or closed: this doesn't block.
+        let n = match reader.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("Couldn't read the clipboard: {e}")),
+        };
+        if n == 0 {
+            return Ok(buf);
+        }
+        if (buf.len() + n) as u64 > max {
+            return Err("The clipboard contents are too large to paste (over 256 MB)".to_string());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
 #[cfg(test)]
-#[test]
-fn pasted_text_is_decoded() {
-    assert_eq!(text_lossy("héllo".into()), "héllo");
-    assert_eq!(text_lossy(b"a\xFFb".to_vec()), "a\u{FFFD}b");
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn pasted_text_is_decoded() {
+        assert_eq!(text_lossy("héllo".into()), "héllo");
+        assert_eq!(text_lossy(b"a\xFFb".to_vec()), "a\u{FFFD}b");
+    }
+
+    #[test]
+    fn paste_reads_stop_at_eof_size_or_deadline() {
+        let soon = || Instant::now() + Duration::from_secs(5);
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"hello").unwrap();
+        drop(w);
+        assert_eq!(read_paste(&mut r, 100, soon()).unwrap(), b"hello");
+        // Too much.
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        w.write_all(&[b'x'; 50]).unwrap();
+        drop(w);
+        assert!(read_paste(&mut r, 10, soon()).unwrap_err().contains("too large"));
+        // A sender that never finishes: the read gives up instead of waiting forever.
+        let (mut r, mut w) = std::io::pipe().unwrap();
+        w.write_all(b"partial").unwrap();
+        let t = Instant::now();
+        let err = read_paste(&mut r, 100, Instant::now() + Duration::from_millis(200)).unwrap_err();
+        assert_eq!(err, crate::commands::PASTE_TIMED_OUT);
+        assert!(t.elapsed() < Duration::from_secs(3));
+        drop(w);
+    }
 }
 
 /// How a paste request started.
@@ -262,17 +323,12 @@ impl Wayland {
         let _ = self.conn.flush();
         drop(sh);
         drop(writer); // our copy of the write end; the other app holds its own
-        // Stop at PASTE_MAX so an app that never stops sending can't exhaust memory.
+        // Stop at PASTE_MAX so an app that never stops sending can't exhaust memory,
+        // and at the paste timeout so one that never finishes can't keep the thread.
+        let deadline = std::time::Instant::now() + crate::commands::PASTE_TIMEOUT;
         let spawned = std::thread::Builder::new().name("clipboard-read".into()).spawn(move || {
-            let mut buf = Vec::new();
-            let result = match reader.take(PASTE_MAX + 1).read_to_end(&mut buf) {
-                Ok(_) if buf.len() as u64 > PASTE_MAX => {
-                    Err("The clipboard contents are too large to paste (over 256 MB)".to_string())
-                }
-                Ok(_) => Ok(text_lossy(buf)),
-                Err(e) => Err(format!("Couldn't read the clipboard: {e}")),
-            };
-            deliver(result);
+            let mut reader = reader;
+            deliver(read_paste(&mut reader, PASTE_MAX, deadline).map(text_lossy));
         });
         if spawned.is_ok() { PasteStart::Pending } else { PasteStart::Empty }
     }

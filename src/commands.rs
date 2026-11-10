@@ -3,7 +3,9 @@
 use super::*;
 
 /// How long to wait for another app to hand over pasted text.
-const PASTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const PASTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Shown when the app that owns the clipboard doesn't hand over its text in time.
+pub(crate) const PASTE_TIMED_OUT: &str = "Paste timed out: the app that owns the clipboard didn't respond";
 
 impl App {
     // ---------------------------------------------------------------- editing
@@ -49,18 +51,17 @@ impl App {
             let _ = proxy.send_event(UserEvent::Wake);
         };
         let start = match &mut self.wl {
-            Some(wl) => wl.request_paste(deliver.clone()),
+            Some(wl) => wl.request_paste(deliver),
             None => {
                 // X11, Windows, macOS: arboard on a thread, since the app that owns
                 // the clipboard may be asked to produce the data on demand.
-                let d = deliver.clone();
                 let spawned = std::thread::Builder::new().name("clipboard-read".into()).spawn(move || {
                     let r = match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
                         Ok(t) => Ok(t),
                         Err(arboard::Error::ContentNotAvailable) => Ok(String::new()),
                         Err(e) => Err(format!("Couldn't read the clipboard: {e}")),
                     };
-                    d(r);
+                    deliver(r);
                 });
                 if spawned.is_ok() { wayland::PasteStart::Pending } else { wayland::PasteStart::Empty }
             }
@@ -69,15 +70,30 @@ impl App {
             wayland::PasteStart::Ready(text) => self.apply_paste(target, text),
             wayland::PasteStart::Empty => {}
             wayland::PasteStart::Pending => {
-                self.pastes.push(PendingPaste { token, target });
+                // Given up on if the other app never answers: the event loop
+                // wakes at the deadline (see `expire_pastes`).
+                self.pastes.push(PendingPaste { token, target, deadline: Instant::now() + PASTE_TIMEOUT });
                 self.win.needs_redraw = true;
-                // Give up if the other app never answers.
-                let _ = std::thread::Builder::new().name("clipboard-timeout".into()).spawn(move || {
-                    std::thread::sleep(PASTE_TIMEOUT);
-                    deliver(Err("Paste timed out: the app that owns the clipboard didn't respond".into()));
-                });
             }
         }
+    }
+
+    /// When the next waiting paste gives up, if any.
+    pub(crate) fn paste_deadline(&self) -> Option<Instant> {
+        self.pastes.iter().map(|p| p.deadline).min()
+    }
+
+    /// Abandons pastes whose deadline has passed, reporting it in their window.
+    /// A late answer is then ignored by `finish_pastes`.
+    pub(crate) fn expire_pastes(&mut self, now: Instant) {
+        let late: Vec<u64> = self.pastes.iter().filter(|p| now >= p.deadline).map(|p| p.token).collect();
+        if late.is_empty() {
+            return;
+        }
+        let mut results = self.paste_results.lock().unwrap_or_else(|e| e.into_inner());
+        results.extend(late.into_iter().map(|t| (t, Err(PASTE_TIMED_OUT.to_string()))));
+        drop(results);
+        self.finish_pastes();
     }
 
     /// Applies pastes whose text has arrived (or that failed or timed out).

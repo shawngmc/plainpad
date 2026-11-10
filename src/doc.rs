@@ -394,10 +394,27 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
 /// Opens a file for reading, refusing anything but a regular file: opening a
 /// FIFO would block forever, and a device such as /dev/zero never ends.
 pub fn open_regular(path: &Path) -> io::Result<fs::File> {
+    // Checked first as well: on Windows, opening a device name such as CON could wait for input.
     if !fs::metadata(path)?.is_file() {
         return Err(io::Error::other("not a regular file"));
     }
-    fs::File::open(path)
+    open_if_regular(path)
+}
+
+/// Opens `path` and checks what was actually opened, since it may have been
+/// swapped for something else since any earlier check. On Unix the open is
+/// non-blocking, so a FIFO can't hang it; that makes no difference to reading
+/// a regular file.
+fn open_if_regular(path: &Path) -> io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
+    let f = opts.open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(f)
 }
 
 /// A hard-to-guess number for temporary file names. Not cryptographic; the
@@ -745,5 +762,17 @@ mod tests {
     fn refuses_special_files() {
         assert!(load(Path::new("/dev/zero")).is_err());
         assert!(load(Path::new("/")).is_err());
+        // A FIFO that turns up after the type check: opening it neither hangs
+        // (no writer will ever come) nor succeeds.
+        let d = tmpdir();
+        let fifo = d.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || tx.send(open_if_regular(&p).is_err()).unwrap());
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true), "refused without hanging");
+        fs::remove_dir_all(&d).unwrap();
     }
 }

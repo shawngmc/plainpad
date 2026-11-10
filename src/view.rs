@@ -24,38 +24,44 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Lines longer than this many bytes are split into display segments.
 const SEG: usize = 2048;
 
+/// Bytes past [`SEG`] that [`first_cut`] looks at to find a grapheme boundary.
+const LOOKAHEAD: usize = 64;
+
+/// Where the first display segment of `text` ends, when `text` is longer than
+/// [`SEG`]. `text` needs to hold the rest of the line, or at least
+/// `SEG + LOOKAHEAD` bytes of it. Splits after a space or punctuation in the
+/// last quarter of the segment where possible, otherwise at a grapheme
+/// boundary, so no character is broken.
+fn first_cut(text: &str) -> usize {
+    let soft =
+        text.as_bytes()[SEG * 3 / 4..SEG].iter().rposition(|b| b" ,;})]>".contains(b)).map(|p| SEG * 3 / 4 + p + 1);
+    let cut = soft.unwrap_or_else(|| {
+        let mut end = (SEG + LOOKAHEAD).min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].grapheme_indices(true).map(|(i, _)| i).take_while(|&i| i <= SEG).last().unwrap_or(0)
+    });
+    // Always make progress, even through one enormous grapheme cluster.
+    if cut > 0 {
+        cut
+    } else {
+        let mut c = SEG;
+        while !text.is_char_boundary(c) {
+            c += 1;
+        }
+        c
+    }
+}
+
 /// Byte offsets where a line's display segments start (always begins with 0).
-/// Splits after a space or punctuation in the last quarter of a segment where
-/// possible, otherwise at a grapheme boundary, so no character is broken.
+#[cfg(test)]
 fn split_line(text: &str) -> Vec<usize> {
     let mut starts = vec![0];
     let mut s = 0;
     while text.len() - s > SEG {
-        let limit = s + SEG;
-        let soft = text.as_bytes()[s + SEG * 3 / 4..limit]
-            .iter()
-            .rposition(|b| b" ,;})]>".contains(b))
-            .map(|p| s + SEG * 3 / 4 + p + 1);
-        let cut = soft.unwrap_or_else(|| {
-            let window_end = (limit + 64).min(text.len());
-            let mut end = window_end;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text[s..end].grapheme_indices(true).map(|(i, _)| s + i).take_while(|&i| i <= limit).last().unwrap_or(s)
-        });
-        // Always make progress, even through one enormous grapheme cluster.
-        let cut = if cut > s {
-            cut
-        } else {
-            let mut c = limit;
-            while !text.is_char_boundary(c) {
-                c += 1;
-            }
-            c
-        };
-        starts.push(cut);
-        s = cut;
+        s += first_cut(&text[s..]);
+        starts.push(s);
     }
     starts
 }
@@ -214,13 +220,23 @@ impl View {
     }
 
     /// Layout lines (and their `segs` entries) for document line `i`.
+    /// A long line is copied from the rope one segment at a time, never whole.
     fn make_lines(&self, i: usize, out: &mut Vec<BufferLine>, segs: &mut Vec<(usize, usize)>) {
-        let text = self.doc.line(i);
-        let starts = split_line(&text);
-        for (k, &a) in starts.iter().enumerate() {
-            let b = starts.get(k + 1).copied().unwrap_or(text.len());
-            out.push(BufferLine::new(&text[a..b], LineEnding::Lf, self.attrs.clone(), Shaping::Advanced));
+        let len = self.doc.line_len(i);
+        let mut a = 0;
+        loop {
+            let long = len - a > SEG;
+            let end = if long { self.doc.floor_index(i, (a + SEG + LOOKAHEAD).min(len)) } else { len };
+            // A short line is often borrowed straight from the rope.
+            let text: std::borrow::Cow<str> =
+                if a == 0 && !long { self.doc.line(i) } else { self.doc.line_slice(i, a, end).into() };
+            let cut = if long { first_cut(&text) } else { text.len() };
+            out.push(BufferLine::new(&text[..cut], LineEnding::Lf, self.attrs.clone(), Shaping::Advanced));
             segs.push((i, a));
+            a += cut;
+            if a >= len {
+                break;
+            }
         }
     }
 
@@ -742,7 +758,7 @@ impl View {
                 urls = search::find_urls(run.text)
                     .into_iter()
                     .map(|r| {
-                        let bad = linkcheck::analyze(&run.text[r.clone()]).suspicious();
+                        let bad = linkcheck::is_suspicious(&run.text[r.clone()]);
                         (r, bad)
                     })
                     .collect();
@@ -987,6 +1003,25 @@ mod tests {
         combining.push_str(&"\u{301}".repeat(3000));
         let starts = split_line(&combining);
         assert!(starts.len() > 1 && starts.iter().all(|&i| combining.is_char_boundary(i)));
+    }
+
+    #[test]
+    fn long_lines_are_built_a_segment_at_a_time() {
+        // Building segments from the rope piece by piece gives the same split as
+        // splitting the whole line.
+        let texts = [
+            "aé😀 ".repeat(5000),
+            format!("a{}", "\u{301}".repeat(3000)),
+            "x".repeat(SEG * 3 + 7),
+            "abc def; ".repeat(2000),
+            "y".repeat(SEG + 1),
+        ];
+        for text in texts {
+            let (_fs, v) = view(&text);
+            let starts: Vec<usize> = v.segs.iter().filter(|s| s.0 == 0).map(|s| s.1).collect();
+            assert_eq!(starts, split_line(&text));
+            assert_mirrors(&v);
+        }
     }
 
     #[test]
