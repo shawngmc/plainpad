@@ -86,6 +86,9 @@ pub struct View {
     geom: Option<(f32, f32, f32, f32, bool)>,
     /// Refuse edits (while the document is loaded, saved or replaced in the background).
     pub read_only: bool,
+    /// Windows built so far (for tests).
+    #[cfg(test)]
+    loads: usize,
 }
 
 impl View {
@@ -105,6 +108,8 @@ impl View {
             vis_rows: 40,
             geom: None,
             read_only: false,
+            #[cfg(test)]
+            loads: 0,
         };
         v.load_window((0, 0), 0.0, false);
         v
@@ -254,11 +259,32 @@ impl View {
     /// line. With `reuse`, lines already loaded (and their shaping) are kept; only
     /// valid if the window mirrors the doc.
     fn load_window(&mut self, top: (usize, usize), vert: f32, reuse: bool) {
+        #[cfg(test)]
+        {
+            self.loads += 1;
+        }
         let n = self.doc.len_lines();
         let m = self.margin();
         let top = if top.0 >= n { (n - 1, 0) } else { top };
-        let start = top.0.saturating_sub(m);
-        let end = (top.0 + self.vis_rows + m).min(n).max(start + 1);
+        // Lines are added around `top` until there are enough display segments to
+        // fill the view and the margins (every segment takes at least one row), or
+        // the usual number of lines. A normal line is one segment, so a normal file
+        // gets exactly that many lines; long lines get far fewer, so the window's
+        // memory follows what's on screen rather than how long the lines are.
+        // Segments are at most SEG + 3 bytes, so this count never overestimates.
+        let segs_in = |bytes: usize| bytes.div_ceil(SEG + 4);
+        let (mut start, mut above) = (top.0, segs_in(top.1));
+        while start > 0 && top.0 - start < m && above < m {
+            start -= 1;
+            above += segs_in(self.doc.line_len(start)).max(1);
+        }
+        let (mut end, mut below) = (top.0, 0);
+        let want = self.vis_rows + m;
+        while end < n && end - top.0 < want && below < want {
+            let from = if end == top.0 { top.1 } else { 0 };
+            below += segs_in(self.doc.line_len(end).saturating_sub(from)).max(1);
+            end += 1;
+        }
         let old_segs = std::mem::take(&mut self.segs);
         let mut old: Vec<Option<BufferLine>> =
             if reuse { std::mem::take(&mut self.buf.lines).into_iter().map(Some).collect() } else { Vec::new() };
@@ -301,17 +327,27 @@ impl View {
     /// Makes sure the cursor is inside the window with room around it for motions.
     fn ensure_cursor_window(&mut self) {
         let (c, m, n) = (self.cursor.line, self.margin(), self.doc.len_lines());
-        let ok_top = self.win == 0 || c >= self.win + m / 2;
-        let ok_bottom = self.win_end() == n || c + m / 2 < self.win_end();
-        if self.in_window(self.cursor) && ok_top && ok_bottom {
-            return;
+        if self.in_window(self.cursor) {
+            // Room around the cursor, in segments: the window may hold only a few
+            // (long) lines. For normal lines this is the same count in lines.
+            let k = self.seg_of(c, self.cursor.index);
+            let ok_top = self.win == 0 || k >= m / 2;
+            let ok_bottom = self.win_end() == n || k + m / 2 < self.segs.len();
+            if ok_top && ok_bottom {
+                return;
+            }
         }
         let top = self.top_line();
         let s = self.buf.scroll();
         if c + m / 2 >= top && c < top + self.vis_rows + m / 2 {
             self.load_window(self.top_pos(), s.vertical, true);
-        } else {
+        }
+        if !self.in_window(self.cursor) {
             self.load_window((c.saturating_sub(self.vis_rows / 2), 0), 0.0, true);
+        }
+        // Long lines above the cursor can fill the window before reaching it.
+        if !self.in_window(self.cursor) {
+            self.load_window((c, 0), 0.0, true);
         }
     }
 
@@ -473,6 +509,11 @@ impl View {
                 s.0 = (s.0 as isize + shift) as usize;
             }
             self.touch();
+            // Long lines pasted in can grow the window well past what the view
+            // needs: trim it again, keeping the lines already laid out.
+            if self.segs.len() > 4 * (self.vis_rows + 2 * self.margin()) {
+                self.load_window(self.top_pos(), self.buf.scroll().vertical, true);
+            }
         } else {
             self.reload();
         }
@@ -897,6 +938,96 @@ mod tests {
 
     fn runs(v: &View) -> usize {
         v.buf.layout_runs().count()
+    }
+
+    /// Text held in the layout window.
+    fn window_bytes(v: &View) -> usize {
+        v.buf.lines.iter().map(|l| l.text().len()).sum()
+    }
+
+    #[test]
+    fn window_is_bounded_in_bytes_for_long_lines() {
+        // 300 lines of 20 KB. A window of whole-document line counts held ~150
+        // of them (3 MB); bounded by segments it needs only a few.
+        let line = "word ".repeat(4000);
+        let (mut fs, mut v) = view(&vec![line.as_str(); 300].join("\n"));
+        let cap = 600 * 1024;
+        let check = |v: &View, what: &str| {
+            assert!(window_bytes(v) < cap, "{what}: window holds {} bytes", window_bytes(v));
+            assert_mirrors(v);
+            assert!(runs(v) >= 20, "{what}: blank view at {:?}", v.scroll_info());
+        };
+        check(&v, "opened");
+        for _ in 0..60 {
+            v.scroll_px(18.0 * 40.0);
+            v.prepare(&mut fs);
+            check(&v, "scrolled");
+        }
+        v.scroll_to_line(150);
+        v.prepare(&mut fs);
+        assert_eq!(v.scroll_info().1, 150);
+        check(&v, "jumped");
+        v.motion(&mut fs, Motion::BufferEnd, false);
+        v.prepare(&mut fs);
+        assert_eq!(v.cursor.line, 299);
+        check(&v, "at the end");
+        for _ in 0..30 {
+            v.motion(&mut fs, Motion::PageUp, false);
+            v.prepare(&mut fs);
+        }
+        check(&v, "paged up");
+        v.type_text("x");
+        v.prepare(&mut fs);
+        check(&v, "typed");
+        // Moving row by row through long lines, the cursor never leaves the
+        // (now small) window. With wrap off, each segment is one row.
+        // 20 KB lines are 10 segments (rows) each; a window of 84 segments holds
+        // about 15 lines. (Moving through long lines is slow in debug builds, so
+        // this keeps to a few hundred moves.)
+        let text: Vec<String> =
+            (0..40).map(|i| if i % 2 == 0 { "w ".repeat(10_000) } else { "short".into() }).collect();
+        let mut v = View::new(&mut fs, "", false);
+        v.set_geometry(14.0, 18.0, 400.0, 18.0 * 20.0, false);
+        v.set_text(&text.join("\n"));
+        v.prepare(&mut fs);
+        let (mut last, loads) = (0, v.loads);
+        let mut step = |v: &mut View, m: Motion| {
+            v.motion(&mut fs, m, false);
+            v.prepare(&mut fs);
+            assert!(v.in_window(v.cursor), "{:?} left the window", v.cursor);
+        };
+        // Down past the first window's lower edge...
+        for _ in 0..110 {
+            step(&mut v, Motion::Down);
+            assert!(v.cursor.line >= last);
+            last = v.cursor.line;
+        }
+        assert!(last > 17, "line {last}: past the first window");
+        check(&v, "moved down");
+        // ...and from the end, up past the last window's upper edge.
+        step(&mut v, Motion::BufferEnd);
+        last = v.cursor.line;
+        assert_eq!(last, 39);
+        for _ in 0..110 {
+            step(&mut v, Motion::Up);
+            assert!(v.cursor.line <= last);
+            last = v.cursor.line;
+        }
+        assert!(last < 22, "line {last}: past the last window");
+        check(&v, "moved up");
+        for m in [Motion::PageUp, Motion::PageUp, Motion::PageDown, Motion::PageDown, Motion::PageDown] {
+            step(&mut v, m);
+        }
+        check(&v, "paged");
+        // The window moves now and then, not on every keystroke.
+        assert!(v.loads - loads < 40, "{} window loads for 226 moves", v.loads - loads);
+        // Normal files keep the window they always had: 20 visible rows and a
+        // 64-line margin either side (only below, at the top of the file).
+        let (mut fs, mut w) = view(&big(100_000));
+        assert_eq!(w.window_len(), 20 + 64);
+        w.scroll_to_line(50_000);
+        w.prepare(&mut fs);
+        assert_eq!(w.window_len(), 20 + 2 * 64);
     }
 
     #[test]

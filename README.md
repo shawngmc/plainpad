@@ -265,8 +265,9 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
 - **Repaints only when something changes.** Moving the mouse repaints only if the hovered URL, the menu
   highlight or a drag actually changes.
 - **The document is stored in a rope (`ropey`), outside the layout engine.** The whole text lives in a
-  compact rope, which adds about 10% over the file size. Only a window of a few hundred lines around the
-  viewport is loaded into cosmic-text. That matters because cosmic-text spends about 330 bytes of
+  compact rope, which adds about 10% over the file size. Only a window of lines around the viewport is
+  loaded into cosmic-text: a few hundred normal lines, or just enough long ones to fill the view and its
+  margins. That matters because cosmic-text spends about 330 bytes of
   bookkeeping on every line it holds, before any layout. As you scroll, lines are swapped in and out of
   the window, and lines already laid out are reused. The cursor, selection and undo history are stored
   in whole-document positions, so they work across the entire file. Search, Replace All, the selection
@@ -406,10 +407,13 @@ Recently fixed:
       aren't covered)
 
 From a code review (November 2026), memory:
-- [ ] **M1.** Bound the layout window by bytes, not just lines (`View::load_window`). It holds about 200
-      document lines in full, so a file of a few hundred 1 MB lines (minified bundles, wide CSV or JSON) copies
-      ~200 MB into cosmic-text on top of the rope, plus ~330 bytes per 2 KB segment. Shrink the margin when
-      lines are long, or only build the segments near the viewport.
+- [x] **M1.** The layout window held about 200 document lines in full, so a file of a few hundred 1 MB lines
+      (minified bundles, wide CSV or JSON) copied ~200 MB into cosmic-text on top of the rope, plus ~330 bytes
+      per 2 KB segment. It's now bounded by display segments: every segment takes at least one row, so lines
+      are added around the view only until there are enough segments for it and its margins. Normal files get
+      the same window as before; in a test file of 300 lines of 20 KB, the window went from 1.7 MB to under
+      600 KB, and with 1 MB lines it holds a few lines instead of ~200. A single huge line is still loaded
+      whole (see "Long lines").
 - [x] **M2.** Hovering a link copies its whole line on every repaint (`draw_status` calls `doc.line`): 5 MB
       per frame on a 5 MB line. Take just the link's bytes from the rope.
 - [x] **M3.** A Wayland paste briefly needs twice its size: `String::from_utf8_lossy(&buf).into_owned()`
