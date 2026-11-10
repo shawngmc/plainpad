@@ -50,6 +50,19 @@ static WRITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 /// Ignore offers that advertise absurd numbers of MIME types.
 const MAX_MIMES: usize = 64;
 
+/// Pasted bytes as text. Valid UTF-8 keeps its buffer, so a big paste isn't
+/// briefly held twice; only invalid input is copied, with U+FFFD substituted.
+fn text_lossy(buf: Vec<u8>) -> String {
+    String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+#[cfg(test)]
+#[test]
+fn pasted_text_is_decoded() {
+    assert_eq!(text_lossy("héllo".into()), "héllo");
+    assert_eq!(text_lossy(b"a\xFFb".to_vec()), "a\u{FFFD}b");
+}
+
 /// How a paste request started.
 pub enum PasteStart {
     /// Our own copied text, available immediately.
@@ -256,7 +269,7 @@ impl Wayland {
                 Ok(_) if buf.len() as u64 > PASTE_MAX => {
                     Err("The clipboard contents are too large to paste (over 256 MB)".to_string())
                 }
-                Ok(_) => Ok(String::from_utf8_lossy(&buf).into_owned()),
+                Ok(_) => Ok(text_lossy(buf)),
                 Err(e) => Err(format!("Couldn't read the clipboard: {e}")),
             };
             deliver(result);

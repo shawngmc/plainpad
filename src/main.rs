@@ -405,6 +405,9 @@ impl App {
             wl_src: None,
             exit: false,
         };
+        if app.recovery.is_none() {
+            document::disable_journal(); // no snapshots, so nothing would read it
+        }
         for p in files {
             if p.exists() {
                 app.open_path(p);

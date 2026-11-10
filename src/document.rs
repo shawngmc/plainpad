@@ -130,6 +130,15 @@ pub fn replay(rope: &mut Rope, ops: &[JournalOp]) -> Result<(), String> {
 /// Unwritten journal entries beyond this give up on journaling until the next full snapshot.
 const JOURNAL_CAP: usize = 16 * 1024 * 1024;
 
+/// Off when crash recovery couldn't start: nothing would ever take the journal,
+/// so each document would hold up to [`JOURNAL_CAP`] of edits for nothing.
+static JOURNALING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Stops all documents keeping a journal (crash recovery is unavailable).
+pub fn disable_journal() {
+    JOURNALING.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn next_epoch() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -294,7 +303,7 @@ impl Document {
         let at = self.offset(a);
         self.rope.remove(ca..cb);
         self.rope.insert(ca, text);
-        self.journal_push(JournalOp { at, remove: removed.len(), insert: text.to_owned() });
+        self.journal_push(at, removed.len(), text);
         let end = end_of(a, text);
         (removed, EditResult { start: a, old_end: b, first: a.line, old_last: b.line, new_last: end.line, end })
     }
@@ -494,15 +503,17 @@ impl Document {
 
     // ------------------------------------------------------------ journal
 
-    fn journal_push(&mut self, op: JournalOp) {
+    fn journal_push(&mut self, at: usize, remove: usize, insert: &str) {
         if self.journal_broken {
             return;
         }
-        self.journal_bytes += op.insert.len() + std::mem::size_of::<JournalOp>();
-        self.journal.push(op);
-        if self.journal_bytes > JOURNAL_CAP {
-            self.journal_break();
+        // Checked before copying, so a huge paste isn't copied only to be dropped.
+        let bytes = insert.len() + std::mem::size_of::<JournalOp>();
+        if !JOURNALING.load(std::sync::atomic::Ordering::Relaxed) || self.journal_bytes + bytes > JOURNAL_CAP {
+            return self.journal_break();
         }
+        self.journal_bytes += bytes;
+        self.journal.push(JournalOp { at, remove, insert: insert.to_owned() });
     }
 
     fn journal_break(&mut self) {
@@ -571,6 +582,18 @@ impl Document {
         let base = self.rope.line_to_byte(line);
         let (ca, cb) = (self.rope.byte_to_char(base + a), self.rope.byte_to_char(base + b));
         self.rope.slice(ca..cb).to_string()
+    }
+
+    /// Bytes `r` of line `line`, without copying the rest of the line. None
+    /// unless the range lies within the line, on char boundaries.
+    pub fn line_get(&self, line: usize, r: Range<usize>) -> Option<Cow<'_, str>> {
+        if line >= self.len_lines() || r.start > r.end || r.end > self.line_len(line) {
+            return None;
+        }
+        let base = self.rope.line_to_byte(line);
+        let (a, b) = (base + r.start, base + r.end);
+        let on_boundary = |i: usize| self.rope.char_to_byte(self.rope.byte_to_char(i)) == i;
+        (on_boundary(a) && on_boundary(b)).then(|| self.rope.byte_slice(a..b).into())
     }
 
     /// 1-based column (in characters) of a position, without copying the line.
@@ -837,6 +860,29 @@ mod tests {
             d.redo();
             assert_eq!(d.to_string_eol("\n"), after);
         }
+    }
+
+    #[test]
+    fn huge_edits_break_the_journal_without_being_copied() {
+        let mut d = Document::new("x");
+        d.replace(c(0, 1), c(0, 1), &"y".repeat(JOURNAL_CAP), false);
+        assert!(d.journal.is_empty() && d.journal_broken && d.journal_bytes == 0);
+        assert!(d.take_journal().ops.is_none(), "the whole text must be written");
+        d.replace(c(0, 0), c(0, 0), "z", false);
+        assert_eq!(d.take_journal().ops.unwrap().len(), 1, "journaling resumes after that");
+    }
+
+    #[test]
+    fn line_get_checks_its_range() {
+        let d = Document::new("ab日c\nxyz");
+        assert_eq!(d.line_get(0, 1..5).as_deref(), Some("b日"));
+        assert_eq!(d.line_get(1, 0..3).as_deref(), Some("xyz"));
+        assert_eq!(d.line_get(0, 2..3), None, "inside a character");
+        assert_eq!(d.line_get(0, 0..7), None, "past the line, into its newline");
+        assert_eq!(d.line_get(2, 0..0), None, "no such line");
+        #[allow(clippy::reversed_empty_ranges)]
+        let backwards = 3..1;
+        assert_eq!(d.line_get(0, backwards), None);
     }
 
     #[test]

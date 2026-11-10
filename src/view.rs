@@ -748,6 +748,13 @@ impl View {
                     .collect();
             }
             for g in run.glyphs {
+                // With word wrap off, most of a long segment is scrolled out of view
+                // sideways: skip it rather than clip it pixel by pixel. The margin of a
+                // line height covers glyph images reaching past their advance.
+                let gx = ox + g.x;
+                if gx + g.w < area.x - run.line_height || gx > area.right() + run.line_height {
+                    continue;
+                }
                 let link = urls.iter().find(|(r, _)| g.start >= r.start && g.start < r.end).map(|(_, bad)| *bad);
                 let in_url = link.is_some();
                 let suspicious = link == Some(true);

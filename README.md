@@ -178,7 +178,8 @@ A text editor opens files from anywhere, so their contents are treated as untrus
   `xdg-open` on Linux) as a single argument, never through a shell.
 - **Saving:** the temp file is created exclusively with an unpredictable name, so a symlink planted next to
   the file can't redirect the write. It's readable only by you until it replaces the original, and then it
-  takes the original's permissions. Files owned by another user, or with extra hard links, are written in place
+  takes the original's permissions. A new file is created exclusively too, so a symlink planted at its name
+  is never followed. Files owned by another user, or with extra hard links, are written in place
   so they keep their owner and links.
 - **Printing:** the PDF sent to the printer is created the same way, private and with an unpredictable name.
 - **Opening files:** only regular files are opened. A FIFO or a device such as `/dev/zero` is refused rather
@@ -408,15 +409,16 @@ From a code review (November 2026), memory:
       document lines in full, so a file of a few hundred 1 MB lines (minified bundles, wide CSV or JSON) copies
       ~200 MB into cosmic-text on top of the rope, plus ~330 bytes per 2 KB segment. Shrink the margin when
       lines are long, or only build the segments near the viewport.
-- [ ] **M2.** Hovering a link copies its whole line on every repaint (`draw_status` calls `doc.line`): 5 MB
+- [x] **M2.** Hovering a link copies its whole line on every repaint (`draw_status` calls `doc.line`): 5 MB
       per frame on a 5 MB line. Take just the link's bytes from the rope.
-- [ ] **M3.** A Wayland paste briefly needs twice its size: `String::from_utf8_lossy(&buf).into_owned()`
+- [x] **M3.** A Wayland paste briefly needs twice its size: `String::from_utf8_lossy(&buf).into_owned()`
       always copies, so a 256 MB paste peaks at 512 MB. Try `String::from_utf8(buf)` first, which reuses the
       buffer.
-- [ ] **M4.** The crash-recovery edit log keeps text it doesn't need. Each edit's inserted text is copied
-      before the 16 MB cap is checked, so a big paste is copied only to be thrown away. Entries also build up
-      for documents under 1 MB, where the writer ignores them, and are never collected if the recovery folder
-      couldn't be created. Check the size before copying, and skip the log when recovery is off.
+- [x] **M4.** The crash-recovery edit log kept text it didn't need. Each edit's inserted text was copied
+      before the 16 MB cap was checked, so a big paste was copied only to be thrown away, and if the recovery
+      folder couldn't be created, nothing ever collected the log. Now the size is checked first, and there's
+      no log without crash recovery. Documents under 1 MB still keep one, which the writer ignores; it's taken
+      at every autosave, so it only ever holds about 2 seconds of typing.
 - [ ] **M5.** The UI label cache fills with one-off strings: every new "Ln X, Col Y", progress percentage and
       IME composition gets a shaped buffer. At 512 entries the whole cache is cleared, menu labels included,
       and they're reshaped. Draw changing text without caching it.
@@ -424,7 +426,7 @@ From a code review (November 2026), memory:
       and segments words from its start. Work on a small window around the cursor, as `next_grapheme` does.
 
 From the same review, CPU:
-- [ ] **C1.** Skip glyphs entirely outside the text area. With word wrap off, every glyph of a 2 KB segment
+- [x] **C1.** Skip glyphs entirely outside the text area. With word wrap off, every glyph of a 2 KB segment
       goes through the glyph cache, and each pixel is then rejected by the clip test.
 - [ ] **C2.** Cache URL detection and link checking per segment. Today both run, punycode and script checks
       included, on every visible line every frame.
@@ -440,20 +442,20 @@ From the same review, CPU:
 - [ ] Sanitise file names shown in the title and tabs (bidi overrides and invisible characters could disguise them)
 
 From the code review (November 2026):
-- [ ] **S1.** A crafted file can slow every repaint. When `find_urls` trims trailing `)` from a link, it
+- [x] **S1.** A crafted file can slow every repaint. When `find_urls` trims trailing `)` from a link, it
       recounts every bracket in the link for each character removed, so the cost grows with the square of
       its length. A file of `http://a)))))…` lines costs millions of comparisons per visible line, on every
       frame and mouse move. Count the brackets once and adjust the count while trimming.
 - [ ] **S2.** Cap Wayland paste readers. If the app that owns the clipboard never closes the pipe, the reader
       thread blocks forever with a buffer of up to 256 MB. The 10 s timeout only gives up in the UI, so each
       further paste leaks another thread. Allow one reader at a time, or poll the pipe with a deadline.
-- [ ] **S3.** Saving a new file follows a symlink planted at its path between the check and the open
+- [x] **S3.** Saving a new file follows a symlink planted at its path between the check and the open
       (`write_in_place` uses `create` + `truncate`), for example in `/tmp`. Use `create_new` when the file
       didn't exist.
 - [ ] **S4.** `open_regular` checks the path's type, then opens the path. A file swapped for a FIFO in between
       freezes the window, since files under 4 MB are read on the window thread. Open with `O_NONBLOCK` and
       check the type of the open handle.
-- [ ] **S5.** `tests/bench/__pycache__/bench.cpython-313.pyc` is committed. Remove it and add `__pycache__/`
+- [x] **S5.** `tests/bench/__pycache__/bench.cpython-313.pyc` is committed. Remove it and add `__pycache__/`
       to `.gitignore`.
 
 **Suggested order for the review items**

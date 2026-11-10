@@ -472,7 +472,10 @@ pub fn save_with(path: &Path, write: &mut Writer) -> io::Result<()> {
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let Ok(meta) = fs::metadata(&target) else {
         // New file: create it directly so it gets the usual default permissions.
-        return write_in_place(&target, write);
+        // Exclusively, so a symlink planted at the name since the check above
+        // (in /tmp, say) can't redirect the write; a dangling one isn't followed.
+        let mut f = fs::OpenOptions::new().write(true).create_new(true).open(&target)?;
+        return fill(&mut f, write);
     };
     let dir = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -715,6 +718,15 @@ mod tests {
         // New files are created.
         save(&d.join("new.txt"), b"x").unwrap();
         assert_eq!(fs::read_to_string(d.join("new.txt")).unwrap(), "x");
+        #[cfg(unix)]
+        {
+            // A symlink pointing nowhere isn't followed to create its target.
+            let elsewhere = d.join("elsewhere.txt");
+            let trap = d.join("trap.txt");
+            std::os::unix::fs::symlink(&elsewhere, &trap).unwrap();
+            assert!(save(&trap, b"redirected?").is_err());
+            assert!(!elsewhere.exists());
+        }
         fs::remove_dir_all(&d).unwrap();
     }
 

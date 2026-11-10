@@ -96,10 +96,9 @@ impl App {
         let doc = &self.win.tabs[self.win.active].view.doc;
         let col = doc.column(cur); // no copy of the (possibly huge) line
         let selected = self.win.tabs[self.win.active].view.selection().map(|(a, z)| doc.chars_between(a, z));
-        let hovered = self.win.hover_url.as_ref().and_then(|(l, r)| {
-            let line = doc.line(*l);
-            line.get(r.clone()).map(linkcheck::analyze)
-        });
+        // Just the link's bytes: copying its line cost 5 MB a frame on a 5 MB line.
+        let link = self.win.hover_url.as_ref().and_then(|(l, r)| doc.line_get(*l, r.clone()));
+        let hovered = link.map(|u| linkcheck::analyze(&u));
         let mut warn = false;
         let key = if MAC { "Cmd" } else { "Ctrl" };
         let job = self.job_status(self.win.tabs[self.win.active].id);
