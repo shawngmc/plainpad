@@ -29,6 +29,12 @@ wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 memmap2 = "0.9"
 rustix = { version = "1", features = ["fs", "event"] }
 
+# Dependencies are optimised in debug and test builds too: laying out long
+# lines in an unoptimised cosmic-text made the tests take 15 s instead of 2 s. Only
+# the first build of each dependency is slower; plainpad itself stays debuggable.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = "fat"

@@ -377,6 +377,7 @@ Recently fixed:
 - [ ] Auto-scroll on a timer while drag-selecting outside the view (today it only scrolls while the mouse moves)
 - [ ] Let the Tab key move keyboard focus between controls in the find bar and dialogs
 - [ ] Repaint only the changed parts of the window, using softbuffer damage regions, instead of the whole window
+      (deferred; see C3 below for measurements)
 - [ ] Accessibility support for screen readers (AccessKit)
 - [ ] Detect BOM-less UTF-16 files
 - [ ] Shape and run the bidi algorithm across a whole long line, not per 2 KB display segment: today a
@@ -441,9 +442,14 @@ From the same review, CPU:
 - [x] **C2.** Link checking, punycode and script checks included, ran on every visible link every frame. Its
       answers are now remembered per link (up to 256 links of up to 512 bytes, about 128 KB at most). Finding
       the links still runs per frame: it's a single pass over the line since S1.
-- [ ] **C3.** Repaint only the changed parts of the window (see the damage-regions item above). At 2560×1600,
-      each keystroke clears and redraws 16 MB of pixels. A first step: repaint only the text area and status
-      bar while typing.
+- [ ] **C3.** Repaint only the changed parts of the window (see the damage-regions item above). Deferred
+      (November 2026): measured, it isn't worth it yet. A full frame at 2560×1600 (release build, Linux)
+      takes about 1.2 ms to draw: 0.55 ms to clear the window, 0.68 ms for a screen of text (57 rows), plus
+      0.05 ms to lay out a keystroke. Typing changes the text area, status bar and tab bar, almost the whole
+      window, so saving most of that needs diffing the text area row by row and tracking what each buffer
+      last showed, at the risk of stale pixels, for about 1 ms per keystroke. An idle window already uses no
+      CPU. Not measured: the cost of sending the frame to the screen. If that turns out to be large on real
+      hardware, the cheaper first step is to present only the damaged region, without changing the drawing.
 - [x] **C4.** Pastes are timed out by the event loop's timer (`WaitUntil`, as autosave does) instead of a
       thread per paste that only slept for 10 s.
 
