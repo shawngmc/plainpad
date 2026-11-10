@@ -403,10 +403,63 @@ Recently fixed:
 - [ ] Run the soak test on Wayland too (it drives X11 only; the Wayland frame presenter and clipboard code
       aren't covered)
 
+From a code review (November 2026), memory:
+- [ ] **M1.** Bound the layout window by bytes, not just lines (`View::load_window`). It holds about 200
+      document lines in full, so a file of a few hundred 1 MB lines (minified bundles, wide CSV or JSON) copies
+      ~200 MB into cosmic-text on top of the rope, plus ~330 bytes per 2 KB segment. Shrink the margin when
+      lines are long, or only build the segments near the viewport.
+- [ ] **M2.** Hovering a link copies its whole line on every repaint (`draw_status` calls `doc.line`): 5 MB
+      per frame on a 5 MB line. Take just the link's bytes from the rope.
+- [ ] **M3.** A Wayland paste briefly needs twice its size: `String::from_utf8_lossy(&buf).into_owned()`
+      always copies, so a 256 MB paste peaks at 512 MB. Try `String::from_utf8(buf)` first, which reuses the
+      buffer.
+- [ ] **M4.** The crash-recovery edit log keeps text it doesn't need. Each edit's inserted text is copied
+      before the 16 MB cap is checked, so a big paste is copied only to be thrown away. Entries also build up
+      for documents under 1 MB, where the writer ignores them, and are never collected if the recovery folder
+      couldn't be created. Check the size before copying, and skip the log when recovery is off.
+- [ ] **M5.** The UI label cache fills with one-off strings: every new "Ln X, Col Y", progress percentage and
+      IME composition gets a shaped buffer. At 512 entries the whole cache is cleared, menu labels included,
+      and they're reshaped. Draw changing text without caching it.
+- [ ] **M6.** `word_at`, `clamp` and `make_lines` copy the whole line: double-clicking in a 5 MB line copies it
+      and segments words from its start. Work on a small window around the cursor, as `next_grapheme` does.
+
+From the same review, CPU:
+- [ ] **C1.** Skip glyphs entirely outside the text area. With word wrap off, every glyph of a 2 KB segment
+      goes through the glyph cache, and each pixel is then rejected by the clip test.
+- [ ] **C2.** Cache URL detection and link checking per segment. Today both run, punycode and script checks
+      included, on every visible line every frame.
+- [ ] **C3.** Repaint only the changed parts of the window (see the damage-regions item above). At 2560×1600,
+      each keystroke clears and redraws 16 MB of pixels. A first step: repaint only the text area and status
+      bar while typing.
+- [ ] **C4.** Time out pastes with the event loop's timer (`WaitUntil`, as autosave does) instead of a thread
+      per paste that only sleeps for 10 s.
+
 **Security**
 - [ ] Coverage-guided fuzzing (`cargo-fuzz`) of the decoder, link checker, search, and document edit/undo code
 - [ ] `cargo-deny` in CI (advisories, licences, duplicate or banned crates); pin the Rust toolchain
 - [ ] Sanitise file names shown in the title and tabs (bidi overrides and invisible characters could disguise them)
+
+From the code review (November 2026):
+- [ ] **S1.** A crafted file can slow every repaint. When `find_urls` trims trailing `)` from a link, it
+      recounts every bracket in the link for each character removed, so the cost grows with the square of
+      its length. A file of `http://a)))))…` lines costs millions of comparisons per visible line, on every
+      frame and mouse move. Count the brackets once and adjust the count while trimming.
+- [ ] **S2.** Cap Wayland paste readers. If the app that owns the clipboard never closes the pipe, the reader
+      thread blocks forever with a buffer of up to 256 MB. The 10 s timeout only gives up in the UI, so each
+      further paste leaks another thread. Allow one reader at a time, or poll the pipe with a deadline.
+- [ ] **S3.** Saving a new file follows a symlink planted at its path between the check and the open
+      (`write_in_place` uses `create` + `truncate`), for example in `/tmp`. Use `create_new` when the file
+      didn't exist.
+- [ ] **S4.** `open_regular` checks the path's type, then opens the path. A file swapped for a FIFO in between
+      freezes the window, since files under 4 MB are read on the window thread. Open with `O_NONBLOCK` and
+      check the type of the open handle.
+- [ ] **S5.** `tests/bench/__pycache__/bench.cpython-313.pyc` is committed. Remove it and add `__pycache__/`
+      to `.gitignore`.
+
+**Suggested order for the review items**
+1. Quick, low-risk fixes (a few lines each, no change in behaviour): S1, S3, S5, M2, M3, M4, C1
+2. Moderate: S2, S4, M5, M6, C2, C4
+3. Larger design changes: M1 (a byte budget for the layout window) and C3 (damage regions)
 
 **Quality**
 - [x] Run the GUI smoke tests in CI: Xvfb for X11 and headless sway for Wayland, scripted with xdotool and
