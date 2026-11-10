@@ -237,6 +237,14 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
   document the process would otherwise stay at its peak size. The app calls `malloc_trim` after closing tabs or
   windows, printing, Replace All, large undo/redo steps, and clearing caches. Closing a 27 MB file now drops
   the app's own memory from 33 MB to 1.8 MB.
+- **The allocator is tuned for a long session.** The soak test found the process's memory creeping up
+  (33 MB to 81 MB in six minutes of pasting, editing and reloading) although nothing was leaking: valgrind
+  showed what was still allocated grew by only 1.3 MB. glibc raises its threshold for giving large blocks
+  their own mapping after freeing one, up to 32 MB, so big temporary buffers (pasted text, file data) end up
+  inside the main heap among small long-lived allocations, and the gaps they leave can't be returned. Every
+  short-lived thread (clipboard reads, file jobs) can also leave behind its own allocator arena. At startup the
+  app now fixes that threshold at 128 KB, so large blocks go back to the OS as soon as they're freed, and
+  allows at most two arenas.
 - **Bounded glyph cache.** Rendered glyph images are cached, but the cache is cleared when the zoom or font
   changes (old sizes are never drawn again), and whenever it passes 8,192 glyphs. Zooming through 30 sizes
   on CJK text now uses 4.5 MB instead of 13.5 MB.
@@ -390,8 +398,10 @@ Recently fixed:
 - [ ] Restore crash-recovered documents in the background too (a 300 MB one takes ~0.5 s at startup)
 - [x] A benchmark job in CI that fails on regressions: startup time, idle memory, memory with a 30 MB file and
       after closing it, keystroke time on a long line, binary size
-- [ ] A long-session soak test: an hour of scripted random edits, undos, tab moves and pastes, then check
+- [x] A long-session soak test: an hour of scripted random edits, undos, tab moves and pastes, then check
       memory returns to its starting level
+- [ ] Run the soak test on Wayland too (it drives X11 only; the Wayland frame presenter and clipboard code
+      aren't covered)
 
 **Security**
 - [ ] Coverage-guided fuzzing (`cargo-fuzz`) of the decoder, link checker, search, and document edit/undo code
@@ -446,6 +456,35 @@ The baseline holds numbers from the CI runner, not a developer machine (memory t
 installed). After an intended change, copy the new numbers from the job summary into the baseline. Locally,
 `tests/bench/bench.py --update` writes your own machine's numbers as the baseline, for comparing before and
 after a change.
+
+### Soak test
+
+`tests/soak/soak.py` drives the release build for a long session (an hour by default) with seeded random
+actions: typing in several scripts, deleting, moving and selecting, scrolling, undo and redo bursts, copy, cut
+and paste, pastes of up to 3 MB from another program, opening, switching and closing tabs, Find, Replace All,
+zoom, word wrap, resizing, right-click menus, saving, and dragging tabs out into new windows and back. It starts
+with four files: two small ones, a 6 MB one (handled in the background) and a 300 KB single line.
+
+Every few minutes it returns the app to its starting state: tabs dragged back, untitled tabs discarded, the
+files saved and then rewritten with their original text (so they reload, clearing undo history), and zoom,
+word wrap, window size and clipboard reset. It then records memory still allocated (glibc's `malloc_stats`,
+read through gdb), the process's own memory, CPU use while idle and how fast a new tab opens. It fails if:
+
+- the app crashes or stops responding,
+- it uses CPU while idle,
+- memory still allocated ends more than 10% + 1 MB above the baseline (a leak),
+- or the process's own memory ends more than 50% (at least 10 MB) above it. This one is looser, because what
+  the allocator holds on to wanders by several MB between checkpoints.
+
+It runs nightly in CI (`.github/workflows/soak.yml`), and on demand from the Actions tab with a chosen length
+and seed. The results table goes to the run summary; the action log, the app's log and, on failure, a
+screenshot are kept as an artifact. To reproduce a run, pass its seed.
+
+```
+sudo apt-get install xvfb xdotool xclip gdb
+cargo build --release
+tests/soak/soak.py --minutes 10 --seed 1234
+```
 
 `tests/gui/testkit` is a small helper for the Wayland tests: a virtual pointer (sway has no input devices
 when headless) and a clipboard owner that never sends its data.

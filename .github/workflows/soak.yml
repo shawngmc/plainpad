@@ -1,0 +1,45 @@
+name: soak
+
+# A long session of random editing that checks memory returns to its starting
+# level (tests/soak/soak.py). Too slow for every push: it runs nightly, and on
+# demand from the Actions tab with a chosen length.
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: How long to run, in minutes
+        default: "60"
+      seed:
+        description: Random seed (blank for a new one)
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
+            xvfb x11-utils xdotool xclip imagemagick gdb fonts-dejavu-core fonts-noto-cjk
+      - run: cargo build --locked --release
+      - name: Soak
+        env:
+          MINUTES: ${{ inputs.minutes || '60' }}
+          SEED: ${{ inputs.seed }}
+        run: python3 tests/soak/soak.py --minutes "$MINUTES" ${SEED:+--seed "$SEED"}
+      - if: success() || failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-results
+          path: target/soak

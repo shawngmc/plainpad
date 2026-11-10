@@ -609,6 +609,7 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
+    mem::init();
     let settings = Settings::load();
     let files = std::env::args_os().skip(1).map(PathBuf::from).collect();
     let el = EventLoop::<UserEvent>::with_user_event().build().expect("failed to create event loop");
