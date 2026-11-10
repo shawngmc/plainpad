@@ -39,6 +39,29 @@ impl LinkInfo {
     }
 }
 
+/// Whether a link may be disguised (see [`analyze`]). Drawing asks this for
+/// every visible link on every frame, so answers are remembered per link text:
+/// up to 256 of them, for links up to 512 bytes (about 128 KB at most).
+pub fn is_suspicious(text: &str) -> bool {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local!(static SEEN: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new()));
+    if text.len() > 512 {
+        return analyze(text).suspicious();
+    }
+    SEEN.with_borrow_mut(|seen| {
+        if let Some(&bad) = seen.get(text) {
+            return bad;
+        }
+        if seen.len() >= 256 {
+            seen.clear();
+        }
+        let bad = analyze(text).suspicious();
+        seen.insert(text.to_owned(), bad);
+        bad
+    })
+}
+
 pub fn analyze(text: &str) -> LinkInfo {
     let url = url_target(text);
     let lower = url.to_ascii_lowercase();
@@ -418,6 +441,21 @@ mod tests {
 
     fn warned(url: &str) -> bool {
         analyze(url).suspicious()
+    }
+
+    #[test]
+    fn remembered_answers_match() {
+        let long = format!("https://example.com/{}", "a".repeat(600));
+        for _ in 0..2 {
+            for url in ["https://example.com/", "https://аpple.com/", "https://google.com@evil.example/", &long] {
+                assert_eq!(is_suspicious(url), warned(url), "{url}");
+            }
+        }
+        // Many different links: the remembered answers stay bounded, and still right.
+        for i in 0..1000 {
+            assert!(!is_suspicious(&format!("https://site{i}.example/")));
+        }
+        assert!(is_suspicious("https://аpple.com/"));
     }
 
     #[test]

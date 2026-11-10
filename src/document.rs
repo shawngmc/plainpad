@@ -130,6 +130,15 @@ pub fn replay(rope: &mut Rope, ops: &[JournalOp]) -> Result<(), String> {
 /// Unwritten journal entries beyond this give up on journaling until the next full snapshot.
 const JOURNAL_CAP: usize = 16 * 1024 * 1024;
 
+/// Off when crash recovery couldn't start: nothing would ever take the journal,
+/// so each document would hold up to [`JOURNAL_CAP`] of edits for nothing.
+static JOURNALING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Stops all documents keeping a journal (crash recovery is unavailable).
+pub fn disable_journal() {
+    JOURNALING.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn next_epoch() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -279,12 +288,15 @@ impl Document {
     /// Clamps a position to the document and to a char boundary.
     pub fn clamp(&self, c: Cursor) -> Cursor {
         let line = c.line.min(self.len_lines() - 1);
-        let text = self.line(line);
-        let mut index = c.index.min(text.len());
-        while !text.is_char_boundary(index) {
-            index -= 1;
-        }
+        let index = self.floor_index(line, c.index.min(self.line_len(line)));
         Cursor { line, index, affinity: c.affinity }
+    }
+
+    /// Byte `i` of line `line` (at most its length) rounded down to a char
+    /// boundary, from the rope: no copy of the (possibly huge) line.
+    pub fn floor_index(&self, line: usize, i: usize) -> usize {
+        let base = self.rope.line_to_byte(line);
+        self.rope.char_to_byte(self.rope.byte_to_char(base + i)) - base
     }
 
     fn replace_raw(&mut self, a: Cursor, b: Cursor, text: &str) -> (String, EditResult) {
@@ -294,7 +306,7 @@ impl Document {
         let at = self.offset(a);
         self.rope.remove(ca..cb);
         self.rope.insert(ca, text);
-        self.journal_push(JournalOp { at, remove: removed.len(), insert: text.to_owned() });
+        self.journal_push(at, removed.len(), text);
         let end = end_of(a, text);
         (removed, EditResult { start: a, old_end: b, first: a.line, old_last: b.line, new_last: end.line, end })
     }
@@ -494,15 +506,17 @@ impl Document {
 
     // ------------------------------------------------------------ journal
 
-    fn journal_push(&mut self, op: JournalOp) {
+    fn journal_push(&mut self, at: usize, remove: usize, insert: &str) {
         if self.journal_broken {
             return;
         }
-        self.journal_bytes += op.insert.len() + std::mem::size_of::<JournalOp>();
-        self.journal.push(op);
-        if self.journal_bytes > JOURNAL_CAP {
-            self.journal_break();
+        // Checked before copying, so a huge paste isn't copied only to be dropped.
+        let bytes = insert.len() + std::mem::size_of::<JournalOp>();
+        if !JOURNALING.load(std::sync::atomic::Ordering::Relaxed) || self.journal_bytes + bytes > JOURNAL_CAP {
+            return self.journal_break();
         }
+        self.journal_bytes += bytes;
+        self.journal.push(JournalOp { at, remove, insert: insert.to_owned() });
     }
 
     fn journal_break(&mut self) {
@@ -573,18 +587,36 @@ impl Document {
         self.rope.slice(ca..cb).to_string()
     }
 
+    /// Bytes `r` of line `line`, without copying the rest of the line. None
+    /// unless the range lies within the line, on char boundaries.
+    pub fn line_get(&self, line: usize, r: Range<usize>) -> Option<Cow<'_, str>> {
+        if line >= self.len_lines() || r.start > r.end || r.end > self.line_len(line) {
+            return None;
+        }
+        let base = self.rope.line_to_byte(line);
+        let (a, b) = (base + r.start, base + r.end);
+        let on_boundary = |i: usize| self.rope.char_to_byte(self.rope.byte_to_char(i)) == i;
+        (on_boundary(a) && on_boundary(b)).then(|| self.rope.byte_slice(a..b).into())
+    }
+
     /// 1-based column (in characters) of a position, without copying the line.
     pub fn column(&self, c: Cursor) -> usize {
         self.chars_between(Cursor::new(c.line, 0), c) + 1
     }
 
-    /// The word (or run of whitespace/punctuation) containing `c`.
+    /// The word (or run of whitespace/punctuation) containing `c`. Looks at a
+    /// window around `c` rather than copying the whole line; a word longer than
+    /// that is cut at the window's edge (still a valid selection).
     pub fn word_at(&self, c: Cursor) -> (Cursor, Cursor) {
-        let line = self.line(c.line);
-        let mut found = (line.len(), line.len());
-        for (i, w) in line.split_word_bound_indices() {
-            if c.index < i + w.len() {
-                found = (i, i + w.len());
+        const AROUND: usize = 256;
+        let len = self.line_len(c.line);
+        let start = self.floor_index(c.line, c.index.min(len).saturating_sub(AROUND));
+        let end = self.floor_index(c.line, (c.index + AROUND).min(len));
+        let window = self.line_slice(c.line, start, end);
+        let mut found = (end, end);
+        for (i, w) in window.split_word_bound_indices() {
+            if c.index < start + i + w.len() {
+                found = (start + i, start + i + w.len());
                 break;
             }
         }
@@ -840,6 +872,29 @@ mod tests {
     }
 
     #[test]
+    fn huge_edits_break_the_journal_without_being_copied() {
+        let mut d = Document::new("x");
+        d.replace(c(0, 1), c(0, 1), &"y".repeat(JOURNAL_CAP), false);
+        assert!(d.journal.is_empty() && d.journal_broken && d.journal_bytes == 0);
+        assert!(d.take_journal().ops.is_none(), "the whole text must be written");
+        d.replace(c(0, 0), c(0, 0), "z", false);
+        assert_eq!(d.take_journal().ops.unwrap().len(), 1, "journaling resumes after that");
+    }
+
+    #[test]
+    fn line_get_checks_its_range() {
+        let d = Document::new("ab日c\nxyz");
+        assert_eq!(d.line_get(0, 1..5).as_deref(), Some("b日"));
+        assert_eq!(d.line_get(1, 0..3).as_deref(), Some("xyz"));
+        assert_eq!(d.line_get(0, 2..3), None, "inside a character");
+        assert_eq!(d.line_get(0, 0..7), None, "past the line, into its newline");
+        assert_eq!(d.line_get(2, 0..0), None, "no such line");
+        #[allow(clippy::reversed_empty_ranges)]
+        let backwards = 3..1;
+        assert_eq!(d.line_get(0, backwards), None);
+    }
+
+    #[test]
     fn journal_replays_to_the_same_text() {
         let base = "héllo wörld\nsecond line\n日本語";
         let mut d = Document::new(base);
@@ -905,5 +960,18 @@ mod tests {
         assert_eq!(d.word_at(c(1, 4)), (c(1, 3), c(1, 5)));
         assert_eq!(d.chars_between(c(0, 0), c(1, 2)), 6);
         assert_eq!(d.clamp(c(9, 99)), c(1, 5));
+        assert_eq!(d.word_at(c(1, 99)), (c(1, 5), c(1, 5)), "past the end of the line");
+    }
+
+    #[test]
+    fn word_and_clamp_on_a_long_line() {
+        // One 100 KB line: these look around the position instead of copying it.
+        let d = Document::new(&format!("{}é b{}", "a".repeat(50_000), "c".repeat(50_000)));
+        assert_eq!(d.clamp(c(0, 50_001)), c(0, 50_000), "inside 'é'");
+        assert_eq!(d.word_at(c(0, 50_002)), (c(0, 50_002), c(0, 50_003)), "the space");
+        // A word longer than the window is cut at its edges, on char boundaries.
+        let (a, z) = d.word_at(c(0, 25_000));
+        assert!(a.index < 25_000 && z.index > 25_000 && z.index - a.index <= 512, "{a:?} {z:?}");
+        assert_eq!(d.word_at(c(0, 50_004)).0, c(0, 50_003), "'bcc…' starts after the space");
     }
 }

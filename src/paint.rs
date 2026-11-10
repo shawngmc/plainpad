@@ -57,16 +57,16 @@ impl App {
         if let Some(p) = self.opening(tab.id) {
             let msg = format!("Opening {}… {p}%", tab.name());
             cv.set_clip(area);
-            self.gfx.text(cv, &msg, area.x + pad, area.y + pad, th.dim);
+            self.gfx.text_once(cv, &msg, area.x + pad, area.y + pad, th.dim);
             cv.reset_clip();
         }
         if let Some((x, y, h)) = caret {
             cv.set_clip(area);
             if !self.win.preedit.is_empty() {
-                let w = self.gfx.text_w(&self.win.preedit);
+                let w = self.gfx.text_w_once(&self.win.preedit);
                 let r = Rect::new(x, y, w + 4.0 * s, h);
                 cv.fill(r, th.field);
-                self.gfx.text_in(cv, &self.win.preedit, Rect::new(x + 2.0 * s, y, w, h), th.fg);
+                self.gfx.text_in_once(cv, &self.win.preedit, Rect::new(x + 2.0 * s, y, w, h), th.fg);
                 cv.fill(Rect::new(x, r.bottom() - 2.0 * s, r.w, s.max(1.0)), th.fg);
             } else if show_caret {
                 cv.fill(Rect::new(x, y, s.max(1.0).round(), h), th.fg);
@@ -96,10 +96,9 @@ impl App {
         let doc = &self.win.tabs[self.win.active].view.doc;
         let col = doc.column(cur); // no copy of the (possibly huge) line
         let selected = self.win.tabs[self.win.active].view.selection().map(|(a, z)| doc.chars_between(a, z));
-        let hovered = self.win.hover_url.as_ref().and_then(|(l, r)| {
-            let line = doc.line(*l);
-            line.get(r.clone()).map(linkcheck::analyze)
-        });
+        // Just the link's bytes: copying its line cost 5 MB a frame on a 5 MB line.
+        let link = self.win.hover_url.as_ref().and_then(|(l, r)| doc.line_get(*l, r.clone()));
+        let hovered = link.map(|u| linkcheck::analyze(&u));
         let mut warn = false;
         let key = if MAC { "Cmd" } else { "Ctrl" };
         let job = self.job_status(self.win.tabs[self.win.active].id);
@@ -142,7 +141,7 @@ impl App {
             x -= 12.0 * s;
         }
         cv.set_clip(Rect::new(r.x, r.y, (x - r.x).max(0.0), r.h));
-        self.gfx.text_in(cv, &left, row, if warn { th.danger } else { th.chrome_fg });
+        self.gfx.text_in_once(cv, &left, row, if warn { th.danger } else { th.chrome_fg });
         cv.reset_clip();
     }
 

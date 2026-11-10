@@ -178,13 +178,15 @@ A text editor opens files from anywhere, so their contents are treated as untrus
   `xdg-open` on Linux) as a single argument, never through a shell.
 - **Saving:** the temp file is created exclusively with an unpredictable name, so a symlink planted next to
   the file can't redirect the write. It's readable only by you until it replaces the original, and then it
-  takes the original's permissions. Files owned by another user, or with extra hard links, are written in place
+  takes the original's permissions. A new file is created exclusively too, so a symlink planted at its name
+  is never followed. Files owned by another user, or with extra hard links, are written in place
   so they keep their owner and links.
 - **Printing:** the PDF sent to the printer is created the same way, private and with an unpredictable name.
 - **Opening files:** only regular files are opened. A FIFO or a device such as `/dev/zero` is refused rather
   than hanging the app or filling memory.
 - **Clipboard:** pasting never blocks the editor (see "Pasting never freezes" below). On Wayland, text pasted
-  from another app is capped at 256 MB, so an app that never stops sending can't exhaust memory. At most 8
+  from another app is capped at 256 MB, so an app that never stops sending can't exhaust memory, and reading
+  it gives up after 10 seconds, so an app that never finishes can't keep a thread and its buffer waiting. At most 8
   transfers of our copied text
   run at once, so an app that keeps asking and never reads can't pile up threads. All shared Wayland
   objects are used under one lock, because libwayland forbids destroying an object on one thread while
@@ -263,8 +265,9 @@ These choices keep memory use, CPU use and dependencies small. Some trade away p
 - **Repaints only when something changes.** Moving the mouse repaints only if the hovered URL, the menu
   highlight or a drag actually changes.
 - **The document is stored in a rope (`ropey`), outside the layout engine.** The whole text lives in a
-  compact rope, which adds about 10% over the file size. Only a window of a few hundred lines around the
-  viewport is loaded into cosmic-text. That matters because cosmic-text spends about 330 bytes of
+  compact rope, which adds about 10% over the file size. Only a window of lines around the viewport is
+  loaded into cosmic-text: a few hundred normal lines, or just enough long ones to fill the view and its
+  margins. That matters because cosmic-text spends about 330 bytes of
   bookkeeping on every line it holds, before any layout. As you scroll, lines are swapped in and out of
   the window, and lines already laid out are reused. The cursor, selection and undo history are stored
   in whole-document positions, so they work across the entire file. Search, Replace All, the selection
@@ -374,6 +377,7 @@ Recently fixed:
 - [ ] Auto-scroll on a timer while drag-selecting outside the view (today it only scrolls while the mouse moves)
 - [ ] Let the Tab key move keyboard focus between controls in the find bar and dialogs
 - [ ] Repaint only the changed parts of the window, using softbuffer damage regions, instead of the whole window
+      (deferred; see C3 below for measurements)
 - [ ] Accessibility support for screen readers (AccessKit)
 - [ ] Detect BOM-less UTF-16 files
 - [ ] Shape and run the bidi algorithm across a whole long line, not per 2 KB display segment: today a
@@ -403,10 +407,79 @@ Recently fixed:
 - [ ] Run the soak test on Wayland too (it drives X11 only; the Wayland frame presenter and clipboard code
       aren't covered)
 
+From a code review (November 2026), memory:
+- [x] **M1.** The layout window held about 200 document lines in full, so a file of a few hundred 1 MB lines
+      (minified bundles, wide CSV or JSON) copied ~200 MB into cosmic-text on top of the rope, plus ~330 bytes
+      per 2 KB segment. It's now bounded by display segments: every segment takes at least one row, so lines
+      are added around the view only until there are enough segments for it and its margins. Normal files get
+      the same window as before; in a test file of 300 lines of 20 KB, the window went from 1.7 MB to under
+      600 KB, and with 1 MB lines it holds a few lines instead of ~200. A single huge line is still loaded
+      whole (see "Long lines").
+- [x] **M2.** Hovering a link copies its whole line on every repaint (`draw_status` calls `doc.line`): 5 MB
+      per frame on a 5 MB line. Take just the link's bytes from the rope.
+- [x] **M3.** A Wayland paste briefly needs twice its size: `String::from_utf8_lossy(&buf).into_owned()`
+      always copies, so a 256 MB paste peaks at 512 MB. Try `String::from_utf8(buf)` first, which reuses the
+      buffer.
+- [x] **M4.** The crash-recovery edit log kept text it didn't need. Each edit's inserted text was copied
+      before the 16 MB cap was checked, so a big paste was copied only to be thrown away, and if the recovery
+      folder couldn't be created, nothing ever collected the log. Now the size is checked first, and there's
+      no log without crash recovery. Documents under 1 MB still keep one, which the writer ignores; it's taken
+      at every autosave, so it only ever holds about 2 seconds of typing.
+- [x] **M5.** The UI label cache filled with one-off strings: every new "Ln X, Col Y", progress percentage and
+      IME composition got a shaped buffer. At 512 entries the whole cache was cleared, menu labels included,
+      and they were reshaped. Now text that keeps changing (the status message, progress, IME composition, a
+      field's width up to the caret) is drawn without the cache. The cache keeps two generations of 256, so
+      labels drawn every frame are never reshaped and unused ones age out. It's still capped at 512 entries:
+      fewer would make a window with a few hundred tabs reshape every tab name on every frame.
+- [x] **M6.** `word_at`, `clamp` and `make_lines` copied the whole line: double-clicking in a 5 MB line copied
+      it and segmented words from its start. `clamp` now works on the rope directly, `word_at` looks 256 bytes
+      either side of the cursor (a longer word is cut at that edge), and `make_lines` copies a long line from
+      the rope one segment at a time.
+
+From the same review, CPU:
+- [x] **C1.** Skip glyphs entirely outside the text area. With word wrap off, every glyph of a 2 KB segment
+      goes through the glyph cache, and each pixel is then rejected by the clip test.
+- [x] **C2.** Link checking, punycode and script checks included, ran on every visible link every frame. Its
+      answers are now remembered per link (up to 256 links of up to 512 bytes, about 128 KB at most). Finding
+      the links still runs per frame: it's a single pass over the line since S1.
+- [ ] **C3.** Repaint only the changed parts of the window (see the damage-regions item above). Deferred
+      (November 2026): measured, it isn't worth it yet. A full frame at 2560×1600 (release build, Linux)
+      takes about 1.2 ms to draw: 0.55 ms to clear the window, 0.68 ms for a screen of text (57 rows), plus
+      0.05 ms to lay out a keystroke. Typing changes the text area, status bar and tab bar, almost the whole
+      window, so saving most of that needs diffing the text area row by row and tracking what each buffer
+      last showed, at the risk of stale pixels, for about 1 ms per keystroke. An idle window already uses no
+      CPU. Not measured: the cost of sending the frame to the screen. If that turns out to be large on real
+      hardware, the cheaper first step is to present only the damaged region, without changing the drawing.
+- [x] **C4.** Pastes are timed out by the event loop's timer (`WaitUntil`, as autosave does) instead of a
+      thread per paste that only slept for 10 s.
+
 **Security**
 - [ ] Coverage-guided fuzzing (`cargo-fuzz`) of the decoder, link checker, search, and document edit/undo code
 - [ ] `cargo-deny` in CI (advisories, licences, duplicate or banned crates); pin the Rust toolchain
 - [ ] Sanitise file names shown in the title and tabs (bidi overrides and invisible characters could disguise them)
+
+From the code review (November 2026):
+- [x] **S1.** A crafted file can slow every repaint. When `find_urls` trims trailing `)` from a link, it
+      recounts every bracket in the link for each character removed, so the cost grows with the square of
+      its length. A file of `http://a)))))…` lines costs millions of comparisons per visible line, on every
+      frame and mouse move. Count the brackets once and adjust the count while trimming.
+- [x] **S2.** If the app that owns the clipboard never closed the pipe, the Wayland paste reader thread blocked
+      forever with a buffer of up to 256 MB. The 10 s timeout only gave up in the UI, so each further paste
+      leaked another thread. The reader now polls the pipe with the same 10 s deadline and then gives up,
+      freeing what it read.
+- [x] **S3.** Saving a new file follows a symlink planted at its path between the check and the open
+      (`write_in_place` uses `create` + `truncate`), for example in `/tmp`. Use `create_new` when the file
+      didn't exist.
+- [x] **S4.** `open_regular` checked the path's type, then opened the path. A file swapped for a FIFO in between
+      froze the window, since files under 4 MB are read on the window thread. On Unix it now opens with
+      `O_NONBLOCK`, and on every platform it checks the type of what it actually opened.
+- [x] **S5.** `tests/bench/__pycache__/bench.cpython-313.pyc` is committed. Remove it and add `__pycache__/`
+      to `.gitignore`.
+
+**Suggested order for the review items**
+1. Quick, low-risk fixes (a few lines each, no change in behaviour): S1, S3, S5, M2, M3, M4, C1
+2. Moderate: S2, S4, M5, M6, C2, C4
+3. Larger design changes: M1 (a byte budget for the layout window) and C3 (damage regions)
 
 **Quality**
 - [x] Run the GUI smoke tests in CI: Xvfb for X11 and headless sway for Wayland, scripted with xdotool and

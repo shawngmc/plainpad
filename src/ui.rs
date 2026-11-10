@@ -621,7 +621,7 @@ impl TextField {
         let inner = Rect::new(r.x + 6.0 * s, r.y, r.w - 12.0 * s, r.h);
         cv.set_clip(inner);
         // Keep the caret visible for long text by scrolling left.
-        let caret_x = g.text_w(&self.text[..self.cursor]);
+        let caret_x = g.text_w_once(&self.text[..self.cursor]); // a new prefix at every caret position
         let shift = (caret_x - inner.w + 2.0 * s).max(0.0);
         if self.all && focused && !self.text.is_empty() {
             let w = g.text_w(&self.text);

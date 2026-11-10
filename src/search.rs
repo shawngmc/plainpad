@@ -269,11 +269,18 @@ pub fn find_urls(line: &str) -> Vec<Range<usize>> {
             end = start + prefix.len() + off + c.len_utf8();
         }
         // Trim trailing punctuation, keeping a ')' that closes a '(' inside the URL.
+        // Counted once and updated while trimming: recounting for each `)`
+        // removed made a link ending in thousands of them quadratic.
+        let opens = line[start..end].matches('(').count();
+        let mut closes = line[start..end].matches(')').count();
         while end > start + prefix.len() {
             let c = line[..end].chars().next_back().unwrap();
             let trim = match c {
                 '.' | ',' | ';' | ':' | '!' | '?' | '\'' | ']' | '}' => true,
-                ')' => line[start..end].matches('(').count() < line[start..end].matches(')').count(),
+                ')' if opens < closes => {
+                    closes -= 1;
+                    true
+                }
                 _ => false,
             };
             if !trim {
@@ -322,6 +329,15 @@ mod tests {
         // Invisible bidi/zero-width characters end a link.
         assert_eq!(urls("https://good.com\u{202E}moc.live"), ["https://good.com"]);
         assert_eq!(urls("https://a.com\u{200B}.evil"), ["https://a.com"]);
+        assert_eq!(urls("x (see http://a.b/c_(d))), y"), ["http://a.b/c_(d)"]);
+    }
+
+    #[test]
+    fn trailing_parens_are_linear() {
+        // Trimming used to recount the brackets for each `)` removed: this took
+        // billions of steps. It must stay instant (it runs on every repaint).
+        let s = format!("http://a.b/{}", ")".repeat(100_000));
+        assert_eq!(urls(&s), ["http://a.b/"]);
     }
 
     #[test]

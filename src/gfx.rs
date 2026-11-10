@@ -171,12 +171,22 @@ fn mix(dst: u32, src: u32, a: u32) -> u32 {
 /// Glyph images kept before the cache is cleared.
 const MAX_GLYPHS: usize = 8192;
 
+/// Shaped UI labels kept per generation of the label cache.
+const UI_GEN: usize = 256;
+
 /// Font system, glyph cache, and a small cache of shaped UI labels.
 pub struct Gfx {
     pub fs: FontSystem,
     pub cache: SwashCache,
+    /// Labels cached in two generations: when `ui` fills up it becomes `ui_old`,
+    /// and labels drawn from `ui_old` move back. Labels drawn every frame (menus,
+    /// tab names) are never reshaped; ones no longer drawn age out.
     ui: HashMap<String, Buffer>,
+    ui_old: HashMap<String, Buffer>,
     ui_metrics: Metrics,
+    /// Labels shaped so far (for tests).
+    #[cfg(test)]
+    shaped: usize,
 }
 
 impl Gfx {
@@ -185,7 +195,10 @@ impl Gfx {
             fs: FontSystem::new(),
             cache: SwashCache::new(),
             ui: HashMap::new(),
+            ui_old: HashMap::new(),
             ui_metrics: Metrics::new(13.0, 18.0),
+            #[cfg(test)]
+            shaped: 0,
         }
     }
 
@@ -210,6 +223,7 @@ impl Gfx {
         if m != self.ui_metrics {
             self.ui_metrics = m;
             self.ui.clear();
+            self.ui_old.clear();
         }
     }
 
@@ -217,22 +231,45 @@ impl Gfx {
         self.ui_metrics.line_height
     }
 
-    fn label(&mut self, text: &str) -> &Buffer {
-        if self.ui.len() > 512 {
-            self.ui.clear();
+    /// Lays out a single-line UI label.
+    fn shape(&mut self, text: &str) -> Buffer {
+        #[cfg(test)]
+        {
+            self.shaped += 1;
         }
-        let Gfx { fs, ui, ui_metrics, .. } = self;
-        ui.entry(text.to_owned()).or_insert_with(|| {
-            let mut b = Buffer::new(fs, *ui_metrics);
-            b.set_size(None, None);
-            b.set_text(text, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
-            b.shape_until_scroll(fs, false);
-            b
-        })
+        let mut b = Buffer::new(&mut self.fs, self.ui_metrics);
+        b.set_size(None, None);
+        b.set_text(text, &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
+        b.shape_until_scroll(&mut self.fs, false);
+        b
+    }
+
+    /// The cached layout of a label.
+    fn label(&mut self, text: &str) -> &Buffer {
+        if !self.ui.contains_key(text) {
+            let b = match self.ui_old.remove(text) {
+                Some(b) => b,
+                None => self.shape(text),
+            };
+            if self.ui.len() >= UI_GEN {
+                self.ui_old = std::mem::take(&mut self.ui);
+            }
+            self.ui.insert(text.to_owned(), b);
+        }
+        &self.ui[text]
     }
 
     pub fn text_w(&mut self, text: &str) -> f32 {
-        self.label(text).layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
+        width(self.label(text))
+    }
+
+    /// Like [`Gfx::text_w`], for text that keeps changing (a field being typed
+    /// in, the cursor position): measured without filling the label cache.
+    pub fn text_w_once(&mut self, text: &str) -> f32 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        width(&self.shape(text))
     }
 
     /// Draws a single-line UI label with its line box top at `y`. Returns its width.
@@ -242,21 +279,65 @@ impl Gfx {
         }
         self.label(text);
         let Gfx { fs, cache, ui, .. } = self;
-        let buf = &ui[text];
-        let mut w: f32 = 0.0;
-        for run in buf.layout_runs() {
-            w = w.max(run.line_w);
-            for g in run.glyphs {
-                let pg = g.physical((x, y + run.line_y), 1.0);
-                cache.with_pixels(fs, pg.cache_key, color, |gx, gy, c| cv.blend(pg.x + gx, pg.y + gy, c));
-            }
+        draw(fs, cache, cv, &ui[text], x, y, color)
+    }
+
+    /// Like [`Gfx::text`], for text that keeps changing: drawn without filling the label cache.
+    pub fn text_once(&mut self, cv: &mut Canvas, text: &str, x: f32, y: f32, color: Color) -> f32 {
+        if text.is_empty() {
+            return 0.0;
         }
-        w
+        let b = self.shape(text);
+        draw(&mut self.fs, &mut self.cache, cv, &b, x, y, color)
     }
 
     /// Draws a label vertically centred in `r`, left aligned at `r.x`.
     pub fn text_in(&mut self, cv: &mut Canvas, text: &str, r: Rect, color: Color) -> f32 {
         let y = r.y + ((r.h - self.ui_line_h()) / 2.0).round();
         self.text(cv, text, r.x, y, color)
+    }
+
+    /// Like [`Gfx::text_in`], for text that keeps changing: drawn without filling the label cache.
+    pub fn text_in_once(&mut self, cv: &mut Canvas, text: &str, r: Rect, color: Color) -> f32 {
+        let y = r.y + ((r.h - self.ui_line_h()) / 2.0).round();
+        self.text_once(cv, text, r.x, y, color)
+    }
+}
+
+/// Width of a shaped label.
+fn width(b: &Buffer) -> f32 {
+    b.layout_runs().map(|r| r.line_w).fold(0.0, f32::max)
+}
+
+/// Draws a shaped label with its line box top at `y`. Returns its width.
+fn draw(fs: &mut FontSystem, cache: &mut SwashCache, cv: &mut Canvas, b: &Buffer, x: f32, y: f32, color: Color) -> f32 {
+    let mut w: f32 = 0.0;
+    for run in b.layout_runs() {
+        w = w.max(run.line_w);
+        for g in run.glyphs {
+            let pg = g.physical((x, y + run.line_y), 1.0);
+            cache.with_pixels(fs, pg.cache_key, color, |gx, gy, c| cv.blend(pg.x + gx, pg.y + gy, c));
+        }
+    }
+    w
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_off_labels_dont_evict_the_rest() {
+        let mut g = Gfx::new();
+        for i in 0..2000 {
+            g.text_w("File"); // drawn every frame, like a menu label
+            g.text_w(&format!("Ln {i}, Col 1")); // never drawn again
+            assert!(g.ui.len() <= UI_GEN && g.ui_old.len() <= UI_GEN);
+        }
+        assert_eq!(g.shaped, 2001, "\"File\" was shaped once");
+        // Text drawn without the cache stays out of it.
+        let before = g.ui.len() + g.ui_old.len();
+        g.text_w_once("typed into a field");
+        assert_eq!(g.ui.len() + g.ui_old.len(), before);
     }
 }
