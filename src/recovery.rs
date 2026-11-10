@@ -204,7 +204,94 @@ fn is_private_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && m.uid() == euid && m.mode() & 0o022 == 0)
 }
 
-#[cfg(not(unix))]
+/// Windows analogue: a real directory (not a reparse point / symlink) that we
+/// can't positively tell is owned by a *different, non-privileged* user. Default
+/// `%APPDATA%` ACLs already keep other standard users out, and the dangerous
+/// outcomes are prevented by recovery being low-capability, so an inconclusive
+/// ownership query fails *open* (allows the directory) rather than disabling
+/// recovery; only a definite foreign owner is refused.
+#[cfg(windows)]
+fn is_private_dir(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else { return false };
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return false;
+    }
+    !owned_by_other_user(path).unwrap_or(false)
+}
+
+/// `Some(true)` only when the directory's owner is a valid SID that is neither
+/// the current process's user nor a privileged principal (Administrators /
+/// SYSTEM, as an elevated process would create). `None` on any query failure.
+#[cfg(windows)]
+fn owned_by_other_user(path: &Path) -> Option<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated; the out-params are valid; on success the
+    // returned security descriptor must be released with LocalFree (done below).
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != ERROR_SUCCESS || owner.is_null() {
+        return None;
+    }
+    // SAFETY: `owner` is a valid SID pointer into `sd` until it is freed.
+    let is_privileged = unsafe {
+        IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0 || IsWellKnownSid(owner, WinLocalSystemSid) != 0
+    };
+    let same_as_current = (|| {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: GetCurrentProcess is a pseudo-handle; `token` is an out-param.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return None;
+        }
+        let mut len = 0u32;
+        // SAFETY: first call just asks for the required buffer length.
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len) };
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: `buf` is `len` bytes; filled with a TOKEN_USER on success.
+        let ok =
+            len > 0 && unsafe { GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len) } != 0;
+        // SAFETY: `token` came from OpenProcessToken.
+        unsafe { CloseHandle(token) };
+        if !ok {
+            return None;
+        }
+        // SAFETY: on success `buf` begins with a TOKEN_USER whose User.Sid is valid.
+        let tu = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+        // SAFETY: both SIDs are valid for the duration of this call.
+        Some(unsafe { EqualSid(owner, tu.User.Sid) } != 0)
+    })();
+    // SAFETY: `sd` was allocated by GetNamedSecurityInfoW and is freed exactly once.
+    unsafe { LocalFree(sd as _) };
+
+    match same_as_current {
+        Some(true) => Some(false),         // owned by us
+        _ if is_privileged => Some(false), // owned by Administrators / SYSTEM
+        Some(false) => Some(true),         // a different, non-privileged owner
+        None => None,                      // couldn't determine the current user
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn is_private_dir(path: &Path) -> bool {
     path.is_dir()
 }
@@ -391,8 +478,29 @@ fn decode_path(s: &str) -> Option<PathBuf> {
             i += 1;
         }
     }
-    // SAFETY: these bytes came from `as_encoded_bytes` of an OsStr on this platform.
-    Some(PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(out) }))
+    path_from_encoded_bytes(out)
+}
+
+/// Rebuilds a path from the bytes [`encode_path`] produced. The bytes come from
+/// a snapshot that may be corrupt or planted, so they are validated rather than
+/// handed to `OsString::from_encoded_bytes_unchecked`, whose safety contract the
+/// untrusted bytes need not meet — on Windows that call is undefined behaviour
+/// for anything that isn't valid WTF-8.
+#[cfg(unix)]
+fn path_from_encoded_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    // On Unix every byte sequence is a valid `OsStr`, so this is lossless (it
+    // round-trips non-UTF-8 file names) and sound.
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn path_from_encoded_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    // Elsewhere (Windows, WASI) accept only valid UTF-8 instead of the unchecked
+    // constructor. A path that isn't valid UTF-8 (e.g. a Windows name with an
+    // unpaired surrogate) simply isn't restored — recovery falls back to an
+    // untitled document rather than risking UB.
+    String::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
 fn log_path(dir: &Path, id: u64, generation: u64) -> PathBuf {
@@ -790,6 +898,24 @@ mod tests {
         assert!(Recovery::start_in(&root).is_none(), "a world-writable recovery root must be refused");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn path_encoding_round_trips_and_rejects_garbage() {
+        for p in ["/tmp/a b.txt", "/weird/na me\n%.txt", "relative.txt", ""] {
+            let enc = encode_path(Path::new(p));
+            assert_eq!(decode_path(&enc).as_deref(), Some(Path::new(p)), "round-trip {p:?}");
+        }
+        // Malformed percent-encoding is rejected rather than decoded into garbage.
+        assert_eq!(decode_path("%G1"), None);
+        assert_eq!(decode_path("%0"), None);
+        assert_eq!(decode_path("ab%"), None);
+        #[cfg(unix)]
+        {
+            // A non-UTF-8 byte round-trips losslessly on Unix.
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(decode_path("%FF").unwrap().as_os_str().as_bytes(), b"\xFF");
+        }
     }
 
     /// Waits until the writer thread has handled everything queued so far.
