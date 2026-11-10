@@ -550,18 +550,56 @@ pub fn app_dir() -> Option<PathBuf> {
     config_path().and_then(|p| p.parent().map(Path::to_path_buf))
 }
 
+/// The home directory to trust when the process is running under a different
+/// user than the one who started it (`sudo -u X`, a setuid launch): the
+/// *effective* user's home from the password database, rather than the inherited
+/// `$HOME`/`$XDG_CONFIG_HOME`, which may belong to the invoking user. This keeps
+/// the config and crash-recovery directories inside a tree whose ancestors are
+/// trusted. With no privilege transition (the normal case) the inherited paths
+/// are the user's own and are used unchanged.
+#[cfg(unix)]
+fn priv_transition_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    // SAFETY: these calls only read the process's own ids.
+    let (euid, ruid, egid, rgid) = unsafe { (libc::geteuid(), libc::getuid(), libc::getegid(), libc::getgid()) };
+    if euid == ruid && egid == rgid {
+        return None;
+    }
+    // SAFETY: getpwuid returns a pointer into a static buffer; we're single-threaded
+    // at startup and copy the string out immediately.
+    let pw = unsafe { libc::getpwuid(euid) };
+    if pw.is_null() {
+        return None;
+    }
+    let dir = unsafe { (*pw).pw_dir };
+    if dir.is_null() {
+        return None;
+    }
+    let bytes = unsafe { std::ffi::CStr::from_ptr(dir) }.to_bytes().to_vec();
+    (!bytes.is_empty()).then(|| PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn priv_transition_home() -> Option<PathBuf> {
+    None
+}
+
 fn config_path() -> Option<PathBuf> {
-    let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
+    // On a privilege transition, ignore the inherited environment and use the
+    // effective user's own home (see priv_transition_home).
+    let base = if let Some(home) = priv_transition_home() {
+        if cfg!(target_os = "macos") { home.join("Library/Application Support") } else { home.join(".config") }
+    } else if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)?
     } else if cfg!(target_os = "macos") {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))?
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?
     };
-    base.map(|b| b.join("plainpad").join("settings.conf"))
+    Some(base.join("plainpad").join("settings.conf"))
 }
 
 impl Settings {

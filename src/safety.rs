@@ -21,6 +21,18 @@ fn snap_key(t: &Tab) -> SnapKey {
     }
 }
 
+/// A sanitized one-line description of a recovered document for the summary
+/// dialog: its original path (if any), flagged when restoring it reads a file.
+fn recovered_label(r: &recovery::Recovered) -> String {
+    match r.origin() {
+        Some(p) => {
+            let name = ui::sanitize_label(&p.to_string_lossy());
+            if r.reads_file() { format!("{name}   (unsaved edits will be rebuilt from this file)") } else { name }
+        }
+        None => "an untitled document".to_string(),
+    }
+}
+
 impl App {
     fn all_tabs(&self) -> impl Iterator<Item = &Tab> {
         std::iter::once(&self.win).chain(self.others.iter()).flat_map(|w| w.tabs.iter())
@@ -83,7 +95,13 @@ impl App {
         self.snapshots.extend(written);
     }
 
-    /// Reopens documents left unsaved by an instance that crashed.
+    /// Finds documents left unsaved by a crashed instance and shows the summary
+    /// dialog. Nothing is opened yet: the documents are materialised only when
+    /// the user dismisses the dialog (see [`App::finish_recovery`]), so a
+    /// file-based snapshot's file isn't read until its path has been shown, and
+    /// every recovered document then opens as an *untitled* tab — never pointed
+    /// at a path a snapshot named. A planted snapshot therefore can't make the
+    /// editor silently read an arbitrary file or arm a silent write.
     pub(crate) fn restore_recovered(&mut self) {
         let Some(rec) = &self.recovery else { return };
         let (found, lost) = rec.take_orphans();
@@ -91,26 +109,70 @@ impl App {
             return;
         }
         let n = found.len();
-        for r in found {
-            let i = if self.tab().is_pristine() { self.win.active } else { self.new_tab() };
-            let t = &mut self.win.tabs[i];
-            t.view.set_document(document::Document::from_rope(r.text));
-            t.encoding = r.meta.encoding;
-            t.eol = r.meta.eol;
-            t.disk = r.meta.path.as_deref().and_then(stamp);
-            t.path = r.meta.path;
-            // Not saved anywhere yet: show it as modified so it gets saved (and re-snapshotted).
-            t.meta_dirty = true;
+        let mut lines = vec![
+            format!(
+                "Recovered {n} unsaved document{} from a session that ended unexpectedly.",
+                if n == 1 { "" } else { "s" }
+            ),
+            "They open as untitled tabs — use Save As to write each one back.".to_string(),
+        ];
+        lines.extend(found.iter().map(|r| format!("•  {}", recovered_label(r))));
+        if !lost.is_empty() {
+            lines.push("Could not recover:".to_string());
+            lines.extend(lost.iter().map(|l| format!("•  {}", ui::sanitize_label(l))));
         }
-        let mut msg = format!(
-            "Recovered {n} unsaved document{} from a session that ended unexpectedly",
-            if n == 1 { "" } else { "s" }
-        );
-        for l in lost {
-            msg.push_str(". ");
-            msg.push_str(&l);
+        self.recovery_items = found;
+        self.win.prompt = Some(Prompt::recovery(lines));
+    }
+
+    /// Materialises the recovered documents into untitled, modified tabs once
+    /// the user has seen the summary. With `list`, also opens a tab holding the
+    /// list of recovered names, as a reference while saving several back.
+    pub(crate) fn finish_recovery(&mut self, list: bool) {
+        let items = std::mem::take(&mut self.recovery_items);
+        if items.is_empty() {
+            return;
         }
-        self.win.status_msg = Some(msg);
+        let mut names: Vec<(String, Option<String>)> = Vec::new();
+        let mut errors = Vec::new();
+        for r in items {
+            let origin = r.origin().map(|p| ui::sanitize_label(&p.to_string_lossy()));
+            // Reads the base file now, if the snapshot needs one — its path was
+            // shown in the dialog the user just dismissed.
+            match r.restore() {
+                Ok((meta, text)) => {
+                    let i = if self.tab().is_pristine() { self.win.active } else { self.new_tab() };
+                    let t = &mut self.win.tabs[i];
+                    t.view.set_document(document::Document::from_rope(text));
+                    t.encoding = meta.encoding;
+                    t.eol = meta.eol;
+                    // Deliberately untitled: no `path`, no `disk` stamp. The content
+                    // is marked modified so it prompts to be saved (and gets
+                    // re-snapshotted), and a Save routes through Save As.
+                    t.meta_dirty = true;
+                    t.recovered_from = origin.clone();
+                    names.push((t.name(), origin));
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        if list && !names.is_empty() {
+            let mut body = String::from("Recovered unsaved documents (originally):\n\n");
+            for (tab, origin) in &names {
+                match origin {
+                    Some(p) => body.push_str(&format!("{tab}\twas  {p}\n")),
+                    None => body.push_str(&format!("{tab}\twas an untitled document\n")),
+                }
+            }
+            body.push_str("\nEach opened as an untitled tab above; use File \u{2192} Save As to write it back.\n");
+            let i = self.new_tab();
+            // A plain reference note: unmodified, so it won't prompt to save or
+            // get snapshotted, and it has no path.
+            self.win.tabs[i].view.set_document(document::Document::new(&body));
+        }
+        if !errors.is_empty() {
+            self.win.status_msg = Some(errors.join(". "));
+        }
     }
 
     /// Checks this window's tabs for files changed or deleted on disk by

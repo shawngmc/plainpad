@@ -935,6 +935,38 @@ pub enum Choice {
     Keep,
     /// Save over a file changed on disk.
     Overwrite,
+    /// Dismiss the crash-recovery summary, restoring the documents.
+    RecoverOk,
+    /// Restore the documents and also open the list of their names as a tab.
+    RecoverList,
+}
+
+/// Strips characters that could disguise a file name shown in the app's own
+/// chrome (dialogs, the status bar, tabs, the title): C0/C1 controls, bidi
+/// overrides, and zero-width or other invisible formatting. Each removed run
+/// becomes a single U+FFFD so the user can see that something was taken out.
+/// (Document *content* isn't sanitised — the editor is built to render arbitrary
+/// text — only short file-name-like strings shown in the UI chrome.)
+pub fn sanitize_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut stripped = false;
+    for c in s.chars() {
+        let bad = c.is_control()
+            || matches!(c,
+                '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}'
+                | '\u{FEFF}' | '\u{00AD}' | '\u{2028}' | '\u{2029}'
+                | '\u{180E}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}');
+        if bad {
+            if !stripped {
+                out.push('\u{FFFD}');
+                stripped = true;
+            }
+        } else {
+            out.push(c);
+            stripped = false;
+        }
+    }
+    out
 }
 
 /// A modal question with a row of buttons.
@@ -954,6 +986,7 @@ const LINK_CHOICES: &[(&str, Choice)] = &[("Open Anyway", Choice::Open), ("Cance
 const CHANGED_CHOICES: &[(&str, Choice)] = &[("Reload", Choice::Reload), ("Keep My Version", Choice::Keep)];
 const OVERWRITE_CHOICES: &[(&str, Choice)] = &[("Overwrite", Choice::Overwrite), ("Cancel", Choice::Cancel)];
 const LARGE_CHOICES: &[(&str, Choice)] = &[("Open", Choice::Open), ("Cancel", Choice::Cancel)];
+const RECOVER_CHOICES: &[(&str, Choice)] = &[("Open List as a Tab", Choice::RecoverList), ("OK", Choice::RecoverOk)];
 
 /// Greedy word wrap of `text` to `max_w` pixels. A word too long for a line
 /// on its own (such as a long URL) is broken between characters, so nothing
@@ -1006,6 +1039,13 @@ impl Prompt {
     /// Opening a very large file; Cancel is the default.
     pub fn large(msg: String) -> Self {
         Self { lines: vec![msg], choices: LARGE_CHOICES, focus: 1, warn: false, buttons: Vec::new() }
+    }
+
+    /// Summary of documents recovered after a crash. OK (the default) restores
+    /// them as untitled tabs; the other button also opens the list as a tab.
+    /// There is no cancel: dismissing it any way still restores the work.
+    pub fn recovery(lines: Vec<String>) -> Self {
+        Self { lines, choices: RECOVER_CHOICES, focus: 1, warn: false, buttons: Vec::new() }
     }
 
     pub fn focused(&self) -> Choice {
@@ -1226,6 +1266,18 @@ mod tests {
         }
         // Nothing lost: the pieces reassemble into the original text.
         assert_eq!(lines.concat().replace(' ', ""), format!("It really goes to: {url}").replace(' ', ""));
+    }
+
+    #[test]
+    fn sanitizes_chrome_labels() {
+        // Plain text is untouched (including legitimate non-ASCII).
+        assert_eq!(sanitize_label("notes é 日本.txt"), "notes é 日本.txt");
+        // Bidi override, zero-width, and controls collapse to one marker each.
+        assert_eq!(sanitize_label("a\u{202E}b"), "a\u{FFFD}b");
+        assert_eq!(sanitize_label("a\u{200B}\u{200C}b"), "a\u{FFFD}b");
+        assert_eq!(sanitize_label("a\tb\nc"), "a\u{FFFD}b\u{FFFD}c");
+        // A path that renders as "nginx.conf" via an override no longer can.
+        assert!(sanitize_label("\u{202E}fnoc.xite/\u{202C}nginx.conf").contains('\u{FFFD}'));
     }
 
     #[test]

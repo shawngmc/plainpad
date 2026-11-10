@@ -435,6 +435,7 @@ impl App {
                 t.disk = safety::stamp(&path);
                 t.path = Some(path);
                 t.file_base = true;
+                t.recovered_from = None; // it now has a real path; the hint is done
                 // The text couldn't change meanwhile (the tab was read-only), but its
                 // encoding or line endings could have been switched from the menu.
                 t.view.doc.mark_saved();

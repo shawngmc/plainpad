@@ -47,10 +47,88 @@ pub struct Meta {
     pub eol: Eol,
 }
 
-/// A recovered document.
+/// A document left unsaved by a crashed instance, ready to restore.
+///
+/// The text is not materialised up front: a snapshot that records only a log
+/// on top of a file on disk (`Source::FromFile`) is read only when the caller
+/// asks, via [`Recovered::restore`], so the user can be shown which path will
+/// be read before any external file is touched. A planted snapshot therefore
+/// can't make the editor silently read an arbitrary path at startup.
 pub struct Recovered {
     pub meta: Meta,
-    pub text: Rope,
+    src: Source,
+    /// The edit log replayed on top of the base (empty for a v1 snapshot).
+    log: Vec<u8>,
+    v1: bool,
+}
+
+/// How a recovered document's text is obtained.
+enum Source {
+    /// Fully reconstructed from the snapshot's own data: nothing external to read.
+    Ready(Rope),
+    /// The text is this file (unchanged since the snapshot) with the log on top.
+    /// The read is deferred until the user has been shown the path.
+    FromFile { path: PathBuf, stamp: Stamp },
+}
+
+/// A human name for a recovered document, for messages.
+fn recovered_name(meta: &Meta) -> String {
+    meta.path
+        .as_deref()
+        .and_then(Path::file_name)
+        .map_or("An untitled document".into(), |n| n.to_string_lossy().into_owned())
+}
+
+impl Recovered {
+    /// The path this document had before the crash, if any. Shown to the user
+    /// before restoring (so they know what each untitled tab was, and — for a
+    /// file-based snapshot — which file will be read).
+    pub fn origin(&self) -> Option<&Path> {
+        self.meta.path.as_deref()
+    }
+
+    /// Whether restoring it reads an external file (its path is shown first).
+    pub fn reads_file(&self) -> bool {
+        matches!(self.src, Source::FromFile { .. })
+    }
+
+    /// If this is a file-based snapshot whose file is gone or changed, the
+    /// message to show instead of restoring it (its edits can't be rebuilt).
+    fn unrecoverable(&self) -> Option<String> {
+        match &self.src {
+            Source::FromFile { path, stamp } if doc::stamp(path) != Some(*stamp) => Some(format!(
+                "{} was changed by another program, so its unsaved edits can't be rebuilt",
+                recovered_name(&self.meta)
+            )),
+            _ => None,
+        }
+    }
+
+    /// Reconstructs the text, reading the base file now if the snapshot needs
+    /// it. The caller must already have shown the user the path (see
+    /// [`Recovered::origin`]). Returns the final metadata and text.
+    pub fn restore(self) -> Result<(Meta, Rope), String> {
+        let Recovered { mut meta, src, log, v1 } = self;
+        let text = match src {
+            Source::Ready(r) => r,
+            Source::FromFile { path, stamp } => {
+                if doc::stamp(&path) != Some(stamp) {
+                    return Err(format!(
+                        "{} was changed by another program, so its unsaved edits can't be rebuilt",
+                        recovered_name(&meta)
+                    ));
+                }
+                let mut t =
+                    doc::load(&path).map_err(|e| format!("{} could not be read: {e}", recovered_name(&meta)))?.rope;
+                if !v1 {
+                    replay_log(&log, &mut t, &mut meta)
+                        .map_err(|e| format!("{}: its edit log is damaged ({e})", recovered_name(&meta)))?;
+                }
+                t
+            }
+        };
+        Ok((meta, text))
+    }
 }
 
 enum Job {
@@ -110,6 +188,124 @@ fn create_dir_private(dir: &Path) -> io::Result<()> {
     b.create(dir)
 }
 
+/// Whether `path` is a real directory private to the effective user: owned by
+/// it, with no group or other write access, and not a symlink. The recovery
+/// code trusts a directory only when this holds, so a snapshot planted by a
+/// *different* user (a world-writable config dir, or a root process that
+/// inherited another user's `$HOME`) is never adopted. A peer with the *same*
+/// uid still passes — that case is handled by recovery being low-capability
+/// (untitled tabs, consent-gated reads), not by ownership.
+#[cfg(unix)]
+fn is_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid only reads the process's effective uid; always sound.
+    let euid = unsafe { libc::geteuid() };
+    // symlink_metadata (lstat) so a symlink in place of the directory fails here.
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && m.uid() == euid && m.mode() & 0o022 == 0)
+}
+
+/// Windows analogue: a real directory (not a reparse point / symlink) that we
+/// can't positively tell is owned by a *different, non-privileged* user. Default
+/// `%APPDATA%` ACLs already keep other standard users out, and the dangerous
+/// outcomes are prevented by recovery being low-capability, so an inconclusive
+/// ownership query fails *open* (allows the directory) rather than disabling
+/// recovery; only a definite foreign owner is refused.
+#[cfg(windows)]
+fn is_private_dir(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else { return false };
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return false;
+    }
+    !owned_by_other_user(path).unwrap_or(false)
+}
+
+/// `Some(true)` only when the directory's owner is a valid SID that is neither
+/// the current process's user nor a privileged principal (Administrators /
+/// SYSTEM, as an elevated process would create). `None` on any query failure.
+#[cfg(windows)]
+fn owned_by_other_user(path: &Path) -> Option<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated; the out-params are valid; on success the
+    // returned security descriptor must be released with LocalFree (done below).
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != ERROR_SUCCESS || owner.is_null() {
+        return None;
+    }
+    // SAFETY: `owner` is a valid SID pointer into `sd` until it is freed.
+    let is_privileged = unsafe {
+        IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0 || IsWellKnownSid(owner, WinLocalSystemSid) != 0
+    };
+    let same_as_current = (|| {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: GetCurrentProcess is a pseudo-handle; `token` is an out-param.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return None;
+        }
+        let mut len = 0u32;
+        // SAFETY: first call just asks for the required buffer length.
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len) };
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: `buf` is `len` bytes; filled with a TOKEN_USER on success.
+        let ok =
+            len > 0 && unsafe { GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len) } != 0;
+        // SAFETY: `token` came from OpenProcessToken.
+        unsafe { CloseHandle(token) };
+        if !ok {
+            return None;
+        }
+        // SAFETY: on success `buf` begins with a TOKEN_USER whose User.Sid is valid.
+        let tu = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+        // SAFETY: both SIDs are valid for the duration of this call.
+        Some(unsafe { EqualSid(owner, tu.User.Sid) } != 0)
+    })();
+    // SAFETY: `sd` was allocated by GetNamedSecurityInfoW and is freed exactly once.
+    unsafe { LocalFree(sd as _) };
+
+    match same_as_current {
+        Some(true) => Some(false),         // owned by us
+        _ if is_privileged => Some(false), // owned by Administrators / SYSTEM
+        Some(false) => Some(true),         // a different, non-privileged owner
+        None => None,                      // couldn't determine the current user
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_private_dir(path: &Path) -> bool {
+    path.is_dir()
+}
+
+/// Opens a file without following a final symlink, so a planted link can't
+/// redirect a read (or the lock) out of the recovery directory.
+fn open_nofollow(path: &Path, write: bool) -> io::Result<fs::File> {
+    let mut o = fs::OpenOptions::new();
+    o.read(!write).write(write);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW);
+    o.open(path)
+}
+
 impl Recovery {
     /// Creates this instance's snapshot folder and locks it.
     pub fn start() -> Option<Self> {
@@ -118,6 +314,12 @@ impl Recovery {
 
     fn start_in(root: &Path) -> Option<Self> {
         create_dir_private(root).ok()?;
+        // Fail closed: if the recovery directory isn't private to us (e.g. it
+        // already existed owned by someone else, or is group/other-writable),
+        // don't adopt from it or write snapshots into it.
+        if !is_private_dir(root) {
+            return None;
+        }
         let (dir, _) = doc::create_private(root, &format!("{}-", std::process::id()), ".d").ok()?;
         // create_private made a file; we want a folder by that unique name.
         fs::remove_file(&dir).ok()?;
@@ -188,14 +390,20 @@ impl Drop for Recovery {
 
 fn take_orphans_in(root: &Path, mine: &Path) -> (Vec<Recovered>, Vec<String>) {
     let (mut out, mut lost) = (Vec::new(), Vec::new());
+    // Only adopt from a recovery tree that's private to us (see is_private_dir).
+    if !is_private_dir(root) {
+        return (out, lost);
+    }
     let Ok(entries) = fs::read_dir(root) else { return (out, lost) };
     for e in entries.flatten() {
         let dir = e.path();
-        if dir == mine || !dir.is_dir() {
+        // Skip our own folder, and anything that isn't a directory private to us
+        // (a symlink, or a folder owned by another user, is never trusted).
+        if dir == mine || !is_private_dir(&dir) {
             continue;
         }
         // Still locked: another running instance's live folder.
-        let Ok(lock) = fs::OpenOptions::new().write(true).open(dir.join("lock")) else { continue };
+        let Ok(lock) = open_nofollow(&dir.join("lock"), true) else { continue };
         if lock.try_lock().is_err() {
             continue;
         }
@@ -204,7 +412,12 @@ fn take_orphans_in(root: &Path, mine: &Path) -> (Vec<Recovered>, Vec<String>) {
             let p = f.path();
             if p.extension().is_some_and(|x| x == "snap") {
                 match read_snapshot(&p) {
-                    Ok(Some(r)) => out.push(r),
+                    // A file-based snapshot whose file is gone or changed can't be
+                    // rebuilt; report it rather than offering an empty recovery.
+                    Ok(Some(r)) => match r.unrecoverable() {
+                        Some(msg) => lost.push(msg),
+                        None => out.push(r),
+                    },
                     Ok(None) => {}
                     Err(e) => lost.push(e),
                 }
@@ -265,8 +478,29 @@ fn decode_path(s: &str) -> Option<PathBuf> {
             i += 1;
         }
     }
-    // SAFETY: these bytes came from `as_encoded_bytes` of an OsStr on this platform.
-    Some(PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(out) }))
+    path_from_encoded_bytes(out)
+}
+
+/// Rebuilds a path from the bytes [`encode_path`] produced. The bytes come from
+/// a snapshot that may be corrupt or planted, so they are validated rather than
+/// handed to `OsString::from_encoded_bytes_unchecked`, whose safety contract the
+/// untrusted bytes need not meet — on Windows that call is undefined behaviour
+/// for anything that isn't valid WTF-8.
+#[cfg(unix)]
+fn path_from_encoded_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    // On Unix every byte sequence is a valid `OsStr`, so this is lossless (it
+    // round-trips non-UTF-8 file names) and sound.
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn path_from_encoded_bytes(bytes: Vec<u8>) -> Option<PathBuf> {
+    // Elsewhere (Windows, WASI) accept only valid UTF-8 instead of the unchecked
+    // constructor. A path that isn't valid UTF-8 (e.g. a Windows name with an
+    // unpaired surrogate) simply isn't restored — recovery falls back to an
+    // untitled document rather than risking UB.
+    String::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
 fn log_path(dir: &Path, id: u64, generation: u64) -> PathBuf {
@@ -445,7 +679,7 @@ fn write_header(dir: &Path, id: u64, meta: &Meta, generation: u64, base: &Base, 
 /// Reads a snapshot and replays its log. `Ok(None)` for something that isn't
 /// a snapshot; `Err` describes a document that couldn't be restored.
 fn read_snapshot(p: &Path) -> Result<Option<Recovered>, String> {
-    let Ok(f) = fs::File::open(p) else { return Ok(None) };
+    let Ok(f) = open_nofollow(p, false) else { return Ok(None) };
     let mut r = io::BufReader::new(f);
     let mut line = || {
         let mut l = String::new();
@@ -472,30 +706,37 @@ fn read_snapshot(p: &Path) -> Result<Option<Recovered>, String> {
         line()?.is_empty().then_some((Meta { path, encoding, eol }, generation, base))
     })();
     let Some((mut meta, generation, base)) = header else { return Ok(None) };
-    let name = meta
-        .path
-        .as_deref()
-        .and_then(Path::file_name)
-        .map_or("An untitled document".into(), |n| n.to_string_lossy().into_owned());
-    let mut text = if base == "text" {
-        Rope::from_reader(r).map_err(|_| format!("{name}: its snapshot is damaged"))?
+    let name = recovered_name(&meta);
+    // The edit log (our own file, not an external path) is safe to read now.
+    let log = if v1 {
+        Vec::new()
     } else {
-        // "file <secs> <nanos> <size> <path>"
+        let lp = p.with_file_name(format!("{}-{generation}.log", p.file_stem().unwrap_or_default().to_string_lossy()));
+        // O_NOFOLLOW: a symlink planted at the log name can't redirect the read.
+        let mut buf = Vec::new();
+        if let Ok(mut f) = open_nofollow(&lp, false) {
+            use std::io::Read;
+            let _ = f.read_to_end(&mut buf);
+        }
+        buf
+    };
+    if base == "text" {
+        // The text is in the snapshot itself: reconstruct it now, nothing external to read.
+        let mut text = Rope::from_reader(r).map_err(|_| format!("{name}: its snapshot is damaged"))?;
+        if !v1 {
+            replay_log(&log, &mut text, &mut meta).map_err(|e| format!("{name}: its edit log is damaged ({e})"))?;
+        }
+        Ok(Some(Recovered { meta, src: Source::Ready(text), log: Vec::new(), v1 }))
+    } else {
+        // "file <secs> <nanos> <size> <path>": record the path and stamp, but
+        // defer reading the file until the user has been shown that path.
         let (st, file) = base
             .strip_prefix("file ")
             .and_then(|b| b.rsplit_once(' '))
             .and_then(|(st, p)| Some((parse_stamp(st)?, decode_path(p)?)))
             .ok_or_else(|| format!("{name}: its snapshot is damaged"))?;
-        if doc::stamp(&file) != Some(st) {
-            return Err(format!("{name} was changed by another program, so its unsaved edits can't be rebuilt"));
-        }
-        doc::load(&file).map_err(|e| format!("{name} could not be read: {e}"))?.rope
-    };
-    let log = p.with_file_name(format!("{}-{generation}.log", p.file_stem().unwrap_or_default().to_string_lossy()));
-    if !v1 && let Ok(data) = fs::read(&log) {
-        replay_log(&data, &mut text, &mut meta).map_err(|e| format!("{name}: its edit log is damaged ({e})"))?;
+        Ok(Some(Recovered { meta, src: Source::FromFile { path: file, stamp: st }, log, v1 }))
     }
-    Ok(Some(Recovered { meta, text }))
 }
 
 /// Applies a log's records. A record cut short (a crash while writing it) ends the log.
@@ -576,14 +817,105 @@ mod tests {
         a.crash();
         let (rec, lost) = b.take_orphans();
         assert_eq!((rec.len(), lost.len()), (1, 0));
-        assert_eq!(rec[0].meta, meta);
-        assert_eq!(rec[0].text, "unsaved text\nline 2");
+        let (m, text) = rec.into_iter().next().unwrap().restore().unwrap();
+        assert_eq!(m, meta);
+        assert_eq!(text, "unsaved text\nline 2");
         assert!(!a_dir.exists(), "orphan folder is removed once recovered");
         // A clean exit removes the instance's folder.
         let b_dir = b.dir.clone();
         drop(b);
         assert!(!b_dir.exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recovered_items_expose_origin_and_defer_file_reads() {
+        let root = tmp_root();
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("doc.txt");
+        let original = "saved line\n".repeat(200_000); // >1 MB: logs on top of the file
+        fs::write(&file, &original).unwrap();
+        let meta = Meta { path: Some(file.clone()), encoding: Encoding::Utf8, eol: Eol::Lf };
+        let base = Some((file.clone(), doc::stamp(&file).unwrap()));
+        let c = |l, i| Cursor::new(l, i);
+
+        let a = Recovery::start_in(&root).unwrap();
+        // A file-based snapshot (big doc, unchanged file) and a text-based one.
+        let mut big = Document::from_rope(doc::load(&file).unwrap().rope);
+        big.replace(c(0, 0), c(0, 0), "EDIT ", false);
+        a.save(1, meta.clone(), big.snapshot(), big.take_journal(), base);
+        let note = Meta { path: Some(root.join("note.txt")), encoding: Encoding::Utf8, eol: Eol::Lf };
+        let mut small = Document::new("just a note");
+        a.save(2, note.clone(), small.snapshot(), small.take_journal(), None);
+        flush(&a);
+        a.crash();
+
+        let b = Recovery::start_in(&root).unwrap();
+        let (mut rec, lost) = b.take_orphans();
+        assert!(lost.is_empty(), "{lost:?}");
+        rec.sort_by_key(|r| r.origin().map(|p| p.to_path_buf()));
+        // One reads an external file (the big doc); the other is self-contained.
+        let big_item = rec.iter().find(|r| r.origin() == Some(file.as_path())).unwrap();
+        assert!(big_item.reads_file(), "big doc rebuilds from its file");
+        let note_item = rec.iter().find(|r| r.origin() == Some(root.join("note.txt").as_path())).unwrap();
+        assert!(!note_item.reads_file(), "text-based snapshot needs no external read");
+        // restore() yields the expected text for both.
+        let texts: std::collections::HashMap<_, _> = rec
+            .into_iter()
+            .map(|r| {
+                let origin = r.origin().map(Path::to_path_buf);
+                (origin, r.restore().unwrap().1.to_string())
+            })
+            .collect();
+        assert_eq!(texts[&Some(file.clone())], format!("EDIT {original}"));
+        assert_eq!(texts[&Some(root.join("note.txt"))], "just a note");
+        drop(b);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_private_recovery_dirs_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp_root();
+        // A crashed instance leaves an orphan folder with a snapshot.
+        let a = Recovery::start_in(&root).unwrap();
+        let meta = Meta { path: None, encoding: Encoding::Utf8, eol: Eol::Lf };
+        a.save(1, meta, Rope::from_str("secret"), Document::new("").take_journal(), None);
+        wait_for(&snapshot_path(&a.dir, 1), true);
+        let a_dir = a.dir.clone();
+        a.crash();
+
+        // Made group/other-writable (as a planted folder would be): not adopted.
+        fs::set_permissions(&a_dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let b = Recovery::start_in(&root).unwrap();
+        let (rec, lost) = b.take_orphans();
+        assert!(rec.is_empty() && lost.is_empty(), "a group/other-writable folder must be skipped");
+        drop(b);
+
+        // A recovery root that isn't private to us: recovery refuses to start.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(Recovery::start_in(&root).is_none(), "a world-writable recovery root must be refused");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn path_encoding_round_trips_and_rejects_garbage() {
+        for p in ["/tmp/a b.txt", "/weird/na me\n%.txt", "relative.txt", ""] {
+            let enc = encode_path(Path::new(p));
+            assert_eq!(decode_path(&enc).as_deref(), Some(Path::new(p)), "round-trip {p:?}");
+        }
+        // Malformed percent-encoding is rejected rather than decoded into garbage.
+        assert_eq!(decode_path("%G1"), None);
+        assert_eq!(decode_path("%0"), None);
+        assert_eq!(decode_path("ab%"), None);
+        #[cfg(unix)]
+        {
+            // A non-UTF-8 byte round-trips losslessly on Unix.
+            use std::os::unix::ffi::OsStrExt;
+            assert_eq!(decode_path("%FF").unwrap().as_os_str().as_bytes(), b"\xFF");
+        }
     }
 
     /// Waits until the writer thread has handled everything queued so far.
@@ -637,8 +969,9 @@ mod tests {
         let b = Recovery::start_in(&root).unwrap();
         let (rec, lost) = b.take_orphans();
         assert!(lost.is_empty(), "{lost:?}");
-        assert_eq!(rec[0].text, want);
-        assert_eq!(rec[0].meta, changed);
+        let (m, text) = rec.into_iter().next().unwrap().restore().unwrap();
+        assert_eq!(text, want);
+        assert_eq!(m, changed);
         assert!(!a_dir.exists());
 
         // Replace All can't be logged: the text is written whole, then logging resumes on top.
@@ -669,7 +1002,8 @@ mod tests {
         let c3 = Recovery::start_in(&root).unwrap();
         let (rec, lost) = c3.take_orphans();
         assert_eq!(rec.len(), 1);
-        assert_eq!(rec[0].text, want);
+        let (_m, text) = rec.into_iter().next().unwrap().restore().unwrap();
+        assert_eq!(text, want);
         assert_eq!(lost.len(), 1);
         assert!(lost[0].contains("big.txt was changed by another program"), "{}", lost[0]);
         drop(c3);

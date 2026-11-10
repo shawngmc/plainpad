@@ -140,12 +140,19 @@ x11_crash_recovery() {
     wait_until 6 sh -c "find '$CFG' -name '*.snap' | grep -q ."
     kill -9 "$APP_PID"; wait "$APP_PID" 2>/dev/null; sleep 0.3
     file_is r.txt "saved"
-    # Restart with the same settings folder: the edit comes back.
+    # Restart: a summary dialog appears and the work returns as an *untitled*
+    # modified tab — never auto-pointed at r.txt, so the file on disk is untouched
+    # and no single Ctrl+S can silently overwrite it.
     XDG_CONFIG_HOME=$CFG "$APP" >"$WORK/app.log" 2>&1 &
-    wait_until 10 x_win '\*r.txt'
-    x_focus "r.txt"
-    xdotool key ctrl+s
-    wait_until 5 file_is r.txt $'saved\nunsaved'
+    wait_until 10 x_win "Plainpad"
+    x_focus "Plainpad"
+    xdotool key Return            # dismiss the recovery dialog (OK)
+    wait_until 5 x_win '\*Untitled' || return 1
+    # Recovery never wrote back on its own: the original file is unchanged.
+    file_is r.txt "saved" || return 1
+    # The recovered content is present; copy it out to check (the final assertion).
+    xdotool key ctrl+a ctrl+c
+    wait_until 5 sh -c "[ \"\$(timeout 2 xclip -o -selection clipboard)\" = \"\$(printf 'saved\nunsaved')\" ]"
 }
 
 x11_reload_changed_file() {
@@ -223,11 +230,44 @@ x11_big_crash_recovery() {
     # A few hundred bytes on disk, not another 9 MB copy.
     [ "$(du -sk "$CFG/plainpad/recovery" | cut -f1)" -lt 64 ]
     kill -9 "$APP_PID"; wait "$APP_PID" 2>/dev/null; sleep 0.3
+    # Restart: the summary dialog names rb.txt; dismissing it reads the file
+    # (its path was shown first) and rebuilds the edits into an untitled tab.
     XDG_CONFIG_HOME=$CFG "$APP" >"$WORK/app.log" 2>&1 &
-    wait_until 10 x_win '\*rb.txt'
-    x_focus "rb.txt"
-    xdotool key ctrl+s
-    wait_until 5 sh -c '[ "$(tail -c 12 rb.txt)" = "unsaved tail" ] && [ "$(head -c 5 rb.txt)" = "#some" ]'
+    wait_until 10 x_win "Plainpad"
+    x_focus "Plainpad"
+    xdotool key Return; sleep 1   # dismiss the dialog (consents to reading rb.txt)
+    wait_until 5 x_win '\*Untitled' || return 1
+    # rb.txt on disk was never written back (still the original saved text, no "#").
+    [ "$(head -c 4 rb.txt)" = "some" ] || return 1
+    # Content was rebuilt from the file plus the logged edits (check head and tail
+    # cheaply rather than copying the whole document).
+    xdotool key ctrl+Home shift+End ctrl+c; sleep 0.4
+    wait_until 5 sh -c '[ "$(timeout 2 xclip -o -selection clipboard | head -c 5)" = "#some" ]' || return 1
+    xdotool key ctrl+End shift+Home ctrl+c; sleep 0.4
+    wait_until 5 sh -c '[ "$(timeout 2 xclip -o -selection clipboard)" = "unsaved tail" ]'
+}
+
+# The recovery dialog's "Open List as a Tab" button drops the recovered names
+# into a reference tab, for restoring several files.
+x11_recovery_list_tab() {
+    printf 'one\n' > f1.txt; printf 'two\n' > f2.txt
+    start_app f1.txt f2.txt
+    wait_until 10 x_win "f2.txt"
+    x_focus "f2.txt"
+    xdotool key ctrl+End; xdotool type "B"    # edit tab 2
+    xdotool key ctrl+1 ctrl+End; xdotool type "A"   # edit tab 1
+    wait_until 6 sh -c "[ \"\$(find '$CFG' -name '*.snap' | wc -l)\" -ge 2 ]"
+    sleep 0.5
+    kill -9 "$APP_PID"; wait "$APP_PID" 2>/dev/null; sleep 0.3
+    XDG_CONFIG_HOME=$CFG "$APP" >"$WORK/app.log" 2>&1 &
+    wait_until 10 x_win "Plainpad"
+    x_focus "Plainpad"
+    xdotool key Tab Return    # focus and choose "Open List as a Tab"
+    wait_until 5 x_win "Untitled" || return 1
+    sleep 0.5
+    # The active tab is the reference list (itself unmodified), naming both files.
+    xdotool key ctrl+a ctrl+c
+    wait_until 5 sh -c 'c=$(timeout 2 xclip -o -selection clipboard); echo "$c" | grep -qF f1.txt && echo "$c" | grep -qF f2.txt'
 }
 
 # ---------------------------------------------------------------- Wayland
@@ -304,7 +344,7 @@ export DISPLAY=:91
 unset WAYLAND_DISPLAY
 wait_until 5 xdpyinfo >/dev/null 2>&1 || sleep 1
 for t in x11_type_and_save x11_clipboard x11_tabs_close_prompt x11_drag_tab_out x11_crash_recovery \
-         x11_reload_changed_file x11_long_line x11_big_file x11_big_crash_recovery; do
+         x11_recovery_list_tab x11_reload_changed_file x11_long_line x11_big_file x11_big_crash_recovery; do
     run_test $t
 done
 kill $XVFB 2>/dev/null
