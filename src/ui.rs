@@ -969,6 +969,15 @@ pub fn sanitize_label(s: &str) -> String {
     out
 }
 
+/// Cached prompt word-wrap layout so [`wrap`] only runs when the prompt first
+/// draws or the window/scale changes.
+struct WrappedPrompt {
+    /// `(max_text.to_bits(), lh.to_bits())` at which `lines` were wrapped.
+    key: (u32, u32),
+    text_w: f32,
+    lines: Vec<(usize, String)>,
+}
+
 /// A modal question with a row of buttons.
 pub struct Prompt {
     /// Lines of text; long lines are wrapped to fit.
@@ -978,9 +987,7 @@ pub struct Prompt {
     /// Draw the first line as a warning.
     warn: bool,
     buttons: Vec<(Rect, Choice)>,
-    /// Cached `((max_text_bits, lh_bits), text_w, wrapped_lines)` so `wrap`
-    /// only runs when the prompt first draws or the window/scale changes.
-    wrapped: Option<((u32, u32), f32, Vec<(usize, String)>)>,
+    wrapped: Option<WrappedPrompt>,
 }
 
 const SAVE_CHOICES: &[(&str, Choice)] =
@@ -1074,24 +1081,24 @@ impl Prompt {
         let btn_total: f32 = bws.iter().sum::<f32>() + 8.0 * s * (bws.len() as f32 - 1.0);
         let max_text = (560.0 * s).min(cv.w as f32 - 40.0 * s - 2.0 * pad).max(100.0 * s);
         let key = (max_text.to_bits(), lh.to_bits());
-        if self.wrapped.as_ref().is_none_or(|(k, _, _)| *k != key) {
-            let wrapped: Vec<(usize, String)> = self
+        if self.wrapped.as_ref().is_none_or(|w| w.key != key) {
+            let lines: Vec<(usize, String)> = self
                 .lines
                 .iter()
                 .enumerate()
                 .flat_map(|(i, l)| wrap(g, l, max_text).into_iter().map(move |w| (i, w)))
                 .collect();
-            let text_w = wrapped.iter().map(|(_, l)| g.text_w(l)).fold(0.0, f32::max);
-            self.wrapped = Some((key, text_w, wrapped));
+            let text_w = lines.iter().map(|(_, l)| g.text_w(l)).fold(0.0, f32::max);
+            self.wrapped = Some(WrappedPrompt { key, text_w, lines });
         }
-        let (_, text_w, wrapped) = self.wrapped.as_ref().expect("populated above");
-        let w = (*text_w + 2.0 * pad).max(btn_total + 2.0 * pad).min(cv.w as f32 - 20.0 * s);
-        let h = pad + lh * wrapped.len() as f32 + pad + fh + pad;
+        let wrapped = self.wrapped.as_ref().expect("populated above");
+        let w = (wrapped.text_w + 2.0 * pad).max(btn_total + 2.0 * pad).min(cv.w as f32 - 20.0 * s);
+        let h = pad + lh * wrapped.lines.len() as f32 + pad + fh + pad;
         let r = Rect::new(((cv.w as f32 - w) / 2.0).round(), ((cv.h as f32 - h) / 2.5).round().max(0.0), w, h);
         cv.fill(r, th.chrome);
         cv.outline(r, s, if self.warn { th.danger } else { th.border });
         cv.set_clip(r);
-        for (k, (i, l)) in wrapped.iter().enumerate() {
+        for (k, (i, l)) in wrapped.lines.iter().enumerate() {
             let color = if self.warn && *i == 0 { th.danger } else { th.chrome_fg };
             g.text(cv, l, r.x + pad, r.y + pad + k as f32 * lh, color);
         }
