@@ -51,10 +51,7 @@ impl App {
     /// The link containing the text cursor, if any (for opening the menu from the keyboard).
     pub(crate) fn link_at_cursor(&self) -> Option<String> {
         let view = &self.win.tabs[self.win.active].view;
-        let c = view.cursor;
-        let line = view.doc.line(c.line);
-        let r = search::find_urls(&line).into_iter().find(|r| c.index >= r.start && c.index < r.end)?;
-        line.get(r).map(str::to_owned)
+        view.doc.url_at(view.cursor)
     }
 
     pub(crate) fn run_ctx(&mut self, a: CtxAction) {

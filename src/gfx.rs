@@ -186,10 +186,14 @@ pub struct Gfx {
     ui_metrics: Metrics,
     /// Labels shaped so far (for tests).
     #[cfg(test)]
-    shaped: usize,
+    pub(crate) shaped: usize,
 }
 
 impl Gfx {
+    #[cfg(test)]
+    pub(crate) fn cached_labels(&self) -> usize {
+        self.ui.len() + self.ui_old.len()
+    }
     pub fn new() -> Self {
         Self {
             fs: FontSystem::new(),

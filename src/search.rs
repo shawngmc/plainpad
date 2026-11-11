@@ -4,33 +4,34 @@ use ropey::Rope;
 use std::borrow::Cow;
 use std::ops::Range;
 
-/// Finds the first match of `needle` in `hay` starting at byte `from`.
+///// Finds the first match of `needle` in `hay` starting at byte `from`.
 pub fn find(hay: &str, needle: &str, case: bool, from: usize) -> Option<Range<usize>> {
-    if needle.is_empty() || from > hay.len() {
-        return None;
-    }
-    let from = floor_boundary(hay, from);
-    if case {
-        return hay[from..].find(needle).map(|i| from + i..from + i + needle.len());
-    }
-    let n: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    find_nocase(hay, &n, from)
+    Query::new(needle, case).find(hay, from)
+}
+
+/// Whether any non-ASCII Unicode scalar lowercases to a sequence starting with
+/// `first` (an ASCII lowercase character). Only three non-ASCII characters in
+/// Unicode fold to ASCII: U+0130 ('İ' -> 'i'), U+017F ('ſ' -> 's'), and
+/// U+212A ('K' -> 'k').
+#[inline]
+fn has_non_ascii_fold(first: char) -> bool {
+    matches!(first, 'i' | 's' | 'k')
 }
 
 /// Case-insensitive search. Only positions whose character could start a match
-/// are tried: for an ASCII first letter that is a quick byte comparison, plus a
-/// check of each non-ASCII character (a few, such as the Kelvin sign, lowercase
-/// to ASCII letters).
+/// are tried: for an ASCII first letter that is a quick byte comparison, plus
+/// (only for 'i', 's', 'k') a check of non-ASCII lead bytes.
 fn find_nocase(hay: &str, lower: &[char], from: usize) -> Option<Range<usize>> {
     let first = lower[0];
     let try_at = |i: usize| match_at(&hay[i..], lower).map(|len| i..i + len);
     if first.is_ascii() {
         let (lo, up) = (first as u8, first.to_ascii_uppercase() as u8);
+        let check_non_ascii = has_non_ascii_fold(first);
         let b = hay.as_bytes();
         let mut i = from;
         while i < b.len() {
             let c = b[i];
-            if (c == lo || c == up || (c >= 0xC0 && starts_lower(&hay[i..], first)))
+            if (c == lo || c == up || (check_non_ascii && c >= 0xC0 && starts_lower(&hay[i..], first)))
                 && let Some(r) = try_at(i)
             {
                 return Some(r);
@@ -43,26 +44,43 @@ fn find_nocase(hay: &str, lower: &[char], from: usize) -> Option<Range<usize>> {
     }
 }
 
+/// Reverse case-insensitive search ending at or before `before`.
+fn rfind_nocase(hay: &str, lower: &[char], before: usize) -> Option<Range<usize>> {
+    let first = lower[0];
+    let slice = &hay[..before];
+    if first.is_ascii() {
+        let (lo, up) = (first as u8, first.to_ascii_uppercase() as u8);
+        let check_non_ascii = has_non_ascii_fold(first);
+        let b = slice.as_bytes();
+        let mut i = b.len();
+        while i > 0 {
+            i -= 1;
+            let c = b[i];
+            if (c == lo || c == up || (check_non_ascii && c >= 0xC0 && starts_lower(&slice[i..], first)))
+                && let Some(len) = match_at(&slice[i..], lower)
+            {
+                return Some(i..i + len);
+            }
+        }
+        None
+    } else {
+        slice
+            .char_indices()
+            .rev()
+            .filter(|&(i, _)| starts_lower(&slice[i..], first))
+            .find_map(|(i, _)| match_at(&slice[i..], lower).map(|len| i..i + len))
+    }
+}
+
 /// Whether the first character of `s` lowercases to something starting with `first`.
 fn starts_lower(s: &str, first: char) -> bool {
     s.chars().next().and_then(|c| c.to_lowercase().next()) == Some(first)
 }
 
 /// Finds the last match of `needle` in `hay` that ends at or before byte `before`.
+#[cfg(test)]
 pub fn rfind(hay: &str, needle: &str, case: bool, before: usize) -> Option<Range<usize>> {
-    if needle.is_empty() {
-        return None;
-    }
-    let before = floor_boundary(hay, before.min(hay.len()));
-    if case {
-        return hay[..before].rfind(needle).map(|i| i..i + needle.len());
-    }
-    let n: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
-    hay[..before]
-        .char_indices()
-        .rev()
-        .filter(|&(i, _)| starts_lower(&hay[i..], n[0]))
-        .find_map(|(i, _)| match_at(&hay[i..before], &n).map(|len| i..i + len))
+    Query::new(needle, case).rfind(hay, before)
 }
 
 // ---------------------------------------------------------------- whole documents
@@ -85,6 +103,7 @@ fn window() -> usize {
 /// lines: the find field can't contain a line break.
 pub struct Query {
     needle: String,
+    lower: Vec<char>,
     case: bool,
     /// The longest a match can be in the text, in bytes, so windows overlap enough.
     max_len: usize,
@@ -92,8 +111,33 @@ pub struct Query {
 
 impl Query {
     pub fn new(needle: &str, case: bool) -> Self {
-        let max_len = if case { needle.len() } else { needle.chars().flat_map(char::to_lowercase).count() * 4 };
-        Self { needle: needle.to_owned(), case, max_len }
+        let lower: Vec<char> = if case { Vec::new() } else { needle.chars().flat_map(char::to_lowercase).collect() };
+        let max_len = if case { needle.len() } else { lower.len() * 4 };
+        Self { needle: needle.to_owned(), lower, case, max_len }
+    }
+
+    fn find(&self, hay: &str, from: usize) -> Option<Range<usize>> {
+        if self.needle.is_empty() || from > hay.len() {
+            return None;
+        }
+        let from = floor_boundary(hay, from);
+        if self.case {
+            hay[from..].find(&self.needle).map(|i| from + i..from + i + self.needle.len())
+        } else {
+            find_nocase(hay, &self.lower, from)
+        }
+    }
+
+    fn rfind(&self, hay: &str, before: usize) -> Option<Range<usize>> {
+        if self.needle.is_empty() {
+            return None;
+        }
+        let before = floor_boundary(hay, before.min(hay.len()));
+        if self.case {
+            hay[..before].rfind(&self.needle).map(|i| i..i + self.needle.len())
+        } else {
+            rfind_nocase(hay, &self.lower, before)
+        }
     }
 }
 
@@ -122,7 +166,7 @@ pub fn find_forward(
         let end = floor_char(rope, (pos + window()).min(to)).max(floor_char(rope, pos + 4).min(to));
         let stop = floor_char(rope, (end + q.max_len).min(len));
         let t = text(rope, pos, stop);
-        if let Some(r) = find(&t, &q.needle, q.case, 0)
+        if let Some(r) = q.find(&t, 0)
             && pos + r.start < end
         {
             return Some(pos + r.start..pos + r.end);
@@ -149,7 +193,7 @@ pub fn find_backward(
         // Reach back far enough to see a match that crosses `start`.
         let from = floor_char(rope, start.saturating_sub(q.max_len));
         let t = text(rope, from, end);
-        if let Some(r) = rfind(&t, &q.needle, q.case, t.len()) {
+        if let Some(r) = q.rfind(&t, t.len()) {
             return Some(from + r.start..from + r.end);
         }
         done += end - start;
@@ -194,7 +238,7 @@ pub fn find_all(rope: &Rope, q: &Query, more: &mut dyn FnMut(usize) -> bool) -> 
         let stop = floor_char(rope, (end + q.max_len).min(len));
         let t = text(rope, pos, stop);
         let mut from = next.max(pos) - pos;
-        while let Some(r) = find(&t, &q.needle, q.case, from) {
+        while let Some(r) = q.find(&t, from) {
             if pos + r.start >= end {
                 break;
             }
@@ -400,5 +444,16 @@ mod tests {
         assert_eq!(find_all(&rope, &Query::new("fox", false), &mut |_| false), None);
         assert_eq!(find_wrapping(&rope, &Query::new("zzz", false), 10, true, &mut go), None);
         assert_eq!(find_wrapping(&rope, &Query::new("zzz", false), 10, false, &mut go), None);
+    }
+
+    #[test]
+    fn non_ascii_fold_table_is_complete() {
+        for c in '\u{80}'..=char::MAX {
+            if let Some(first) = c.to_lowercase().next()
+                && first.is_ascii()
+            {
+                assert!(has_non_ascii_fold(first), "U+{:04X} lowercases to ASCII {first:?}", c as u32);
+            }
+        }
     }
 }

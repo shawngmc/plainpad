@@ -978,6 +978,9 @@ pub struct Prompt {
     /// Draw the first line as a warning.
     warn: bool,
     buttons: Vec<(Rect, Choice)>,
+    /// Cached `((max_text_bits, lh_bits), text_w, wrapped_lines)` so `wrap`
+    /// only runs when the prompt first draws or the window/scale changes.
+    wrapped: Option<((u32, u32), f32, Vec<(usize, String)>)>,
 }
 
 const SAVE_CHOICES: &[(&str, Choice)] =
@@ -990,13 +993,14 @@ const RECOVER_CHOICES: &[(&str, Choice)] = &[("Open List as a Tab", Choice::Reco
 
 /// Greedy word wrap of `text` to `max_w` pixels. A word too long for a line
 /// on its own (such as a long URL) is broken between characters, so nothing
-/// is cut off.
+/// is cut off. Probes use `text_w_once` so intermediate prefixes don't flood
+/// the UI label cache.
 fn wrap(g: &mut Gfx, text: &str, max_w: f32) -> Vec<String> {
     let mut out = Vec::new();
     let mut line = String::new();
     for word in text.split(' ') {
         let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-        if g.text_w(&candidate) <= max_w {
+        if g.text_w_once(&candidate) <= max_w {
             line = candidate;
             continue;
         }
@@ -1005,7 +1009,7 @@ fn wrap(g: &mut Gfx, text: &str, max_w: f32) -> Vec<String> {
         }
         for c in word.chars() {
             line.push(c);
-            if g.text_w(&line) > max_w && line.chars().count() > 1 {
+            if g.text_w_once(&line) > max_w && line.chars().count() > 1 {
                 line.pop();
                 out.push(std::mem::replace(&mut line, c.to_string()));
             }
@@ -1016,36 +1020,40 @@ fn wrap(g: &mut Gfx, text: &str, max_w: f32) -> Vec<String> {
 }
 
 impl Prompt {
+    fn new(lines: Vec<String>, choices: &'static [(&'static str, Choice)], focus: usize, warn: bool) -> Self {
+        Self { lines, choices, focus, warn, buttons: Vec::new(), wrapped: None }
+    }
+
     /// "Save changes?" with Save / Don't Save / Cancel; Save is the default.
     pub fn save(msg: String) -> Self {
-        Self { lines: vec![msg], choices: SAVE_CHOICES, focus: 0, warn: false, buttons: Vec::new() }
+        Self::new(vec![msg], SAVE_CHOICES, 0, false)
     }
 
     /// A warning about a suspicious link, with Open Anyway / Cancel; Cancel is the default.
     pub fn link(lines: Vec<String>) -> Self {
-        Self { lines, choices: LINK_CHOICES, focus: 1, warn: true, buttons: Vec::new() }
+        Self::new(lines, LINK_CHOICES, 1, true)
     }
 
     /// A file changed on disk under unsaved edits; keeping ours is the default.
     pub fn changed(msg: String) -> Self {
-        Self { lines: vec![msg], choices: CHANGED_CHOICES, focus: 1, warn: false, buttons: Vec::new() }
+        Self::new(vec![msg], CHANGED_CHOICES, 1, false)
     }
 
     /// Saving would overwrite a file changed on disk; Cancel is the default.
     pub fn overwrite(msg: String) -> Self {
-        Self { lines: vec![msg], choices: OVERWRITE_CHOICES, focus: 1, warn: true, buttons: Vec::new() }
+        Self::new(vec![msg], OVERWRITE_CHOICES, 1, true)
     }
 
     /// Opening a very large file; Cancel is the default.
     pub fn large(msg: String) -> Self {
-        Self { lines: vec![msg], choices: LARGE_CHOICES, focus: 1, warn: false, buttons: Vec::new() }
+        Self::new(vec![msg], LARGE_CHOICES, 1, false)
     }
 
     /// Summary of documents recovered after a crash. OK (the default) restores
     /// them as untitled tabs; the other button also opens the list as a tab.
     /// There is no cancel: dismissing it any way still restores the work.
     pub fn recovery(lines: Vec<String>) -> Self {
-        Self { lines, choices: RECOVER_CHOICES, focus: 1, warn: false, buttons: Vec::new() }
+        Self::new(lines, RECOVER_CHOICES, 1, false)
     }
 
     pub fn focused(&self) -> Choice {
@@ -1065,14 +1073,19 @@ impl Prompt {
         let bws: Vec<f32> = self.choices.iter().map(|(t, _)| g.text_w(t).max(60.0 * s) + 24.0 * s).collect();
         let btn_total: f32 = bws.iter().sum::<f32>() + 8.0 * s * (bws.len() as f32 - 1.0);
         let max_text = (560.0 * s).min(cv.w as f32 - 40.0 * s - 2.0 * pad).max(100.0 * s);
-        let wrapped: Vec<(usize, String)> = self
-            .lines
-            .iter()
-            .enumerate()
-            .flat_map(|(i, l)| wrap(g, l, max_text).into_iter().map(move |w| (i, w)))
-            .collect();
-        let text_w = wrapped.iter().map(|(_, l)| g.text_w(l)).fold(0.0, f32::max);
-        let w = (text_w + 2.0 * pad).max(btn_total + 2.0 * pad).min(cv.w as f32 - 20.0 * s);
+        let key = (max_text.to_bits(), lh.to_bits());
+        if self.wrapped.as_ref().is_none_or(|(k, _, _)| *k != key) {
+            let wrapped: Vec<(usize, String)> = self
+                .lines
+                .iter()
+                .enumerate()
+                .flat_map(|(i, l)| wrap(g, l, max_text).into_iter().map(move |w| (i, w)))
+                .collect();
+            let text_w = wrapped.iter().map(|(_, l)| g.text_w(l)).fold(0.0, f32::max);
+            self.wrapped = Some((key, text_w, wrapped));
+        }
+        let (_, text_w, wrapped) = self.wrapped.as_ref().expect("populated above");
+        let w = (*text_w + 2.0 * pad).max(btn_total + 2.0 * pad).min(cv.w as f32 - 20.0 * s);
         let h = pad + lh * wrapped.len() as f32 + pad + fh + pad;
         let r = Rect::new(((cv.w as f32 - w) / 2.0).round(), ((cv.h as f32 - h) / 2.5).round().max(0.0), w, h);
         cv.fill(r, th.chrome);
@@ -1260,12 +1273,23 @@ mod tests {
         let mut g = Gfx::new();
         let url = format!("https://{}.example/path", "a".repeat(200));
         let lines = wrap(&mut g, &format!("It really goes to: {url}"), 300.0);
+        assert_eq!(g.cached_labels(), 0, "wrap probes must not pollute the UI label cache");
         assert!(lines.len() > 2);
         for l in &lines {
-            assert!(g.text_w(l) <= 300.0, "{l:?} too wide");
+            assert!(g.text_w_once(l) <= 300.0, "{l:?} too wide");
         }
         // Nothing lost: the pieces reassemble into the original text.
         assert_eq!(lines.concat().replace(' ', ""), format!("It really goes to: {url}").replace(' ', ""));
+
+        // Redrawing an open Prompt reuses its wrapped lines instead of re-running wrap().
+        let mut px = vec![0u32; 800 * 600];
+        let mut cv = Canvas::new(&mut px, 800, 600);
+        let mut p = Prompt::link(vec![format!("It really goes to: {url}")]);
+        p.draw(&mut g, &mut cv, &Theme::LIGHT, 1.0);
+        let shaped_after_first = g.shaped;
+        p.cycle(true);
+        p.draw(&mut g, &mut cv, &Theme::LIGHT, 1.0);
+        assert_eq!(g.shaped, shaped_after_first, "second Prompt draw should not re-shape");
     }
 
     #[test]

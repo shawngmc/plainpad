@@ -22,7 +22,7 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Lines longer than this many bytes are split into display segments.
-const SEG: usize = 2048;
+pub(crate) const SEG: usize = 2048;
 
 /// Bytes past [`SEG`] that [`first_cut`] looks at to find a grapheme boundary.
 const LOOKAHEAD: usize = 64;
@@ -32,7 +32,7 @@ const LOOKAHEAD: usize = 64;
 /// `SEG + LOOKAHEAD` bytes of it. Splits after a space or punctuation in the
 /// last quarter of the segment where possible, otherwise at a grapheme
 /// boundary, so no character is broken.
-fn first_cut(text: &str) -> usize {
+pub(crate) fn first_cut(text: &str) -> usize {
     let soft =
         text.as_bytes()[SEG * 3 / 4..SEG].iter().rposition(|b| b" ,;})]>".contains(b)).map(|p| SEG * 3 / 4 + p + 1);
     let cut = soft.unwrap_or_else(|| {
@@ -227,19 +227,56 @@ impl View {
     /// Layout lines (and their `segs` entries) for document line `i`.
     /// A long line is copied from the rope one segment at a time, never whole.
     fn make_lines(&self, i: usize, out: &mut Vec<BufferLine>, segs: &mut Vec<(usize, usize)>) {
-        let len = self.doc.line_len(i);
-        let mut a = 0;
+        self.make_lines_range(i, 0, self.doc.line_len(i), out, segs);
+    }
+
+    /// Layout lines (and their `segs` entries) for byte range `from..to` of
+    /// document line `i`. Streams chunks from a single rope slice with one
+    /// reusable buffer instead of walking the rope tree and allocating per segment.
+    fn make_lines_range(
+        &self,
+        i: usize,
+        from: usize,
+        to: usize,
+        out: &mut Vec<BufferLine>,
+        segs: &mut Vec<(usize, usize)>,
+    ) {
+        if from == 0 && to <= SEG {
+            let text = self.doc.line(i);
+            out.push(BufferLine::new(&text[..to], LineEnding::Lf, self.attrs.clone(), Shaping::Advanced));
+            segs.push((i, 0));
+            return;
+        }
+        let rope = self.doc.rope();
+        let base = rope.line_to_byte(i);
+        let mut chunks = rope.byte_slice(base + from..base + to).chunks();
+        let mut buf = String::with_capacity(SEG + LOOKAHEAD + 64);
+        let mut a = from;
         loop {
-            let long = len - a > SEG;
-            let end = if long { self.doc.floor_index(i, (a + SEG + LOOKAHEAD).min(len)) } else { len };
-            // A short line is often borrowed straight from the rope.
-            let text: std::borrow::Cow<str> =
-                if a == 0 && !long { self.doc.line(i) } else { self.doc.line_slice(i, a, end).into() };
-            let cut = if long { first_cut(&text) } else { text.len() };
-            out.push(BufferLine::new(&text[..cut], LineEnding::Lf, self.attrs.clone(), Shaping::Advanced));
+            let rem = to - a;
+            let long = rem > SEG;
+            let need = if long { (SEG + LOOKAHEAD).min(rem) } else { rem };
+            while buf.len() < need {
+                match chunks.next() {
+                    Some(c) => buf.push_str(c),
+                    None => break,
+                }
+            }
+            let end = if long {
+                let mut e = need.min(buf.len());
+                while !buf.is_char_boundary(e) {
+                    e -= 1;
+                }
+                e
+            } else {
+                buf.len()
+            };
+            let cut = if long { first_cut(&buf[..end]) } else { end };
+            out.push(BufferLine::new(&buf[..cut], LineEnding::Lf, self.attrs.clone(), Shaping::Advanced));
             segs.push((i, a));
+            buf.drain(..cut);
             a += cut;
-            if a >= len {
+            if a >= to {
                 break;
             }
         }
@@ -458,34 +495,55 @@ impl View {
 
     // ------------------------------------------------------------ editing
 
-    /// Fast path for an edit within one segment of one line (typing, Backspace,
-    /// Delete): re-lay out just that segment and shift the later segments' offsets.
+    /// Fast path for an edit within one line (typing, Backspace, Delete, or
+    /// single-line paste/delete across segments): updates or re-splits only the
+    /// touched segments and shifts later segments' byte offsets on that line,
+    /// without re-segmenting or re-shaping the rest of a huge line.
     fn edit_segment(&mut self, r: &EditResult) -> bool {
         let line = r.first;
         if r.old_last != line || r.new_last != line || !self.in_window(r.start) {
             return false;
         }
-        let k = self.seg_of(line, r.start.index);
+        let k0 = self.seg_of(line, r.start.index);
         let delta = r.end.index as isize - r.old_end.index as isize;
-        let seg_start = self.segs[k].1;
-        let next = self.segs.get(k + 1).filter(|s| s.0 == line).map(|s| s.1);
-        let old_line_len = (self.doc.line_len(line) as isize - delta) as usize;
-        let old_seg_end = next.unwrap_or(old_line_len);
-        if r.old_end.index > old_seg_end {
-            return false; // the edit spans a segment boundary
+        let seg_start = self.segs[k0].1;
+        let new_line_len = self.doc.line_len(line);
+        let old_line_len = (new_line_len as isize - delta) as usize;
+        let mut k1 = k0 + 1;
+        while k1 < self.segs.len() && self.segs[k1].0 == line && self.segs[k1].1 < r.old_end.index {
+            k1 += 1;
         }
+        let has_prev = k0 > 0 && self.segs[k0 - 1].0 == line;
+        let has_next = k1 < self.segs.len() && self.segs[k1].0 == line;
+        let old_seg_end = if has_next { self.segs[k1].1 } else { old_line_len };
         let new_end = (old_seg_end as isize + delta) as usize;
         let len = new_end - seg_start;
-        // Re-split once a segment grows well past the limit, or empties out.
-        if len > 2 * SEG || (len == 0 && (k > 0 && self.segs[k - 1].0 == line || next.is_some())) {
-            return false;
+        // Single-segment in-place update when within bounds and non-empty (or sole segment).
+        if k1 == k0 + 1 && len <= 2 * SEG && (len > 0 || (!has_prev && !has_next)) {
+            let text = self.doc.line_slice(line, seg_start, new_end);
+            self.buf.lines[k0].set_text(text, LineEnding::Lf, self.attrs.clone());
+            for s in self.segs[k1..].iter_mut().take_while(|s| s.0 == line) {
+                s.1 = (s.1 as isize + delta) as usize;
+            }
+            self.touch();
+            return true;
         }
-        let text = self.doc.line_slice(line, seg_start, new_end);
-        self.buf.lines[k].set_text(text, LineEnding::Lf, self.attrs.clone());
-        for s in self.segs[k + 1..].iter_mut().take_while(|s| s.0 == line) {
+        // Re-split only the affected span `seg_start..new_end` (or drop emptied
+        // segments when the rest of the line is non-empty).
+        let (mut lines, mut segs) = (Vec::new(), Vec::new());
+        if len > 0 || new_line_len == 0 {
+            self.make_lines_range(line, seg_start, new_end, &mut lines, &mut segs);
+        }
+        let added = segs.len();
+        self.buf.lines.splice(k0..k1, lines);
+        self.segs.splice(k0..k1, segs);
+        for s in self.segs[k0 + added..].iter_mut().take_while(|s| s.0 == line) {
             s.1 = (s.1 as isize + delta) as usize;
         }
         self.touch();
+        if self.segs.len() > 4 * (self.vis_rows + 2 * self.margin()) {
+            self.load_window(self.top_pos(), self.buf.scroll().vertical, true);
+        }
         true
     }
 
@@ -1180,14 +1238,28 @@ mod tests {
         v.prepare(&mut fs);
         assert_eq!(v.window_len(), segs_before);
         assert_mirrors(&v);
-        // Backspace and Delete across a segment boundary.
+        // Backspace and Delete across a segment boundary keep later segments shaped.
         let boundary = v.segs[1].1;
+        v.buf.line_layout(&mut fs, 3);
+        assert!(v.buf.lines[3].shape_opt().is_some(), "segment 3 was shaped");
         v.cursor = Cursor::new(0, boundary);
         v.backspace();
+        assert!(v.buf.lines[3].shape_opt().is_some(), "untouched segment kept its shaping");
         v.prepare(&mut fs);
         assert_mirrors(&v);
         v.cursor = Cursor::new(0, v.segs[1].1);
         v.delete();
+        v.prepare(&mut fs);
+        assert_mirrors(&v);
+        // Deleting an entire segment drops it cleanly without rebuilding the whole line.
+        let (s1, s2) = (v.segs[1].1, v.segs[2].1);
+        v.set_selection(Cursor::new(0, s1), Cursor::new(0, s2));
+        v.delete_selection();
+        v.prepare(&mut fs);
+        assert_mirrors(&v);
+        // Growing a segment past 2 * SEG splits only that segment.
+        v.cursor = Cursor::new(0, 100);
+        v.replace_selection(&"word ".repeat(1000), false);
         v.prepare(&mut fs);
         assert_mirrors(&v);
         // A newline in the middle re-splits the line and shifts later lines.

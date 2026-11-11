@@ -622,6 +622,26 @@ impl Document {
         }
         (Cursor::new(c.line, found.0), Cursor::new(c.line, found.1))
     }
+
+    /// The URL containing `c`, if any. Looks at a window around `c` rather than
+    /// copying the whole line, so opening the context menu on a multi-megabyte
+    /// line stays instant.
+    pub fn url_at(&self, c: Cursor) -> Option<String> {
+        const AROUND: usize = 2048;
+        let len = self.line_len(c.line);
+        let idx = c.index.min(len);
+        let raw_start = idx.saturating_sub(AROUND);
+        // Step back one extra byte before snapping so a non-zero `start` can
+        // never land on the first byte of `http://` right after a word char.
+        let start = self.floor_index(c.line, raw_start.saturating_sub(1));
+        let end = self.floor_index(c.line, (idx + AROUND).min(len));
+        let window = self.line_slice(c.line, start, end);
+        let rel = idx - start;
+        let r = crate::search::find_urls(&window)
+            .into_iter()
+            .find(|r| (start == 0 || r.start > 0) && rel >= r.start && rel < r.end)?;
+        window.get(r).map(str::to_owned)
+    }
 }
 
 /// A Replace All ready to install: the new text and its undo record.
@@ -973,5 +993,20 @@ mod tests {
         let (a, z) = d.word_at(c(0, 25_000));
         assert!(a.index < 25_000 && z.index > 25_000 && z.index - a.index <= 512, "{a:?} {z:?}");
         assert_eq!(d.word_at(c(0, 50_004)).0, c(0, 50_003), "'bcc…' starts after the space");
+    }
+
+    #[test]
+    fn url_at_on_long_line() {
+        let prefix = "a".repeat(50_000);
+        let suffix = "b".repeat(50_000);
+        let d = Document::new(&format!("{prefix} https://example.com/path nohttp://bad.com {suffix}"));
+        let url_start = 50_001;
+        assert_eq!(d.url_at(c(0, url_start + 5)).as_deref(), Some("https://example.com/path"));
+        assert_eq!(d.url_at(c(0, 10_000)), None);
+        // Even if the 2048-byte lookbehind lands right before "http://bad.com" inside "nohttp://bad.com",
+        // the extra lookbehind byte prevents mistaking it for a word boundary.
+        let bad_http = url_start + "https://example.com/path no".len();
+        let d2 = Document::new(&format!("{}nohttp://bad.com{}", "x".repeat(bad_http), " ".repeat(5000)));
+        assert_eq!(d2.url_at(c(0, bad_http + 2048)), None);
     }
 }

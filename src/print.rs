@@ -2,7 +2,10 @@
 //! the editor (so fonts, bidi and complex scripts print as they display), then
 //! handed to the platform: GDI on Windows, CUPS `lp` (as PDF) elsewhere.
 
-use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Wrap};
+use crate::view::{SEG, first_cut};
+use cosmic_text::{
+    Attrs, AttrsList, Buffer, BufferLine, Color, Family, FontSystem, LineEnding, Metrics, Shaping, SwashCache, Wrap,
+};
 use std::io::{self, Write};
 
 pub struct PageSetup {
@@ -40,9 +43,63 @@ pub struct Raster<'a> {
     pub px: &'a [u8],
 }
 
-/// Document lines laid out per batch, so even huge documents only ever have
-/// one batch of layout in memory.
+/// Display segments laid out per batch, so even huge documents or multi-megabyte
+/// single lines only ever hold bounded layout state in memory.
 const BATCH: usize = 256;
+
+/// Up to this many shaped batches (4,096 segments ≈ 80 pages) are kept from
+/// Pass 1 so Pass 2 can rasterise them directly without shaping a second time.
+const MAX_CACHED_BATCHES: usize = 16;
+
+/// Streams document lines into batches of at most [`BATCH`] [`SEG`]-bounded
+/// [`BufferLine`]s.
+struct Batcher<'a> {
+    job: &'a Job<'a>,
+    attrs: AttrsList,
+    metrics: Metrics,
+    content_w: f32,
+    line_idx: usize,
+    cur_line: String,
+    cur_off: usize,
+}
+
+impl<'a> Batcher<'a> {
+    fn new(job: &'a Job<'a>, attrs: AttrsList, metrics: Metrics, content_w: f32) -> Self {
+        Self { job, attrs, metrics, content_w, line_idx: 0, cur_line: String::new(), cur_off: 0 }
+    }
+
+    fn next_batch(&mut self, fs: &mut FontSystem) -> Option<Buffer> {
+        let mut lines = Vec::with_capacity(BATCH.min(self.job.lines.saturating_sub(self.line_idx).max(1)));
+        while lines.len() < BATCH {
+            if self.cur_off == self.cur_line.len() {
+                if self.line_idx >= self.job.lines {
+                    break;
+                }
+                self.cur_line = (self.job.line)(self.line_idx);
+                self.line_idx += 1;
+                self.cur_off = 0;
+                if self.cur_line.is_empty() {
+                    lines.push(BufferLine::new("", LineEnding::Lf, self.attrs.clone(), Shaping::Advanced));
+                    continue;
+                }
+            }
+            let rest = &self.cur_line[self.cur_off..];
+            let long = rest.len() > SEG;
+            let cut = if long { first_cut(rest) } else { rest.len() };
+            lines.push(BufferLine::new(&rest[..cut], LineEnding::Lf, self.attrs.clone(), Shaping::Advanced));
+            self.cur_off += cut;
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        let mut buf = Buffer::new(fs, self.metrics);
+        buf.set_wrap(Wrap::WordOrGlyph);
+        buf.set_size(Some(self.content_w), None);
+        buf.lines = lines;
+        buf.shape_until_scroll(fs, false);
+        Some(buf)
+    }
+}
 
 struct Pager<'a, F> {
     w: u32,
@@ -113,21 +170,26 @@ pub fn render_pages(
     } else {
         Attrs::new().family(Family::Name(job.family))
     };
-    let mut buf = Buffer::new(fs, Metrics::new(font_px, lh));
-    buf.set_wrap(Wrap::WordOrGlyph);
-    buf.set_size(Some(content_w), None);
-    let layout = |buf: &mut Buffer, fs: &mut FontSystem, start: usize| {
-        let end = (start + BATCH).min(job.lines);
-        let text: Vec<String> = (start..end).map(job.line).collect();
-        buf.set_text(&text.join("\n"), &attrs, Shaping::Advanced, None);
-        buf.shape_until_scroll(fs, false);
-    };
+    let attrs_list = AttrsList::new(&attrs);
+    let metrics = Metrics::new(font_px, lh);
 
     // Pass 1: count visual lines so the footer can say "Page n of m".
+    // Keep shaped batches in memory when the document fits within MAX_CACHED_BATCHES
+    // so normal print jobs are shaped only once.
+    let mut batcher = Batcher::new(job, attrs_list.clone(), metrics, content_w);
+    let mut cached = Vec::new();
+    let mut overflowed = false;
     let mut total = 0;
-    for start in (0..job.lines).step_by(BATCH) {
-        layout(&mut buf, fs, start);
-        total += buf.layout_runs().count();
+    while let Some(b) = batcher.next_batch(fs) {
+        total += b.layout_runs().count();
+        if !overflowed {
+            if cached.len() < MAX_CACHED_BATCHES {
+                cached.push(b);
+            } else {
+                cached.clear();
+                overflowed = true;
+            }
+        }
     }
     let pages = total.div_ceil(lines_per_page).max(1);
 
@@ -146,10 +208,9 @@ pub fn render_pages(
         sink: &mut sink,
     };
 
-    // Pass 2: render.
+    // Pass 2: render from cached batches (single-pass shaping) or stream again if huge.
     let mut row = 0;
-    for start in (0..job.lines).step_by(BATCH) {
-        layout(&mut buf, fs, start);
+    let mut render_buf = |buf: &Buffer, fs: &mut FontSystem, cache: &mut SwashCache| -> io::Result<()> {
         for run in buf.layout_runs() {
             let top = margin + row as f32 * lh;
             for g in run.glyphs {
@@ -164,6 +225,17 @@ pub fn render_pages(
                 pager.emit(fs, cache)?;
                 row = 0;
             }
+        }
+        Ok(())
+    };
+    if !overflowed {
+        for b in &cached {
+            render_buf(b, fs, cache)?;
+        }
+    } else {
+        let mut batcher = Batcher::new(job, attrs_list, metrics, content_w);
+        while let Some(b) = batcher.next_batch(fs) {
+            render_buf(&b, fs, cache)?;
         }
     }
     if row > 0 || pager.page == 0 {
@@ -405,5 +477,47 @@ mod win {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn single_pass_shaping_and_long_line_segmentation() {
+        let mut fs = FontSystem::new();
+        let mut cache = SwashCache::new();
+        let page = PageSetup { w_in: 8.5, h_in: 11.0, margin_in: 0.75, dpi: 72.0 };
+        let calls = Cell::new(0usize);
+        let line_fn = |i: usize| {
+            calls.set(calls.get() + 1);
+            format!("Line {i}: hello world")
+        };
+        let job = Job { lines: 120, line: &line_fn, family: "", font_pt: 11.0 };
+        let mut emitted = Vec::new();
+        let pages = render_pages(&mut fs, &mut cache, &job, &page, |idx, total, r| {
+            assert!(r.px.iter().any(|&p| p < 255), "page {idx} should have ink");
+            emitted.push((idx, total));
+            Ok(())
+        })
+        .unwrap();
+        assert!(pages >= 2);
+        assert_eq!(emitted.len(), pages);
+        assert_eq!(calls.get(), 120, "each line should be fetched and shaped only once");
+
+        // A single line spanning multiple SEG (2048-byte) chunks is segmented and
+        // laid out across multiple pages without hanging or re-fetching.
+        let huge = "word ".repeat(3000); // 15 KB single line (> 7 SEG chunks)
+        let huge_calls = Cell::new(0usize);
+        let huge_fn = |_: usize| {
+            huge_calls.set(huge_calls.get() + 1);
+            huge.clone()
+        };
+        let huge_job = Job { lines: 1, line: &huge_fn, family: "", font_pt: 11.0 };
+        let huge_pages = render_pages(&mut fs, &mut cache, &huge_job, &page, |_, _, _| Ok(())).unwrap();
+        assert!(huge_pages >= 2, "15 KB line wraps onto multiple pages (got {huge_pages})");
+        assert_eq!(huge_calls.get(), 1);
     }
 }
