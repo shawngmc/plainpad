@@ -266,6 +266,12 @@ impl App {
         if self.choose_disk(c, &pending) {
             return;
         }
+        if pending == Pending::About {
+            if c == Choice::CopyDetails {
+                self.copy_about();
+            }
+            return;
+        }
         if let Pending::OpenLarge(path) = pending {
             if c == Choice::Open {
                 self.open_new(path, true);
@@ -293,7 +299,9 @@ impl App {
             | Choice::Keep
             | Choice::Overwrite
             | Choice::RecoverOk
-            | Choice::RecoverList => {}
+            | Choice::RecoverList
+            | Choice::CopyDetails
+            | Choice::Close => {}
             // A failed or cancelled save stops the close or exit, like Cancel. A save
             // running in the background carries on with it once it's done.
             Choice::Save => match self.save(Some(pending.clone())) {
@@ -320,7 +328,11 @@ impl App {
             Pending::CloseWindow => self.request_close_window(),
             Pending::Exit => self.request_exit(),
             Pending::CloseMarked => self.close_marked(),
-            Pending::OpenLink(_) | Pending::Reload(_) | Pending::Overwrite(_) | Pending::OpenLarge(_) => {}
+            Pending::OpenLink(_)
+            | Pending::Reload(_)
+            | Pending::Overwrite(_)
+            | Pending::OpenLarge(_)
+            | Pending::About => {}
         }
     }
 

@@ -94,6 +94,13 @@ editor, but it should use far less memory than modern Windows Notepad (80+ MB).
 - Windows: the native print dialog, printing through GDI
 - macOS and Linux: a PDF is sent to the default CUPS printer with `lp`. If there is no printer, the PDF opens in your viewer.
 
+**Help**
+- Help → About shows the version, the git commit the build came from (and its date, and whether the source
+  had uncommitted changes), the platform it was built for, the Rust version, and whether it's running on
+  Wayland, X11, Windows or macOS. Copy Details puts that on the clipboard for a bug report.
+- `plainpad --version` prints the version and commit. The build records no timestamp, so building the same
+  commit twice gives the same binary.
+
 **Settings**
 - Font, size, word wrap, status bar and window size are remembered in the platform config directory
   (`%APPDATA%`, `~/Library/Application Support`, or `$XDG_CONFIG_HOME`).
@@ -123,7 +130,7 @@ On macOS, use **Cmd** wherever this table says **Ctrl**, except for Ctrl+Tab and
 | Find previous | Shift+F3 or Ctrl+Shift+G |
 | Word wrap | Alt+Z |
 | Zoom in / out / reset | Ctrl+= / Ctrl+- / Ctrl+0, or Ctrl+mouse wheel |
-| Open the File / Edit / Format / View menu | Alt+F / Alt+E / Alt+O / Alt+V |
+| Open the File / Edit / Format / View / Help menu | Alt+F / Alt+E / Alt+O / Alt+V / Alt+H |
 | Move between menu items | Arrow keys (Right opens a submenu, Left closes it), Enter to choose, Esc to close |
 | Move by word | Ctrl+Left / Ctrl+Right |
 | Start / end of line | Home / End |

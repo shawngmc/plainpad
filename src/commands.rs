@@ -304,6 +304,7 @@ impl App {
                     self.gfx.clear_glyphs(); // glyphs at the old size won't be drawn again
                 }
             }
+            Cmd::About => self.show_about(),
             Cmd::StatusBar => {
                 self.settings.status_bar = !self.settings.status_bar;
                 self.settings.save();

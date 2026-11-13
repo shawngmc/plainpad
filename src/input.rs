@@ -181,7 +181,7 @@ impl App {
         if alt
             && !primary
             && !MAC
-            && let Some(i) = c.and_then(|c| "feov".find(c))
+            && let Some(i) = c.and_then(|c| "feovh".find(c))
         {
             self.win.menu.open = Some(i);
             self.win.menu.hover = None;

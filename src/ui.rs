@@ -36,6 +36,7 @@ pub enum Cmd {
     PrevTab,
     /// 1-8 select that tab, 9 the last one.
     SelectTab(u8),
+    About,
 }
 
 pub struct Item {
@@ -133,6 +134,7 @@ pub const MENUS: &[(&str, &[Item])] = &[
             it("Previous Tab", "Ctrl+Shift+Tab", Cmd::PrevTab),
         ],
     ),
+    ("Help", &[it("About Plainpad", "", Cmd::About)]),
 ];
 
 /// Every command reachable from the menus, including submenus.
@@ -939,6 +941,9 @@ pub enum Choice {
     RecoverOk,
     /// Restore the documents and also open the list of their names as a tab.
     RecoverList,
+    /// About: copy the version details to the clipboard / close.
+    CopyDetails,
+    Close,
 }
 
 /// Strips characters that could disguise a file name shown in the app's own
@@ -996,6 +1001,7 @@ const LINK_CHOICES: &[(&str, Choice)] = &[("Open Anyway", Choice::Open), ("Cance
 const CHANGED_CHOICES: &[(&str, Choice)] = &[("Reload", Choice::Reload), ("Keep My Version", Choice::Keep)];
 const OVERWRITE_CHOICES: &[(&str, Choice)] = &[("Overwrite", Choice::Overwrite), ("Cancel", Choice::Cancel)];
 const LARGE_CHOICES: &[(&str, Choice)] = &[("Open", Choice::Open), ("Cancel", Choice::Cancel)];
+const ABOUT_CHOICES: &[(&str, Choice)] = &[("Copy Details", Choice::CopyDetails), ("OK", Choice::Close)];
 const RECOVER_CHOICES: &[(&str, Choice)] = &[("Open List as a Tab", Choice::RecoverList), ("OK", Choice::RecoverOk)];
 
 /// Greedy word wrap of `text` to `max_w` pixels. A word too long for a line
@@ -1061,6 +1067,11 @@ impl Prompt {
     /// There is no cancel: dismissing it any way still restores the work.
     pub fn recovery(lines: Vec<String>) -> Self {
         Self::new(lines, RECOVER_CHOICES, 1, false)
+    }
+
+    /// Help → About; OK is the default.
+    pub fn about(lines: Vec<String>) -> Self {
+        Self::new(lines, ABOUT_CHOICES, 1, false)
     }
 
     pub fn focused(&self) -> Choice {

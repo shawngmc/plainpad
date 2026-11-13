@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod about;
 mod commands;
 mod context;
 mod doc;
@@ -126,6 +127,8 @@ enum Pending {
     Overwrite(u64),
     /// Open this very large file if the user confirms.
     OpenLarge(PathBuf),
+    /// The About dialog is open (Copy Details copies its text).
+    About,
 }
 
 fn next_tab_id() -> u64 {
@@ -631,8 +634,13 @@ impl ApplicationHandler<UserEvent> for App {
 
 fn main() {
     mem::init();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
+        println!("{}", about::version_line());
+        return;
+    }
     let settings = Settings::load();
-    let files = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let files = args.into_iter().map(PathBuf::from).collect();
     let el = EventLoop::<UserEvent>::with_user_event().build().expect("failed to create event loop");
     el.set_control_flow(ControlFlow::Wait);
     let mut app = App::new(settings, files, el.create_proxy());
