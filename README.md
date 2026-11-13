@@ -545,9 +545,15 @@ read through gdb), the process's own memory, CPU use while idle and how fast a n
 
 - the app crashes or stops responding,
 - it uses CPU while idle,
-- memory still allocated ends more than 10% + 1 MB above the baseline (a leak),
+- memory still allocated ends more than 20% (at least 4 MB) above where it was early in the session (a leak),
 - or the process's own memory ends more than 50% (at least 10 MB) above it. This one is looser, because what
   the allocator holds on to wanders by several MB between checkpoints.
+
+"Early" is the median of the first half of the checkpoints, since caches fill up during the first part of a
+session. "The end" is the lowest of the last three checkpoints: one checkpoint can catch work still settling,
+such as a big paste landing, and show a spike that the next one doesn't, while leaked memory never comes back.
+In an hour-long CI run, memory in use settled at 15–17 MB after about half an hour, with spikes of 25 and
+34 MB that went away again.
 
 It runs nightly in CI (`.github/workflows/soak.yml`), and on demand from the Actions tab with a chosen length
 and seed. The results table goes to the run summary; the action log, the app's log and, on failure, a

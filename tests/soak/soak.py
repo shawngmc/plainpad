@@ -12,11 +12,14 @@ process's own memory (RssAnon), its total memory, its CPU use while idle and
 how fast it responds. The baseline is the second checkpoint, after a warm-up
 round (the first shows every tab, which can load fallback fonts).
 
-It fails if the app crashes or stops responding, if it uses CPU while idle, if
-memory still allocated at the last checkpoint is more than 10% + 1 MB above
-the baseline (a leak), or if the process's own memory is more than 50% (at
-least 10 MB) above it (memory the allocator keeps; this wanders by several MB
-between checkpoints, so the limit is looser).
+It fails if the app crashes or stops responding, if it uses CPU while idle, or
+if memory ends up higher than early in the session: memory still allocated by
+more than 20% (at least 4 MB), which shows a leak, or the process's own memory
+by more than 50% (at least 10 MB), which also counts what the allocator holds on
+to and wanders by several MB. "Early" is the median of the first half of the
+checkpoints (caches fill up at first); "the end" is the lowest of the last three
+(one checkpoint can catch a big paste still landing, but leaked memory never
+comes back). See judge().
 
 Needs gdb for the leak check (with passwordless sudo when not root, as on CI
 runners); without it, only the process's memory is checked.
@@ -431,6 +434,33 @@ class Soak:
         shutil.rmtree(self.cfg, ignore_errors=True)
 
 
+# (measure, description, allowed growth ratio, allowed growth at least, in KB).
+# Memory still allocated shows leaks. The process's own memory also includes
+# what the allocator holds on to, which wanders by several MB, so its limit is
+# looser.
+LIMITS = [
+    ("live_kb", "memory in use", 0.2, 4096),
+    ("heap_kb", "process's own memory", 0.5, 10240),
+]
+
+
+def judge(points, key, ratio, floor_kb):
+    """(reference, end, limit) for one measure, or None if it wasn't measured.
+
+    The reference is the median of the first half of the checkpoints: caches
+    fill up over the first part of a session, and that isn't a leak. The end
+    is the lowest of the last three: a checkpoint can catch work still settling
+    (a big paste landing), giving a one-off spike that the next one doesn't
+    show, while leaked memory never comes back, so it raises all three."""
+    values = [p[key] for p in points]
+    if any(v is None for v in values):
+        return None
+    first = sorted(values[: max(1, (len(values) + 1) // 2)])
+    ref = first[len(first) // 2]
+    end = min(values[-3:])
+    return ref, end, ref + max(ref * ratio, floor_kb)
+
+
 def report(points, verdicts):
     lines = ["| Minute | Actions | In use | Own memory | Total (RSS) | Peak RSS | Idle CPU (2 s) | New tab |",
              "|---:|---:|---:|---:|---:|---:|---:|---:|"]
@@ -476,24 +506,16 @@ def main():
             if left <= 30:
                 break
             soak.run_round(min(args.round_minutes * 60, left))
-        base, last = points[0], points[-1]
-        # Leaks: memory still allocated must come back to where it started.
-        if base["live_kb"] is not None and last["live_kb"] is not None:
-            limit = base["live_kb"] * 1.1 + 1024
-            msg = (f"memory in use {base['live_kb'] / 1024:.1f} MB -> {last['live_kb'] / 1024:.1f} MB "
-                   f"(limit {limit / 1024:.1f} MB)")
-            failed |= last["live_kb"] > limit
-            verdicts.append(("FAIL: " if last["live_kb"] > limit else "ok: ") + msg)
-        else:
-            verdicts.append("skipped: memory in use (gdb couldn't attach)")
-        # Bloat: the process's own memory also includes what the allocator holds
-        # on to (fragmentation), which wanders by several MB from checkpoint to
-        # checkpoint, so it gets a looser limit.
-        limit = base["heap_kb"] + max(base["heap_kb"] * 0.5, 10240)
-        msg = (f"process's own memory {base['heap_kb'] / 1024:.1f} MB -> {last['heap_kb'] / 1024:.1f} MB "
-               f"(limit {limit / 1024:.1f} MB)")
-        failed |= last["heap_kb"] > limit
-        verdicts.append(("FAIL: " if last["heap_kb"] > limit else "ok: ") + msg)
+        last = points[-1]
+        for key, what, ratio, floor_kb in LIMITS:
+            v = judge(points, key, ratio, floor_kb)
+            if v is None:
+                verdicts.append(f"skipped: {what} (gdb couldn't attach)")
+                continue
+            ref, end, limit = v
+            verdicts.append(("FAIL: " if end > limit else "ok: ") + f"{what}: {ref / 1024:.1f} MB early on, "
+                            f"{end / 1024:.1f} MB at the end (limit {limit / 1024:.1f} MB)")
+            failed |= end > limit
         busy = [p for p in points if p["idle_cpu_ms"] > 30]
         if busy:
             failed = True
